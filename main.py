@@ -32,6 +32,7 @@ def index():
                                brand_name=brand['name'],
                                brand_tagline=brand['tagline'],
                                brand_theme=brand['theme_colors'],
+                               landing_enabled=brand['landing_enabled'],
                                login_error=None,
                                register_error=None,
                                register_success=None,

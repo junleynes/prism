@@ -400,7 +400,9 @@ def load_branding():
     re-derive it themselves."""
     cfg = {'name': DEFAULT_BRAND_NAME, 'tagline': DEFAULT_BRAND_TAGLINE, 'footer': '',
            'accent_color': DEFAULT_BRAND_ACCENT, 'theme_name': DEFAULT_THEME_NAME,
-           'logo_filename': None, 'favicon_filename': None}
+           'logo_filename': None, 'favicon_filename': None,
+           # Off: signed-out visitors get only the sign-in card, not the marketing page.
+           'landing_enabled': True}
     if os.path.exists(BRANDING_FILE):
         try:
             with open(BRANDING_FILE) as f:
@@ -413,6 +415,9 @@ def load_branding():
                 if k == 'footer':
                     if 'footer' in saved:
                         cfg['footer'] = saved['footer']
+                elif k == 'landing_enabled':
+                    if 'landing_enabled' in saved:
+                        cfg['landing_enabled'] = bool(saved['landing_enabled'])
                 elif saved.get(k):
                     cfg[k] = saved[k]
         except Exception as e:
@@ -439,6 +444,13 @@ def save_branding_text(name=None, tagline=None, footer=None):
         # legitimate, common choice (most installs won't want one at all),
         # not a mistake to silently correct the way a blank name would be.
         cfg['footer'] = footer.strip()
+    _write_branding(cfg)
+    return cfg
+
+def save_branding_landing(enabled):
+    """Shows (True) or skips (False) the landing page for signed-out visitors."""
+    cfg = load_branding()
+    cfg['landing_enabled'] = bool(enabled)
     _write_branding(cfg)
     return cfg
 

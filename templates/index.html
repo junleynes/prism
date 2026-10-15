@@ -13736,6 +13736,14 @@ function switchDocs(btn){
 </div>
 
 <div style="border:1px solid var(--line);border-radius:12px;padding:16px 18px">
+  <label>Landing page:</label>
+  <label style="display:flex;gap:8px;align-items:center;font-weight:400;cursor:pointer;margin-top:6px">
+    <input type=checkbox id=brand-landing-input onchange="saveBrandLanding()"> Show the landing page to signed-out visitors</label>
+  <p style="font-size:11px;opacity:.65;margin-top:6px">Off: the address opens straight on the sign-in box (with <em>Request access</em>), without the product page behind it. Signed-in users are not affected.</p>
+  <span id=brand-landing-status style="font-size:12px"></span>
+</div>
+
+<div style="border:1px solid var(--line);border-radius:12px;padding:16px 18px">
   <label>Color theme:</label>
   <p style="font-size:11px;opacity:.65;margin:2px 0 8px">A coordinated set of colors used app-wide &mdash; the active-tab highlight, most buttons, badges, and status indicators, in both light and dark mode, including the sign-in page. Pick "Custom" to set just the accent color instead.</p>
   <div id=brand-theme-swatches style="display:flex;flex-wrap:wrap;gap:10px"></div>
@@ -14804,6 +14812,7 @@ async function loadBrandingTab(){
     document.getElementById('brand-name-input').value = d.name
     document.getElementById('brand-tagline-input').value = d.tagline
     document.getElementById('brand-footer-input').value = d.footer || ''
+    document.getElementById('brand-landing-input').checked = d.landing_enabled !== false
     document.getElementById('brand-accent-input').value = d.accent_color
     document.getElementById('brand-accent-text').value = d.accent_color
     document.getElementById('brand-logo-status').textContent = d.has_logo ? 'Custom logo in use' : 'Using the built-in default'
@@ -14892,6 +14901,20 @@ async function saveBrandAccent(){
       status.style.color = 'var(--amber)'
     }
   }catch(e){ status.textContent = 'Save failed: ' + e; status.style.color = 'var(--amber)' }
+}
+
+async function saveBrandLanding(){
+  var box = document.getElementById('brand-landing-input'), status = document.getElementById('brand-landing-status')
+  status.textContent = 'Saving…'; status.style.color = 'var(--ink-dim)'
+  try{
+    var fd = new FormData()
+    fd.append('landing_enabled', box.checked ? '1' : '0')
+    var d = await (await fetch('/api/branding', {method: 'POST', body: fd})).json()
+    if(!d.ok) throw new Error(d.error || 'unknown error')
+    box.checked = d.landing_enabled !== false
+    status.textContent = box.checked ? 'Saved. Signed-out visitors see the landing page.' : 'Saved. Signed-out visitors go straight to sign-in.'
+    status.style.color = 'var(--phosphor)'
+  }catch(e){ box.checked = !box.checked; status.textContent = 'Save failed: ' + (e.message || e); status.style.color = 'var(--amber)' }
 }
 
 async function saveBrandText(){

@@ -20,7 +20,7 @@ Self-hosted toolkit for producing broadcast episodic promos end to end — from 
 - **Per-show templates** — Save a full generator configuration (genre, transitions, lengths, audio targets, voice, music/SFX/VO/cards) under a show name. New episodes are one dropdown away.
 - **Trailer library** — Every render is kept, browsable and re-downloadable, independent of the source footage.
 - **Per-user accounts** — Real login with admin role for account management and last-login tracking. Optional groups restrict accounts to the tabs (Docs included) their group is given, and keep each group's Vertical Shorts projects to itself.
-- **Configurable branding** — Name, tagline, logo, and favicon editable at runtime from Config → Branding (admin-only).
+- **Configurable branding** — Name, tagline, logo, favicon and theme editable at runtime from Config → Branding (admin-only), where the public landing page can also be switched off so visitors go straight to sign-in.
 - **Favorite folders** — Pin network-browser locations for quick access.
 - **Narration preview & output meter** — Preview VO before render; live peak/channel meter on output.
 - **Delivery formats** — Choose the delivery format up front.

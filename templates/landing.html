@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+{% set landing_enabled = landing_enabled if landing_enabled is defined else true %}<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -189,6 +189,11 @@ button,input{font:inherit}
   animation:overlay-in .18s ease
 }
 .auth-overlay.open{display:flex}
+/* Landing page switched off (Config > Branding): only the sign-in card, which cannot be dismissed. */
+.no-landing .auth-overlay{background:transparent;backdrop-filter:none;padding-top:96px}
+.no-landing [data-close]{display:none}
+.no-landing .hero{background:none;padding:0}
+.no-landing footer{display:none}
 @keyframes overlay-in{from{opacity:0}to{opacity:1}}
 .auth-dock{
   width:100%;max-width:400px;margin:auto;
@@ -369,13 +374,15 @@ footer{
 }
 </style>
 </head>
-<body>
+<body{% if not landing_enabled %} class="no-landing"{% endif %}>
 <header class="nav" id="topNav">
   <div class="wrap nav-inner">
     <a class="brand" href="/"><img class="logo-light" src="/branding/logo" alt="{{ brand_name }}"><img class="logo-dark" src="/branding/logo-dark" alt="{{ brand_name }}"></a>
     <div class="nav-right">
+      {% if landing_enabled %}
       <a class="nav-link" href="#how">How it works</a>
       <a class="nav-link" href="#features">Features</a>
+      {% endif %}
       <button type="button" class="btn btn-ghost btn-nav" id="navBtnRegister" data-auth="register">Request access</button>
       <button type="button" class="btn btn-primary btn-nav" id="navBtnSignIn" data-auth="signin">Sign in</button>
       <button type="button" class="theme-btn" id="themeToggle" aria-label="Toggle theme">
@@ -388,14 +395,16 @@ footer{
 
 <div class="wrap">
   <section class="hero" id="access">
-    <div class="hero-kicker">Broadcast-ready AI workflow</div>
-    <h1>A smarter workflow for <span>episodic promo</span> production.</h1>
-    <p class="hero-lead">Score scenes, shape the edit, generate music and narration, and produce promo-ready exports from a single workflow.</p>
+    {% if landing_enabled %}
+    <div class="hero-kicker">AI production suite for broadcast</div>
+    <h1>One workspace for <span>promos, shorts and schedule plugs</span>.</h1>
+    <p class="hero-lead">Cut episodic plugs, turn full episodes into vertical shorts, animate schedule artwork, and create the music, voice and sound behind them, all on your own servers.</p>
     <p class="hero-note">Self-hosted · Your media stays local · Controlled access</p>
 
     <div class="hero-shot">
-      <img src="/static/landing-hero.jpg" alt="{{ brand_name }} — finished promo on a calibrated monitor with live output metering" loading="eager" width="1600" height="900">
+      <img src="/static/landing-hero.jpg" alt="{{ brand_name }} — a finished piece on a calibrated monitor with live output metering" loading="eager" width="1600" height="900">
     </div>
+    {% endif %}
 
     {# ---- Auth modal (hidden until CTA) ---- #}
     <div class="auth-overlay{% if auth_panel in ('signin', 'register', 'register-done') or pending_2fa or login_error or register_error or register_success %} open{% endif %}" id="authOverlay">
@@ -460,106 +469,111 @@ footer{
       </div>
     </div>
 
+    {% if landing_enabled %}
     <div class="trust-row">
       <span class="trust-pill"><i></i><b>Self-hosted</b> media stays local</span>
       <span class="trust-pill"><i></i><b>2FA ready</b> TOTP + backup codes</span>
-      <span class="trust-pill"><i></i><b>Episodic</b> templates &amp; library</span>
+      <span class="trust-pill"><i></i><b>Team access</b> groups &amp; shared projects</span>
     </div>
+    {% endif %}
   </section>
 
+  {% if landing_enabled %}
   <section class="section" id="how">
     <h2 class="section-title">How it works</h2>
-    <p class="section-sub">From episode ingest to a finished plug — without jumping between tools.</p>
+    <p class="section-sub">The same three steps whether you are cutting a plug, a set of shorts or a schedule promo.</p>
     <div class="how-visual">
-      <img src="/static/landing-process.jpg" alt="AI-assisted promo workflow — from timeline edit to scored scenes to a finished deliverable" loading="lazy" width="1600" height="900">
+      <img src="/static/landing-process.jpg" alt="AI-assisted production — from source footage to analysed moments to a finished deliverable" loading="lazy" width="1600" height="900">
     </div>
     <div class="how-grid">
       <article class="how-card">
         <div class="how-card-bg" style="background-image:url('/static/landing-step-1.jpg')"></div>
         <div class="how-card-body">
           <div class="how-step">Step 01</div>
-          <h3>Ingest &amp; analyze</h3>
-          <p>Drop an episode or pick one from a network share. Scenes are detected and scored for quality and content.</p>
+          <h3>Bring in the source</h3>
+          <p>Pick an episode or artwork from the network share, or upload it. Scenes are detected, dialogue transcribed and moments rated.</p>
         </div>
       </article>
       <article class="how-card">
         <div class="how-card-bg" style="background-image:url('/static/landing-step-2.jpg')"></div>
         <div class="how-card-body">
           <div class="how-step">Step 02</div>
-          <h3>Shape the cut</h3>
-          <p>Preview moments, swap alternates, and lock music, SFX, and narration — driven by scores, VO, or music.</p>
+          <h3>Review and shape</h3>
+          <p>Preview the cut, swap scenes, re-time shorts, fix captions, steer layer animation, and add music, SFX and narration.</p>
         </div>
       </article>
       <article class="how-card">
         <div class="how-card-bg" style="background-image:url('/static/landing-step-3.jpg')"></div>
         <div class="how-card-body">
           <div class="how-step">Step 03</div>
-          <h3>Render &amp; library</h3>
-          <p>Export broadcast-ready masters, save show templates, and keep every render searchable.</p>
+          <h3>Render and deliver</h3>
+          <p>Render broadcast-ready files, keep every version in the library, and send them straight to a network destination.</p>
         </div>
       </article>
     </div>
   </section>
 
   <section class="section" id="features">
-    <h2 class="section-title">Everything your promo needs</h2>
-    <p class="section-sub">Built around real broadcast workflow — not a generic highlight reel toy.</p>
+    <h2 class="section-title">What is inside</h2>
+    <p class="section-sub">Built around how a broadcast promo team actually works, from the daily plug to social cut-downs.</p>
     <div class="features">
       <article class="feature">
         <div class="feature-bg" style="background-image:url('/static/landing-feat-1.jpg')"></div>
         <div class="feature-body">
-          <div class="num c-teal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></div>
-          <h3>Intelligent scene selection</h3>
-          <p>Score, preview, and lock the cut before you render.</p>
-        </div>
-      </article>
-      <article class="feature">
-        <div class="feature-bg" style="background-image:url('/static/landing-feat-2.jpg')"></div>
-        <div class="feature-body">
-          <div class="num c-amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V6l11-2v12"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg></div>
-          <h3>VO- &amp; music-led cuts</h3>
-          <p>Optional selection driven by narration or beat energy.</p>
-        </div>
-      </article>
-      <article class="feature">
-        <div class="feature-bg" style="background-image:url('/static/landing-feat-3.jpg')"></div>
-        <div class="feature-body">
-          <div class="num c-blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a4 4 0 0 1 4 4v5a4 4 0 0 1-8 0V7a4 4 0 0 1 4-4z"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/><path d="M8 21h8"/></svg></div>
-          <h3>Music, SFX &amp; voice</h3>
-          <p>Dedicated AI tools for beds, hits, and TTS narration.</p>
+          <div class="num c-teal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4.5-2.5L10 9.5z"/></svg></div>
+          <h3>Episodic Plug</h3>
+          <p>Scored scenes, title and end cards, music and VO mixed into a trailer at the length you need, with per-show templates.</p>
         </div>
       </article>
       <article class="feature">
         <div class="feature-bg" style="background-image:url('/static/landing-feat-4.jpg')"></div>
         <div class="feature-body">
-          <div class="num c-teal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></div>
-          <h3>Show templates</h3>
-          <p>Reuse per-programme packages episode after episode.</p>
-        </div>
-      </article>
-      <article class="feature">
-        <div class="feature-bg" style="background-image:url('/static/landing-feat-5.jpg')"></div>
-        <div class="feature-body">
-          <div class="num c-amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
-          <h3>Self-hosted by design</h3>
-          <p>Media and models stay in your environment.</p>
+          <div class="num c-amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg></div>
+          <h3>Vertical Shorts</h3>
+          <p>A full episode cut into stand-alone 9:16 shorts: face-tracked framing, burned-in captions, cliffhanger endings.</p>
         </div>
       </article>
       <article class="feature">
         <div class="feature-bg" style="background-image:url('/static/landing-feat-6.jpg')"></div>
         <div class="feature-body">
-          <div class="num c-blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4.5-2.5L10 9.5z"/></svg></div>
-          <h3>Delivery packages</h3>
-          <p>MP4, ProRes, scene lists, and library history.</p>
+          <div class="num c-blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4M7 13h4M7 17h7"/></svg></div>
+          <h3>Schedule Plug</h3>
+          <p>A schedule still or layered PSD animated into a 10 to 30-second plug, with the artwork&rsquo;s text kept exactly as designed.</p>
+        </div>
+      </article>
+      <article class="feature">
+        <div class="feature-bg" style="background-image:url('/static/landing-feat-2.jpg')"></div>
+        <div class="feature-body">
+          <div class="num c-teal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a4 4 0 0 1 4 4v5a4 4 0 0 1-8 0V7a4 4 0 0 1 4-4z"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/><path d="M8 21h8"/></svg></div>
+          <h3>Music, SFX &amp; voice</h3>
+          <p>Original music, sound effects from a text prompt, and narration with voice cloning.</p>
+        </div>
+      </article>
+      <article class="feature">
+        <div class="feature-bg" style="background-image:url('/static/landing-feat-3.jpg')"></div>
+        <div class="feature-body">
+          <div class="num c-amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+          <h3>Transcripts, scenes &amp; AI chat</h3>
+          <p>Speech to text, scene detection with AI commentary, and an assistant for drafting promo copy.</p>
+        </div>
+      </article>
+      <article class="feature">
+        <div class="feature-bg" style="background-image:url('/static/landing-feat-5.jpg')"></div>
+        <div class="feature-body">
+          <div class="num c-blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
+          <h3>Self-hosted, team-ready</h3>
+          <p>Media and models stay on your servers. Groups decide who sees which tools and projects; 2FA on every account.</p>
         </div>
       </article>
     </div>
 
     <div class="cta-band">
-      <h2>Ready when your episode is.</h2>
-      <p>Use <strong class="cta-highlight">Request access</strong> or <strong class="cta-highlight">Sign in</strong> in the top right to start building broadcast-ready promos on your own hardware.</p>
+      <h2>Ready when your next episode is.</h2>
+      <p>Use <strong class="cta-highlight">Request access</strong> or <strong class="cta-highlight">Sign in</strong> in the top right to start producing promos, shorts and plugs on your own hardware.</p>
     </div>
   </section>
+
+  {% endif %}
 
   <footer>
     <span>{{ brand_name }} · {{ brand_tagline }}</span>
@@ -605,7 +619,10 @@ footer{
     var el = document.getElementById(focusId);
     if(el) setTimeout(function(){ el.focus(); }, 50);
   }
+  var landing = {{ 'true' if landing_enabled else 'false' }};
   function closeAuth(){
+    // With the landing page off there is nothing behind the card: it stays, back on sign-in.
+    if(!landing){ openAuth('signin'); return; }
     document.querySelectorAll('.auth-dock').forEach(function(d){ d.classList.remove('open'); });
     document.querySelectorAll('[data-auth]').forEach(function(b){ b.classList.remove('active'); });
     if(overlay) overlay.classList.remove('open');
@@ -632,7 +649,7 @@ footer{
   var panel = {{ (auth_panel or '')|tojson }};
   if(panel === 'register' || panel === 'register-done' || location.hash === '#register'){
     openAuth('register');
-  } else if(panel === 'signin' || {{ 'true' if (pending_2fa or login_error) else 'false' }} || location.hash === '#signin'){
+  } else if(!landing || panel === 'signin' || {{ 'true' if (pending_2fa or login_error) else 'false' }} || location.hash === '#signin'){
     openAuth('signin');
   }
 })();

@@ -32,7 +32,7 @@ import scriptbrief
 from schedule_core import IMAGE_EXTENSIONS as SCHEDULE_IMAGE_EXTENSIONS
 from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, library_get_row, library_delete,
     audit_log, audit_log_list, network_favorites_list, network_favorite_add, network_favorite_remove,
-    load_branding, save_branding_text, save_branding_color, save_branding_logo, save_branding_favicon,
+    load_branding, save_branding_text, save_branding_landing, save_branding_color, save_branding_logo, save_branding_favicon,
     clear_branding_logo, clear_branding_favicon, clear_branding_color, BRANDING_DIR,
     load_disabled_services, set_service_disabled, save_branding_theme, THEME_PRESETS,
     load_network_folders, save_network_folder, NETWORK_CATEGORY_KEYS,
@@ -9842,7 +9842,8 @@ def api_branding_get():
                    accent_color=cfg['accent_color'], theme_name=cfg['theme_name'],
                    theme_colors=cfg['theme_colors'],
                    themes={k: v for k, v in THEME_PRESETS.items()},
-                   has_logo=bool(cfg['logo_filename']), has_favicon=bool(cfg['favicon_filename']))
+                   has_logo=bool(cfg['logo_filename']), has_favicon=bool(cfg['favicon_filename']),
+                   landing_enabled=cfg['landing_enabled'])
 
 @app.route('/api/branding', methods=['POST'])
 def api_branding_post():
@@ -9861,6 +9862,9 @@ def api_branding_post():
     footer = request.form.get('footer')
     if name is not None or tagline is not None or footer is not None:
         save_branding_text(name, tagline, footer)
+    landing = request.form.get('landing_enabled')
+    if landing is not None:
+        save_branding_landing(landing.strip().lower() in ('1', 'true', 'on', 'yes'))
     theme_name = request.form.get('theme_name')
     if theme_name:
         _, err = save_branding_theme(theme_name)
@@ -9888,7 +9892,7 @@ def api_branding_post():
     if request.form.get('reset_accent_color') == '1':
         clear_branding_color()
     cfg = load_branding()
-    changed = [k for k in ('name', 'tagline', 'footer', 'theme_name', 'accent_color')
+    changed = [k for k in ('name', 'tagline', 'footer', 'theme_name', 'accent_color', 'landing_enabled')
                if request.form.get(k)] + \
               [f'{k}_upload' for k in ('logo', 'favicon') if request.files.get(k) and request.files[k].filename] + \
               [f'reset_{k}' for k in ('logo', 'favicon', 'accent_color') if request.form.get(f'reset_{k}') == '1']
@@ -9897,7 +9901,8 @@ def api_branding_post():
     return jsonify(ok=True, name=cfg['name'], tagline=cfg['tagline'], footer=cfg['footer'],
                    accent_color=cfg['accent_color'], theme_name=cfg['theme_name'],
                    theme_colors=cfg['theme_colors'], themes={k: v for k, v in THEME_PRESETS.items()},
-                   has_logo=bool(cfg['logo_filename']), has_favicon=bool(cfg['favicon_filename']))
+                   has_logo=bool(cfg['logo_filename']), has_favicon=bool(cfg['favicon_filename']),
+                   landing_enabled=cfg['landing_enabled'])
 
 @app.route('/api/health')
 def api_health():
