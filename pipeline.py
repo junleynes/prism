@@ -1,0 +1,12797 @@
+"""The media/trailer-generation engine: scene detection, AI vision scoring,
+TTS/STT, music & SFX generation, the ffmpeg render pipeline, per-show asset
+templates, and their API routes.
+
+This is intentionally kept as one module rather than split further. Internally
+it has several places (live-reloadable AI service URLs edited from the Config
+tab, a shared face-detector instance, a structured-output-support flag) that
+use `global` to let a nested closure deep in one route update state that
+other routes read on their next call -- moving those definitions and their
+readers into different files would silently break the live-reload behavior
+unless every read site were rewritten to a qualified module.attr lookup.
+Splitting *within* this module further is a reasonable next step, but it's
+safer done incrementally against a real render on the actual server, where
+the AI services, ffmpeg, and real footage can actually be exercised --
+not blind in a sandbox that has none of those available.
+"""
+import os, cv2, numpy as np, tempfile, threading, time, pathlib, base64, json, requests, subprocess, shutil, re, sqlite3, uuid, secrets, io, mimetypes, hashlib
+from xml.sax.saxutils import escape as xml_escape
+from concurrent.futures import ThreadPoolExecutor
+from scenedetect import open_video, SceneManager, FrameTimecode
+from scenedetect.detectors import ContentDetector, AdaptiveDetector
+from flask import request, jsonify, redirect, Response, send_from_directory, send_file, session
+import zipfile
+import math
+from werkzeug.utils import secure_filename
+import smbclient  # pip install smbprotocol -- lets the upload panels browse a Windows/SMB network share directly
+from smbprotocol.exceptions import SharingViolation
+
+from core import app, ALLOWED_EXTENSIONS, _job_submit_limiter, _client_ip, _RateLimiter
+import cutcraft
+import scriptbrief
+from schedule_core import IMAGE_EXTENSIONS as SCHEDULE_IMAGE_EXTENSIONS
+from library_db import (LIBRARY_DIR, _sqlite_connect, library_add, library_list, library_stats, library_get_row, library_delete,
+    audit_log, audit_log_list, network_favorites_list, network_favorite_add, network_favorite_remove,
+    load_branding, save_branding_text, save_branding_color, save_branding_logo, save_branding_favicon,
+    clear_branding_logo, clear_branding_favicon, clear_branding_color, BRANDING_DIR,
+    load_disabled_services, set_service_disabled, save_branding_theme, THEME_PRESETS,
+    load_network_folders, save_network_folder, NETWORK_CATEGORY_KEYS,
+    network_destinations_list, network_destination_get, network_destination_add,
+    network_destination_update, network_destination_remove)
+from auth import require_permission
+
+# ---- Per-show asset templates (SQLite) ----
+# A "template" is a named bundle of the reusable assets a specific show always
+# uses -- its background music bed, SFX one-shot, VO track, title card and end
+# card (each card with an optional card VO + in/out points). Picking a template
+# at generate time fills all of those slots at once, as an alternative to picking
+# a Genre (which only presets transition style and the AI music/SFX *prompts*,
+# and supplies no actual files).
+#
+# Like LIBRARY_DIR above, this has to survive process restarts -- UPLOAD_FOLDER is
+# a fresh tempdir every boot -- so the master copy of each asset lives here and is
+# only ever *copied* into UPLOAD_FOLDER per job (see template_stage_asset). That
+# copy is mandatory, not defensive: _run_trailer_job() deletes the SFX, VO and
+# card-VO files it is handed once it's finished with them.
+TEMPLATES_DIR = os.environ.get('TEMPLATES_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'show_templates'))
+os.makedirs(TEMPLATES_DIR, exist_ok=True)
+TEMPLATES_DB_PATH = os.path.join(TEMPLATES_DIR, 'templates.db')
+
+# Each slot maps a template asset to the form field the trailer form already uses
+# for it. Note the two legacy field names: 'end_card_video' is really the *title*
+# card and 'schedule_video' is really the *end* card -- the slot keys below use the
+# accurate names, and the mapping is kept in this one place so nothing else has to
+# know about the mismatch.
+TEMPLATE_SLOTS = {
+    'bgm':           {'field': 'scoring_audio',  'kind': 'audio', 'label': 'Background music'},
+    'sfx':           {'field': 'sfx_upload',     'kind': 'audio', 'label': 'SFX one-shot'},
+    'vo':            {'field': 'vo_upload',      'kind': 'audio', 'label': 'Voiceover'},
+    'title_card':    {'field': 'end_card_video', 'kind': 'video', 'label': 'Title card'},
+    'title_card_vo': {'field': 'title_card_vo',  'kind': 'audio', 'label': 'Title card VO'},
+    'end_card':      {'field': 'schedule_video', 'kind': 'video', 'label': 'End card'},
+    'end_card_vo':   {'field': 'end_card_vo',    'kind': 'audio', 'label': 'End card VO'},
+}
+TEMPLATE_SLOT_KEYS = list(TEMPLATE_SLOTS.keys())
+
+# A template is the whole configuration for a show, not just its files: genre and
+# transition, the asset slots above, and every other generator setting. These are
+# captured verbatim from the generate form into a single settings_json column
+# rather than one column each, so adding a control to the form doesn't need a
+# schema migration.
+TEMPLATE_SETTING_FIELDS = [
+    'genre', 'transition', 'xfade_dur', 'transition_matte',
+    'trailer_length', 'max_scene_dur', 'scene_threshold', 'min_scene_len_sec',
+    'detector', 'adaptive_threshold',
+    'mode', 'model', 'prompt',
+    'scoring_mode', 'sfx_mode', 'sfx_source', 'vo_mode', 'vo_engine',
+    'vo_voice', 'vo_language', 'vo_rate', 'vo_start', 'vo_volume',
+    'vo_trim_start', 'vo_trim_end', 'vo_text',
+    'sfx_upload_trim_start', 'sfx_upload_trim_end',
+    'title_card_vo_start', 'title_card_vo_end',
+    'end_card_vo_start', 'end_card_vo_end',
+    'end_card_video_start', 'end_card_video_end',
+    'schedule_video_start', 'schedule_video_end',
+    'target_loudness', 'true_peak', 'music_duck_db', 'duck_depth_db',
+    'duck_release_hold', 'beat_match', 'broadcast_stereo',
+    'sync_beats', 'whisper_enhance',
+    'cut_clean', 'card_fit', 'vo_smart',
+]
+# Checkbox-style fields: absent from a form POST means "off", so they must be
+# recorded as off rather than left at whatever the previous value was.
+TEMPLATE_BOOL_FIELDS = {'beat_match', 'broadcast_stereo', 'sync_beats', 'whisper_enhance'}
+
+def _tpl_db():
+    return _sqlite_connect(TEMPLATES_DB_PATH)
+
+def templates_db_init():
+    cols = []
+    for slot in TEMPLATE_SLOT_KEYS:
+        cols.append(f'{slot}_file TEXT')   # stored filename inside TEMPLATES_DIR
+        cols.append(f'{slot}_name TEXT')   # original filename, for display only
+    conn = _tpl_db()
+    conn.execute('CREATE TABLE IF NOT EXISTS show_templates ('
+                 'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+                 'name TEXT NOT NULL UNIQUE,'
+                 'notes TEXT,'
+                 'created_at REAL NOT NULL,'
+                 'updated_at REAL NOT NULL,'
+                 'genre TEXT,'
+                 'transition TEXT,'
+                 'xfade_dur REAL,'
+                 'settings_json TEXT,'
+                 'vo_start REAL, vo_volume REAL, vo_trim_start REAL, vo_trim_end REAL,'
+                 'title_card_vo_start REAL, title_card_vo_end REAL,'
+                 'end_card_vo_start REAL, end_card_vo_end REAL,'
+                 + ','.join(cols) + ')')
+    # Migration for databases created before settings_json existed.
+    have = {r[1] for r in conn.execute('PRAGMA table_info(show_templates)')}
+    if 'settings_json' not in have:
+        conn.execute('ALTER TABLE show_templates ADD COLUMN settings_json TEXT')
+        print('show_templates: added settings_json column (existing templates keep their assets).')
+    conn.commit()
+    conn.close()
+
+def template_settings(row):
+    """The saved form configuration for a template, as a plain dict."""
+    if not row:
+        return {}
+    try:
+        return json.loads(row.get('settings_json') or '{}')
+    except (ValueError, TypeError):
+        return {}
+
+def _template_public(row):
+    """Shapes a DB row for the UI: hides on-disk filenames, exposes which slots are
+    actually filled plus the display name of each."""
+    out = {k: row.get(k) for k in ('id', 'name', 'notes', 'created_at', 'updated_at', 'genre',
+                                   'transition', 'xfade_dur', 'vo_start', 'vo_volume',
+                                   'vo_trim_start', 'vo_trim_end',
+                                   'title_card_vo_start', 'title_card_vo_end',
+                                   'end_card_vo_start', 'end_card_vo_end')}
+    out['slots'] = {slot: {'filled': bool(row.get(f'{slot}_file')),
+                           'name': row.get(f'{slot}_name'),
+                           'label': TEMPLATE_SLOTS[slot]['label']}
+                    for slot in TEMPLATE_SLOT_KEYS}
+    out['settings'] = template_settings(row)
+    return out
+
+def template_list():
+    conn = _tpl_db()
+    rows = conn.execute('SELECT * FROM show_templates ORDER BY name COLLATE NOCASE').fetchall()
+    conn.close()
+    return [_template_public(dict(r)) for r in rows]
+
+def template_get(tid):
+    conn = _tpl_db()
+    row = conn.execute('SELECT * FROM show_templates WHERE id=?', (tid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def template_get_by_name(name):
+    conn = _tpl_db()
+    row = conn.execute('SELECT * FROM show_templates WHERE name=? COLLATE NOCASE', (name,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def template_store_asset(src_path, slot, orig_name=None):
+    """Copies a resolved upload into TEMPLATES_DIR under a collision-proof name.
+    Returns (stored_filename, display_name)."""
+    ext = os.path.splitext(src_path)[1] or ''
+    stored = f'{slot}_{uuid.uuid4().hex}{ext}'
+    shutil.copy2(src_path, os.path.join(TEMPLATES_DIR, stored))
+    return stored, (orig_name or os.path.basename(src_path))
+
+def template_asset_abspath(row, slot):
+    fn = row.get(f'{slot}_file') if row else None
+    if not fn:
+        return None
+    p = os.path.join(TEMPLATES_DIR, os.path.basename(fn))
+    return p if os.path.exists(p) else None
+
+def template_stage_asset(row, slot):
+    """Copies the template's master asset for `slot` into UPLOAD_FOLDER and returns
+    the job-local path, or None if that slot is empty / missing on disk.
+
+    The copy is REQUIRED -- _run_trailer_job() deletes sfx_upload_path,
+    vo_upload_path, title_card_vo_path and end_card_vo_path once it's done with
+    them, so handing it a TEMPLATES_DIR path directly would destroy the template
+    after a single use."""
+    src = template_asset_abspath(row, slot)
+    if not src:
+        return None
+    ext = os.path.splitext(src)[1] or ''
+    dest = os.path.join(app.config['UPLOAD_FOLDER'],
+                        f'tpl{row["id"]}_{slot}_{int(time.time()*1000)}_{threading.get_ident()}{ext}')
+    shutil.copy2(src, dest)
+    return dest
+
+def template_delete_asset_file(row, slot):
+    p = template_asset_abspath(row, slot)
+    if p:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+def template_delete(tid):
+    row = template_get(tid)
+    if not row:
+        return False
+    for slot in TEMPLATE_SLOT_KEYS:
+        template_delete_asset_file(row, slot)
+    conn = _tpl_db()
+    conn.execute('DELETE FROM show_templates WHERE id=?', (tid,))
+    conn.commit()
+    conn.close()
+    return True
+
+templates_db_init()
+
+# ---- Pipeline stages (for the progress checklist in the UI) ----
+# The job reports 16 distinct named steps but the UI used to collapse them into
+# one bar and one line, so long stages looked frozen and short ones flew past.
+# Each entry is (percent_at_start, label); the UI marks everything below the
+# current percent as done and highlights the stage the job is actually in.
+#
+# "Selecting scenes" starts at 30, not 28: a real, reported bug -- the AI
+# vision scoring loop above climbs incrementally up to 18+12=30 as it works
+# through every scene (see the job_set call using n_scenes_ai below), but
+# several of the steps that genuinely run right after it (transcribing
+# dialogue, preparing music for beat-synced cuts, the actual scene selection
+# itself, transcribing uploaded narration) were still using percent values
+# from BEFORE that 30% ceiling. The progress bar and this stepper visibly
+# jumped backward to "AI vision rating" every time one of those ran, even
+# though the job was moving strictly forward the whole time -- the percent
+# values were just out of order relative to when each step actually executes.
+# Every one of those steps' own job_set() calls (search this file for
+# "Transcribing dialogue", "Preparing music for beat", "Selecting scenes",
+# "Transcribing uploaded narration") now uses a value at or above this same
+# 30, in the same order they actually run in, specifically so this can't
+# regress again -- if a percent value is ever added or changed in that
+# stretch of the pipeline, keeping it >= this table's own "Selecting scenes"
+# entry (and below "Extracting clips" at 38) preserves the same guarantee.
+PIPELINE_STAGES = [
+    (2,   'Reading video'),
+    (8,   'Detecting cuts'),
+    (15,  'Rating scenes'),
+    (18,  'AI vision rating'),
+    (30,  'Selecting scenes'),
+    (38,  'Extracting clips'),
+    (50,  'Transitions'),
+    (58,  'Audio levels'),
+    (62,  'Sound effects'),
+    (80,  'Music'),
+    (90,  'Narration'),
+    (100, 'Done'),
+]
+
+# ---- Preview checkpoint ----
+# A preview job runs the expensive analysis half of the pipeline (detect, score,
+# select) and then STOPS, handing back the chosen cut with thumbnails. The user
+# approves or drops scenes, then renders — and the render reuses this stored
+# selection instead of redoing detection and AI scoring. Without it the only way
+# to see what got picked was to sit through a full render.
+PREVIEWS = {}
+PREVIEWS_LOCK = threading.Lock()
+PREVIEW_TTL = int(os.environ.get('PREVIEW_TTL', 2 * 3600))
+# How many runner-up scenes a preview offers as swap-in alternatives ("show more").
+PREVIEW_ALTERNATES = int(os.environ.get('PREVIEW_ALTERNATES', 12))
+
+def preview_store(pid, data):
+    with PREVIEWS_LOCK:
+        now = time.time()
+        for k in [k for k, v in PREVIEWS.items() if now - v.get('created', 0) > PREVIEW_TTL]:
+            PREVIEWS.pop(k, None)
+        data['created'] = now
+        PREVIEWS[pid] = data
+
+def preview_get(pid):
+    with PREVIEWS_LOCK:
+        p = PREVIEWS.get(pid)
+        return dict(p) if p else None
+
+ACE_STEP_URL = os.environ.get('ACE_STEP_URL', 'http://localhost:8001')
+# Optional, for a hosted ACE-Step endpoint (e.g. acemusic.ai) instead of a
+# self-hosted server -- confirmed against the upstream ACE-Step API docs
+# (docs/en/API.md in ace-step/ACE-Step-1.5): /release_task supports optional
+# Bearer-token auth, same convention as FISH_AUDIO_API_KEY below. Leave blank
+# for a self-hosted server with no auth configured, which is this app's
+# original, unchanged default behavior.
+ACE_STEP_API_KEY = os.environ.get('ACE_STEP_API_KEY', '')
+
+def _ace_step_headers():
+    """Shared by every ACE_STEP_URL request (release_task, query_result
+    polling, the result download, /models) -- a hosted endpoint like
+    acemusic.ai needs the Bearer token on all of them, not just the initial
+    generate call. Returns {} when no key is set, so a self-hosted server
+    with no auth configured sees no Authorization header at all, same as
+    before this existed."""
+    return {'Authorization': f'Bearer {ACE_STEP_API_KEY}'} if ACE_STEP_API_KEY else {}
+# Diffusion steps for music generation. The previous hardcoded 8 was far below
+# ACE-Step's documented default and produced noticeably thin, smeared beds.
+ACE_STEP_STEPS = int(os.environ.get('ACE_STEP_STEPS', 27))
+ACE_STEP_NEGATIVE_PROMPT = os.environ.get(
+    'ACE_STEP_NEGATIVE_PROMPT',
+    'vocals, singing, voice, lyrics, choir, spoken word, low quality, distorted, clipping')
+WOOSH_URL = os.environ.get('WOOSH_URL', 'http://localhost:8030')  # local API server for Sony AI's Woosh SFX foundation model (github.com/SonyResearch/Woosh); tried first for genre SFX, falls back to a procedural synth if unreachable (see woosh_sfx())
+# Local speech-to-text service (e.g. fedirz/faster-whisper-server or any server exposing
+# an OpenAI-compatible POST /v1/audio/transcriptions endpoint). Dialogue transcription
+# calls out to this service instead of loading faster-whisper in-process, same as the
+# other engines (Fish Audio, Ollama, ACE-Step, Woosh) — no local Python whisper
+# dependency required. Override WHISPER_MODEL if your server needs a model name passed.
+WHISPER_URL = os.environ.get('WHISPER_URL', 'http://localhost:8000')
+WHISPER_MODEL = os.environ.get('WHISPER_MODEL', 'large-v2')
+# Self-hosted Fish Audio S2 (SGLang-based server you run yourself) — no API key needed.
+# To use Fish Audio's hosted cloud API instead, set FISH_AUDIO_URL=https://api.fish.audio/v1/tts
+# and FISH_AUDIO_API_KEY to your key.
+FISH_AUDIO_URL = os.environ.get('FISH_AUDIO_URL', 'http://localhost:8080/v1/tts')
+FISH_AUDIO_API_KEY = os.environ.get('FISH_AUDIO_API_KEY', '')  # leave blank for a self-hosted server
+FISH_AUDIO_MODEL = os.environ.get('FISH_AUDIO_MODEL', 's2.1-pro-free')  # ignored by most self-hosted servers, which just run whichever checkpoint they were started with
+
+# ---- Fish Audio inline delivery tags ----
+# Fish Audio interprets markers embedded in the narration text to control
+# emotion, delivery and non-speech sounds. The syntax differs by generation:
+# S2 uses [square brackets] and accepts free-form natural language; the older S1
+# uses (parentheses) and a fixed tag set. FISH_TAG_STYLE picks which to emit --
+# 'auto' infers it from FISH_AUDIO_MODEL, which is what a self-hosted server is
+# usually named after.
+FISH_TAG_STYLE = os.environ.get('FISH_TAG_STYLE', 'auto')
+
+def fish_tag_syntax():
+    """Returns ('[', ']') for S2-style tags or ('(', ')') for legacy S1."""
+    style = (FISH_TAG_STYLE or 'auto').lower()
+    if style in ('s1', 'paren', 'parentheses'):
+        return '(', ')'
+    if style in ('s2', 'bracket', 'brackets'):
+        return '[', ']'
+    model = (FISH_AUDIO_MODEL or '').lower()
+    # Anything explicitly S1 gets parentheses; everything else (s2*, unknown,
+    # blank) gets brackets, which is the current default generation.
+    return ('(', ')') if ('s1' in model and 's2' not in model) else ('[', ']')
+
+# Curated from Fish Audio's emotion-control reference. Not the full 64+ list --
+# these are the ones that actually earn their place in a broadcast promo script;
+# S2 accepts free-form descriptions anyway, so anything missing can be typed.
+FISH_TAG_GROUPS = [
+    ('Delivery', ['emphasis', 'whispering', 'shouting', 'soft tone',
+                  'in a hurry tone', 'screaming']),
+    ('Tone', ['confident', 'excited', 'calm', 'serious', 'friendly',
+              'empathetic', 'curious', 'determined', 'hopeful', 'nostalgic',
+              'sarcastic', 'proud']),
+    ('Emotion', ['happy', 'sad', 'angry', 'scared', 'worried', 'surprised',
+                 'frustrated', 'delighted', 'grateful', 'moved', 'relaxed',
+                 'disappointed']),
+    ('Pauses', ['break', 'long-break']),
+    ('Sounds', ['laughing', 'chuckling', 'sighing', 'gasping', 'panting',
+                'clear throat', 'audience laughing', 'crowd laughing']),
+]
+
+def fish_tag_catalogue():
+    """Tag groups rendered in the syntax the configured model expects."""
+    lo, hi = fish_tag_syntax()
+    return {
+        'open': lo, 'close': hi,
+        'style': 's1' if lo == '(' else 's2',
+        'model': FISH_AUDIO_MODEL,
+        'groups': [{'name': name, 'tags': [{'name': t, 'tag': f'{lo}{t}{hi}'} for t in tags]}
+                   for name, tags in FISH_TAG_GROUPS],
+    }
+# Reference WAV used for Fish Audio voice cloning (zero-shot): the narration voice is
+# cloned from this sample on every request rather than requiring a pre-registered
+# reference_id. Looked up next to this script by default; override with the env var.
+
+# ---- Network (SMB) folder browsing — alternative to local file upload ----
+# Lets the upload panels list and pull media straight from a Windows network
+# share instead of requiring a local drag-and-drop/browse.
+#
+# Config > Network now (see CONFIGURABLE_SERVICES below) rather than only
+# via env vars -- previously excluded specifically because a share password
+# is a plaintext secret, but FISH_AUDIO_API_KEY already established the same
+# admin-only, masked-password-field treatment for a secret of the same
+# sensitivity, so there's no new category of risk in extending it here too.
+#
+# Each of the six browsable categories (HIRES, title/end cards, music, VO,
+# SFX) is configured independently with its own full network path and its
+# own credentials -- there is no shared "default share" to fall back to.
+# An earlier version of this had a default-share-plus-per-category-override
+# system; replaced with this simpler direct model, since in practice
+# whoever's filling this in already knows the exact path and login for each
+# folder rather than thinking of them as subdivisions of one base share.
+AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac', 'wma'}
+# Rundown / script files accepted by Attach script (and the script network folder).
+CAPTION_EXTENSIONS = {'srt', 'vtt', 'scc'}
+SCRIPT_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'webp', 'bmp', 'tif', 'tiff', 'txt', 'md', 'csv'}
+
+# ---- Media upload policy ----
+# When off (the default), media can ONLY come from the configured network
+# folders via Browse Library, or be generated by the AI services -- direct
+# browser file uploads for video/audio are rejected server-side.
+#
+# The reasoning is specifically about ffmpeg: every media file supplied here
+# is eventually handed to it, and ffmpeg is a very large C codebase with a
+# long history of parser CVEs. On a deployment reachable beyond a trusted
+# LAN, the strongest available control isn't validating uploads more
+# carefully, it's not accepting arbitrary media at all. Files coming off an
+# internal share are curated by definition -- someone already needs access to
+# write there.
+#
+# Deliberately an env var rather than a Config-tab toggle: a UI setting for
+# this could be flipped by anyone who compromises an admin session, which is
+# exactly the situation the restriction exists to contain. Set
+# ALLOW_LOCAL_MEDIA_UPLOAD=1 to re-enable (reasonable on an isolated LAN
+# deployment where convenience matters more).
+#
+# NOTE: this covers media only. Script/rundown uploads (Attach script) and AI
+# Assistant document attachments are still accepted -- those are parsed by
+# pypdf/tesseract/Python text decoding, never by ffmpeg, and are size-capped.
+ALLOW_LOCAL_MEDIA_UPLOAD = os.environ.get('ALLOW_LOCAL_MEDIA_UPLOAD', '').lower() in ('1', 'true', 'yes')
+DEFAULT_NETWORK_CATEGORY = 'hires'
+
+def _normalize_unc_path(path):
+    """Accepts whatever format someone reasonably types into a "full network
+    path" field -- \\\\server\\share\\folder, //server/share/folder, or
+    without the leading slashes at all -- and returns it in the exact
+    backslash UNC form smbclient expects. Forgiving on input since this is
+    typed by hand, not selected from a picker."""
+    p = (path or '').strip().replace('/', '\\')
+    p = p.lstrip('\\')
+    return '\\\\' + p if p else ''
+
+# What Vertical Shorts takes as a source: the usual video types and MXF, the broadcast master format
+# (the other tabs do not take it).
+SHORTS_EXTENSIONS = set(ALLOWED_EXTENSIONS) | {'mxf'}
+
+
+def _network_categories():
+    """label/exts per browsable category. No 'folder' key anymore -- each
+    category's full path (including whatever its actual folder name is) is
+    stored directly per-category now, see load_network_folders()."""
+    return {
+        'hires': {'exts': ALLOWED_EXTENSIONS, 'label': 'Video (HIRES)'},
+        # Source video for the Vertical Shorts tab. Its own folder because
+        # shorts are cut from whole episodes, which commonly live somewhere
+        # other than the material promos are built from. 'fallback': until
+        # an admin gives it a path it reads the Video (HIRES) folder, so the
+        # tab keeps working on a server set up before this category existed.
+        'shorts': {'exts': SHORTS_EXTENSIONS, 'label': 'Vertical Shorts video (HIRES)', 'fallback': 'hires'},
+        # Captions that already exist for an episode (SRT / WebVTT / SCC), picked per part in Vertical Shorts.
+        # Reads the Vertical Shorts folder (and through it the HIRES one) until it is given a path of its own.
+        'captions': {'exts': CAPTION_EXTENSIONS, 'label': 'Vertical Shorts captions (SRT / VTT / SCC)', 'fallback': 'shorts'},
+        # Artwork for the Schedule Plug tab: stills, not video -- a flat
+        # image or a layered Photoshop file. No fallback: nothing else that
+        # is configured holds images.
+        'schedule': {'exts': SCHEDULE_IMAGE_EXTENSIONS, 'label': 'Schedule plug artwork (image / PSD)'},
+        # NOTE the legacy form-field names: 'end_card_video' is the TITLE
+        # card and 'schedule_video' is the END card (see TEMPLATE_SLOTS for
+        # the same mapping).
+        'tcard': {'exts': ALLOWED_EXTENSIONS, 'label': 'Title card (TCARD)'},
+        'endcard': {'exts': ALLOWED_EXTENSIONS, 'label': 'End card (ENDCARD)'},
+        'music': {'exts': AUDIO_EXTENSIONS, 'label': 'Music'},
+        'vo':    {'exts': AUDIO_EXTENSIONS, 'label': 'VO'},
+        'sfx':   {'exts': AUDIO_EXTENSIONS, 'label': 'SFX'},
+        'script': {'exts': SCRIPT_EXTENSIONS, 'label': 'Script / rundown'},
+    }
+
+def _network_category(category):
+    """Validates/normalizes a category key, falling back to 'hires'."""
+    cats = _network_categories()
+    return cats.get(category, cats[DEFAULT_NETWORK_CATEGORY])
+
+def _sanitize_subpath(subpath):
+    """Validates a subfolder path (relative to a category's configured root)
+    typed or clicked into from the browse-library modal. Accepts either slash
+    style, collapses '.' segments, and rejects '..' outright so browsing can
+    never escape the configured root. Returns the cleaned path joined with
+    backslashes -- '' means the root itself."""
+    raw = (subpath or '').strip().replace('/', '\\')
+    parts = [p for p in raw.split('\\') if p and p != '.']
+    if any(p == '..' for p in parts):
+        raise ValueError('Invalid subfolder path')
+    return '\\'.join(parts)
+
+# Categories that hold full-length source video: the ones the configured
+# maximum video size applies to.
+VIDEO_SOURCE_CATEGORIES = ('hires', 'shorts')
+
+def _network_folder_row(category):
+    """The saved path/username/password `category` actually reads from.
+    Its own row -- or, for a category that names a 'fallback' and has no
+    path of its own yet, that other category's row WHOLE (path and login
+    together: a login only means something next to the share it is for).
+    Resolved here and nowhere else, so listing, searching, fetching and the
+    SMB session can never disagree about which folder a category means."""
+    folders = load_network_folders()
+    row = folders.get(category, {})
+    seen = {category}
+    while not (row.get('path') or '').strip():
+        fallback = _network_categories().get(category, {}).get('fallback')
+        if not fallback or fallback in seen:
+            break
+        seen.add(fallback)
+        category = fallback
+        row = folders.get(category, {})
+    return row
+
+def _network_share_root(category=DEFAULT_NETWORK_CATEGORY):
+    """The configured full UNC path for `category`, normalized -- empty
+    string if that category hasn't been set up in Config > Network yet."""
+    return _normalize_unc_path(_network_folder_row(category).get('path', ''))
+
+def _network_session(category=DEFAULT_NETWORK_CATEGORY):
+    """(Re)registers the SMB session for `category`'s configured host.
+    smbclient caches connections per-server, so calling this repeatedly is
+    cheap once logged in -- including across categories that happen to
+    share the same server, still a common case even though each is
+    independently configured."""
+    row = _network_folder_row(category)
+    root = _normalize_unc_path(row.get('path', ''))
+    # Host is the third UNC path segment: \\HOST\share\...
+    parts = root.split('\\')
+    host = parts[2] if len(parts) > 2 else ''
+    smbclient.register_session(host, username=row.get('username', ''),
+                                password=row.get('password', ''), connection_timeout=10)
+
+def list_network_files(category=DEFAULT_NETWORK_CATEGORY, subpath=''):
+    """Returns the subfolders and files (name/size/modified) inside `subpath`
+    (relative to `category`'s configured root -- '' for the root itself),
+    files filtered to that category's allowed extensions. Subfolders aren't
+    extension-filtered since you need to see them to browse into them."""
+    cat = _network_category(category)
+    root = _network_share_root(category)
+    if not root:
+        raise ValueError(f'No network path configured for {cat["label"]} yet -- set it in Config > Network.')
+    sub = _sanitize_subpath(subpath)
+    full = root + ('\\' + sub if sub else '')
+    _network_session(category)
+    folders, files = [], []
+    for entry in smbclient.scandir(full):
+        if entry.is_dir():
+            folders.append({'name': entry.name})
+        elif entry.is_file() and allowed_file(entry.name, cat['exts']):
+            st = entry.stat()
+            files.append({'name': entry.name, 'size': st.st_size, 'mtime': st.st_mtime})
+    folders.sort(key=lambda e: e['name'].lower())
+    files.sort(key=lambda e: e['name'].lower())
+    return full, sub, folders, files
+
+# Recursive search is capped on both depth and result count -- an SMB walk
+# over a large or deep tree can otherwise take a very long time (or
+# effectively hang) rather than fail fast. Returns whatever it found before
+# hitting either cap, with a truncated flag, rather than blocking
+# indefinitely trying to be exhaustive.
+NETWORK_RECURSIVE_MAX_RESULTS = int(os.environ.get('NETWORK_RECURSIVE_MAX_RESULTS', 500))
+NETWORK_RECURSIVE_MAX_DEPTH = int(os.environ.get('NETWORK_RECURSIVE_MAX_DEPTH', 8))
+
+def list_network_files_recursive(category=DEFAULT_NETWORK_CATEGORY, subpath='', query=''):
+    """Walks every subfolder under `subpath` (relative to `category`'s
+    configured root) and returns every matching file OR folder found at any
+    depth, each annotated with its own subpath so the caller knows where it
+    actually lives -- results from different folders are otherwise
+    indistinguishable once flattened. `query` (case-insensitive substring
+    against the name) is optional; blank means every file, which is a
+    reasonable search on its own ("show me everything under here" instead
+    of clicking through folders one at a time).
+
+    A matching folder is returned alongside matching files (each item
+    carries is_dir so the caller can tell them apart and act
+    accordingly -- fetch a file, navigate into a folder) -- searching used
+    to only ever look at filenames, silently skipping folder names
+    entirely, so searching for a show's own folder name (rather than a
+    specific file inside it) came back empty even when that folder
+    genuinely existed right there. A folder is still queued for its own
+    recursive search regardless of whether it matched, since files inside
+    it may match even when its own name doesn't, and vice versa a matching
+    folder's own contents should still surface normally by browsing into it.
+
+    Breadth-first rather than recursive Python calls -- straightforward to
+    cap depth/result count cleanly, and avoids any recursion-depth concern
+    on a pathological folder tree. An unreadable subfolder (permissions,
+    a transient SMB error) is skipped rather than aborting the whole
+    search, since one bad folder shouldn't hide results from every other
+    one."""
+    cat = _network_category(category)
+    root = _network_share_root(category)
+    if not root:
+        raise ValueError(f'No network path configured for {cat["label"]} yet -- set it in Config > Network.')
+    start_sub = _sanitize_subpath(subpath)
+    _network_session(category)
+    q = (query or '').strip().lower()
+
+    results = []
+    truncated = False
+    queue = [(start_sub, 0)]
+    while queue:
+        cur_sub, depth = queue.pop(0)
+        full = root + ('\\' + cur_sub if cur_sub else '')
+        try:
+            entries = list(smbclient.scandir(full))
+        except Exception:
+            continue
+        for entry in entries:
+            if entry.is_dir():
+                # A blank query already means "every file" for the file
+                # branch below -- matching that same "show everything"
+                # behavior here too, rather than blank query silently
+                # excluding every folder while blank-query file results
+                # already include everything at every depth.
+                if not q or q in entry.name.lower():
+                    results.append({'name': entry.name, 'subpath': cur_sub, 'is_dir': True})
+                    if len(results) >= NETWORK_RECURSIVE_MAX_RESULTS:
+                        truncated = True
+                        break
+                if depth < NETWORK_RECURSIVE_MAX_DEPTH:
+                    queue.append((cur_sub + '\\' + entry.name if cur_sub else entry.name, depth + 1))
+                continue
+            if not entry.is_file() or not allowed_file(entry.name, cat['exts']):
+                continue
+            if q and q not in entry.name.lower():
+                continue
+            st = entry.stat()
+            results.append({'name': entry.name, 'subpath': cur_sub, 'size': st.st_size, 'mtime': st.st_mtime, 'is_dir': False})
+            if len(results) >= NETWORK_RECURSIVE_MAX_RESULTS:
+                truncated = True
+                break
+        if truncated:
+            break
+    # Folders sort before files within the same subpath, matching how the
+    # non-search folder browser already lists folders before files -- a
+    # search shouldn't rearrange that convention just because it flattens
+    # multiple subpaths together.
+    results.sort(key=lambda e: (e['subpath'], not e.get('is_dir'), e['name'].lower()))
+    return root, results, truncated
+
+def _asset_display_name(path):
+    """A clean, human-readable name for a resolved asset path, for the
+    production summary shown alongside a finished render -- not something
+    to feed back into any actual file operation, purely for a person to
+    read. A network-staged file's local name is always net_<timestamp>_
+    <original name> (see fetch_network_file); a combined multi-file
+    result's local name ends in _combined<ext> with no way to recover the
+    individual original names from the path alone, so that case is left
+    as-is rather than guessed at. A direct upload's local name has no such
+    prefix at all -- it's field_name_timestamp_threadid.ext with the real
+    original name discarded entirely (see _resolve_upload) -- so for that
+    case this only produces something readable when the caller already
+    resolved the real name via _upload_orig_name and this is just
+    tidying a network-staged one instead."""
+    if not path:
+        return None
+    base = os.path.basename(path)
+    m = re.match(r'^net_\d+_(.+)$', base)
+    return m.group(1) if m else base
+
+def _upload_orig_name(field_name):
+    """The real, original filename for an optional media field resolved via
+    _resolve_upload -- needed because that function's own local path
+    throws the original name away entirely for a direct upload (see its
+    own docstring), unlike load_video()'s path/orig_name pair for the main
+    source video. Checks the direct-upload case first (request.files still
+    has the browser's own original filename at this point in the request),
+    falling back to _asset_display_name for a network-staged pick, whose
+    local name still has the original name embedded in it after the
+    net_<timestamp>_ prefix."""
+    f = request.files.get(field_name)
+    if f and f.filename:
+        return secure_filename(f.filename) or None
+    staged = (request.form.get(field_name + '_network') or '').strip()
+    return _asset_display_name(staged) if staged else None
+
+def _safe_exception_text(e):
+    """str(e), but never raises itself -- some smbprotocol exceptions
+    (SharingViolation included) build their own message lazily from the raw
+    SMB response header, which can itself fail to parse in edge cases.
+    An error message failing while it's being constructed, on top of the
+    original error, would be a worse failure than just losing some detail
+    from it -- so this falls back to the exception's type name alone
+    rather than letting that secondary failure propagate."""
+    try:
+        return str(e)
+    except Exception:
+        return type(e).__name__
+
+# Where each staged copy came from: {local name: {'category', 'subpath',
+# 'name'}}. A staged copy lives in UPLOAD_FOLDER, which is emptied by age
+# and starts empty after a restart; something that has to outlive it (a
+# Vertical Shorts analysis kept for review) records this, and fetches the
+# file again from the same place when it is next needed.
+STAGED_ORIGINS = {}
+
+
+def staged_origin(local_name):
+    """Where a staged copy (net_<ts>_<name>) was fetched from, or None."""
+    return dict(STAGED_ORIGINS[local_name]) if local_name in STAGED_ORIGINS else None
+
+
+# ---- Reading a network file where it is, instead of copying it here ----
+# For the categories in INPLACE_CATEGORIES an admin can switch "read in place"
+# on (Config > Network). A pick then does not copy anything: it records where
+# the file is, and the job opens that path directly. That needs this server's
+# own operating system to be able to open the share path (the SMB client used
+# for browsing and copying is a library inside this process, not something
+# ffmpeg or OpenCV can read through); when it cannot, the pick falls back to
+# a copy, so the setting can never make a file unusable.
+INPLACE_CATEGORIES = ('shorts', 'hires')
+INPLACE = {}            # staged name -> {'path', 'category', 'subpath', 'name'}
+INPLACE_ORIGINS = {}    # path on the share -> {'category', 'subpath', 'name'}
+
+
+def network_in_place(category):
+    """Whether picks from `category` are read where they are."""
+    if category not in INPLACE_CATEGORIES:
+        return False
+    # The box on the folder's own row counts even while its path is blank and it is
+    # borrowing another folder (Vertical Shorts reading the HIRES one) -- that is where
+    # the person ticked it.
+    return bool(load_network_folders().get(category, {}).get('in_place')
+                or _network_folder_row(category).get('in_place'))
+
+
+def _readable_in_place(path):
+    """Whether this server's operating system can open `path` (a test seam as much as a check)."""
+    try:
+        with open(path, 'rb') as f:
+            f.read(1)
+        return True
+    except OSError:
+        return False
+
+
+_OS_SHARE_TRIED = {}
+
+
+def _connect_os_share(category):
+    """Windows only: gives this process's own logon session a connection to the category's share, using the
+    login saved in Config > Network, so the operating system itself (ffmpeg, OpenCV, Python's open) can read
+    the share in place. The login is otherwise used only by smbclient for browsing and copying, which does not
+    help a program that opens the UNC path through Windows. (ok, why-not)."""
+    if os.name != 'nt':
+        return False, 'not Windows'
+    row = _network_folder_row(category)
+    root = _normalize_unc_path(row.get('path', ''))
+    parts = [x for x in root.split('\\') if x]
+    if len(parts) < 2 or not row.get('username'):
+        return False, 'no share or login saved for this folder'
+    remote = '\\\\' + parts[0] + '\\' + parts[1]
+    key = (remote.lower(), row.get('username'))
+    last = _OS_SHARE_TRIED.get(key)
+    if last and time.time() - last[0] < 30:
+        return last[1], last[2]
+    import ctypes
+    from ctypes import wintypes
+
+    class NETRESOURCEW(ctypes.Structure):
+        _fields_ = [('dwScope', wintypes.DWORD), ('dwType', wintypes.DWORD), ('dwDisplayType', wintypes.DWORD),
+                    ('dwUsage', wintypes.DWORD), ('lpLocalName', wintypes.LPWSTR), ('lpRemoteName', wintypes.LPWSTR),
+                    ('lpComment', wintypes.LPWSTR), ('lpProvider', wintypes.LPWSTR)]
+    nr = NETRESOURCEW(0, 1, 0, 0, None, remote, None, None)
+    try:
+        rc = ctypes.windll.mpr.WNetAddConnection2W(ctypes.byref(nr), row.get('password') or None, row.get('username'), 0)
+    except Exception as e:
+        rc, why = -1, str(e)
+    else:
+        why = {0: '', 1219: 'Windows already has a connection to this server under a different login (disconnect it '
+                            'with "net use * /delete" and try again)',
+               1326: 'Windows rejected the saved login', 53: 'Windows cannot find the network path',
+               5: 'access denied'}.get(rc, f'Windows error {rc}')
+    ok = rc == 0
+    _OS_SHARE_TRIED[key] = (time.time(), ok, why)
+    return ok, why
+
+
+def _open_error(path):
+    try:
+        with open(path, 'rb') as f:
+            f.read(1)
+        return None
+    except OSError as e:
+        return f'{e.strerror or e}'
+
+
+def inside_uploads(path):
+    """Whether `path` is a file in UPLOAD_FOLDER -- ours to clean up. A source read in
+    place is on the network share, and nothing here may ever delete or alter it."""
+    return bool(path) and os.path.dirname(os.path.abspath(path)) == os.path.abspath(app.config['UPLOAD_FOLDER'])
+
+
+def staged_path(local_name):
+    """The path of a staged name: where it was left in place, or its copy in UPLOAD_FOLDER."""
+    if local_name in INPLACE:
+        return INPLACE[local_name]['path']
+    return os.path.join(app.config['UPLOAD_FOLDER'], local_name)
+
+
+def origin_of_path(path):
+    """Where a source path came from -- a share path read in place, or a staged copy -- or None."""
+    return dict(INPLACE_ORIGINS[path]) if path in INPLACE_ORIGINS else staged_origin(os.path.basename(path or ''))
+
+
+def stage_network_file(name, category=DEFAULT_NETWORK_CATEGORY, subpath=''):
+    """What fetch_network_file() does, or -- where read-in-place is on and
+    the share can be opened directly -- nothing but note where the file is.
+    {'local_name', 'path', 'in_place', 'note'}."""
+    if network_in_place(category):
+        cat = _network_category(category)
+        if os.path.basename(name) != name or not allowed_file(name, cat['exts']):
+            raise ValueError('Invalid filename')
+        root = _network_share_root(category)
+        if not root:
+            raise ValueError(f'No network path configured for {cat["label"]} yet -- set it in Config > Network.')
+        sub = _sanitize_subpath(subpath)
+        remote_path = root + ('\\' + sub if sub else '') + '\\' + name
+        why = None
+        if not _readable_in_place(remote_path):
+            # The saved login was only given to smbclient. Give Windows the same one, then look again.
+            ok, why = _connect_os_share(category)
+            if ok and not _readable_in_place(remote_path):
+                why = 'connected, but the path still could not be opened: ' + (_open_error(remote_path) or '')
+        if _readable_in_place(remote_path):
+            try:
+                size = os.path.getsize(remote_path)
+            except OSError:
+                size = None
+            if size is not None and category in VIDEO_SOURCE_CATEGORIES:
+                ok, err = check_video_size(size, label=name)
+                if not ok:
+                    raise ValueError(err)
+            local_name = f'net_{int(time.time())}_{secure_filename(name)}'
+            origin = {'category': category, 'subpath': sub, 'name': name}
+            if len(INPLACE) > 2000:
+                for k in list(INPLACE)[:1000]:
+                    INPLACE.pop(k, None)
+            INPLACE[local_name] = dict(origin, path=remote_path)
+            INPLACE_ORIGINS[remote_path] = origin
+            return {'local_name': local_name, 'path': remote_path, 'in_place': True, 'note': None, 'size': size}
+        note = ('This server could not open the share path directly, so the file was copied instead'
+                + (f' ({why})' if why else '') + '. '
+                'Check that the account PRISM runs under can read it, or switch "read in place" off.')
+    else:
+        note = None
+    local_name = fetch_network_file(name, category, subpath)
+    path = os.path.join(app.config['UPLOAD_FOLDER'], local_name)
+    return {'local_name': local_name, 'path': path, 'in_place': False, 'note': note, 'size': os.path.getsize(path)}
+
+
+def _is_sharing_violation(e):
+    """NtStatus 0xC0000043: the file is open elsewhere. smbclient reports it as an SMBOSError (an OSError
+    carrying .ntstatus), not as smbprotocol's SharingViolation, so both are recognised."""
+    return isinstance(e, SharingViolation) or getattr(e, 'ntstatus', None) == 0xC0000043
+
+
+def _copy_from_share(remote_path, local_path):
+    """Copy one share file to local_path. Opened allowing other readers, writers and deleters to keep the file
+    open, so an ingest that is still writing it does not block the read."""
+    with smbclient.open_file(remote_path, mode='rb', share_access='rwd') as rf, open(local_path, 'wb') as lf:
+        shutil.copyfileobj(rf, lf)
+
+
+def fetch_network_file(name, category=DEFAULT_NETWORK_CATEGORY, subpath=''):
+    """Copies `name` from inside `subpath` of the network folder for `category`
+    into UPLOAD_FOLDER and returns the local staged filename (prefixed
+    net_<ts>_ so load_video() / _resolve_upload() can recognize and trust it)."""
+    cat = _network_category(category)
+    if os.path.basename(name) != name or not allowed_file(name, cat['exts']):
+        raise ValueError('Invalid filename')
+    root = _network_share_root(category)
+    if not root:
+        raise ValueError(f'No network path configured for {cat["label"]} yet -- set it in Config > Network.')
+    sub = _sanitize_subpath(subpath)
+    _network_session(category)
+    remote_path = root + ('\\' + sub if sub else '') + '\\' + name
+    # Checked via a stat, before opening/copying anything -- rejecting a file
+    # that's over the configured limit shouldn't cost the time and bandwidth
+    # of pulling it across the network first. Only enforced for the source
+    # video categories (HIRES, and the Vertical Shorts folder), which this
+    # limit is actually about; the others (music, SFX, cards) were never in
+    # scope for a "max video size" setting.
+    if category in VIDEO_SOURCE_CATEGORIES:
+        try:
+            size = smbclient.stat(remote_path).st_size
+        except Exception:
+            size = None  # stat failing shouldn't block the fetch -- let the real copy surface the real error
+        if size is not None:
+            ok, err = check_video_size(size, label=name)
+            if not ok:
+                raise ValueError(err)
+    local_name = f'net_{int(time.time())}_{secure_filename(name)}'
+    local_path = os.path.join(app.config['UPLOAD_FOLDER'], local_name)
+    # A file actively being written by a sync tool (this share's own name
+    # includes "raysync") is often locked for only as long as that write
+    # takes -- typically a few seconds, not indefinitely. A SharingViolation
+    # here is a real, observed production error (NtStatus 0xC0000043): the
+    # file genuinely exists and was found -- that status code is SMB's own
+    # "someone else has this open right now", not "not found" or a
+    # permissions problem, so retrying shortly after is a real fix for the
+    # common case, not a blind hope. Only retries THIS specific exception;
+    # anything else (auth, not-found, network) fails immediately, since
+    # retrying those would just waste time on an error retrying can't help.
+    last_err = None
+    for attempt in range(4):
+        if attempt > 0:
+            time.sleep(1.5 * attempt)
+        try:
+            _copy_from_share(remote_path, local_path)
+            if len(STAGED_ORIGINS) > 2000:
+                for k in list(STAGED_ORIGINS)[:1000]:
+                    STAGED_ORIGINS.pop(k, None)
+            STAGED_ORIGINS[local_name] = {'category': category, 'subpath': sub, 'name': name}
+            return local_name
+        except Exception as e:
+            if not _is_sharing_violation(e):
+                raise
+            last_err = e
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+    # This process's own pooled SMB session can be what still holds the file (a pick that was never used); one
+    # last attempt on a fresh session covers that. A violation that survives it is external.
+    try:
+        smbclient.reset_connection_cache()
+        _network_session(category)
+        _copy_from_share(remote_path, local_path)
+        return local_name
+    except Exception as e:
+        if not _is_sharing_violation(e):
+            raise
+        last_err = e
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+    raise ValueError(f'"{name}" is currently in use by another process on the network share '
+                      f'(often a sync tool actively writing it) -- please try again in a moment. '
+                      f'({_safe_exception_text(last_err)})')
+
+# Back-compat aliases (old names, always the 'hires'/video category, root only).
+def list_network_videos():
+    root, sub, folders, files = list_network_files('hires')
+    return root, files
+
+def fetch_network_video(name):
+    return fetch_network_file(name, 'hires')
+
+# ---- Config tab persistence: lets the AI service URLs above be edited from the UI ----
+# instead of only via environment variables. Overrides are saved to a small JSON file
+# next to this script and re-applied on every startup, on top of the env-var defaults
+# set above. Env vars still win at process start; the Config tab wins after that until
+# the file is deleted or a value is cleared back to blank.
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ai_services_config.json')
+# name -> (module-level global to update, human label, help text)
+CONFIGURABLE_SERVICES = {
+    'FISH_AUDIO_URL':    ('Fish Audio S2', 'Full TTS endpoint URL, e.g. http://host:8080/v1/tts'),
+    'FISH_AUDIO_API_KEY':('Fish Audio API key', 'Only needed for the hosted fish.audio cloud API — leave blank for a self-hosted server'),
+    'WHISPER_URL':       ('faster-whisper', 'Base server URL, e.g. http://localhost:8000'),
+    'OLLAMA_URL':        ('Ollama', 'Base server URL, e.g. http://localhost:11434'),
+    'ACE_STEP_URL':      ('ACE-Step', 'Base server URL, e.g. http://localhost:8001 — or a hosted endpoint like acemusic.ai'),
+    'ACE_STEP_API_KEY':  ('ACE-Step API key', 'Only needed for a hosted ACE-Step endpoint (e.g. acemusic.ai) — leave blank for a self-hosted server with no auth'),
+    'WOOSH_URL':         ('Woosh', 'Base server URL, e.g. http://localhost:8030'),
+    # Network share paths/credentials are NOT here -- each of the six
+    # browsable categories is configured independently via
+    # /api/network/shares (see load_network_folders/save_network_folder in
+    # library_db.py), not through this flat single-value-per-key mechanism.
+}
+
+def load_config_overrides():
+    """Applies any saved Config-tab overrides on top of the env-var defaults above.
+    Called once at startup, after every constant it might touch is already defined."""
+    global FISH_AUDIO_URL, FISH_AUDIO_API_KEY, WHISPER_URL, OLLAMA_URL, ACE_STEP_URL, ACE_STEP_API_KEY, WOOSH_URL
+    if not os.path.exists(CONFIG_FILE):
+        return
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except Exception as e:
+        print(f'Config file load error ({CONFIG_FILE}): {e}')
+        return
+    if 'FISH_AUDIO_URL' in cfg and cfg['FISH_AUDIO_URL']: FISH_AUDIO_URL = cfg['FISH_AUDIO_URL']
+    if 'FISH_AUDIO_API_KEY' in cfg: FISH_AUDIO_API_KEY = cfg['FISH_AUDIO_API_KEY']
+    if 'WHISPER_URL' in cfg and cfg['WHISPER_URL']: WHISPER_URL = cfg['WHISPER_URL']
+    if 'OLLAMA_URL' in cfg and cfg['OLLAMA_URL']: OLLAMA_URL = cfg['OLLAMA_URL']
+    if 'ACE_STEP_URL' in cfg and cfg['ACE_STEP_URL']: ACE_STEP_URL = cfg['ACE_STEP_URL']
+    if 'ACE_STEP_API_KEY' in cfg: ACE_STEP_API_KEY = cfg['ACE_STEP_API_KEY']
+    if 'WOOSH_URL' in cfg and cfg['WOOSH_URL']: WOOSH_URL = cfg['WOOSH_URL']
+
+def save_config_overrides(updates):
+    """Merges `updates` (dict of the CONFIGURABLE_SERVICES keys) into the config file
+    and applies them to the live module globals immediately — no restart needed."""
+    global FISH_AUDIO_URL, FISH_AUDIO_API_KEY, WHISPER_URL, OLLAMA_URL, ACE_STEP_URL, ACE_STEP_API_KEY, WOOSH_URL
+    existing = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+    existing.update({k: v for k, v in updates.items() if k in CONFIGURABLE_SERVICES})
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(existing, f, indent=2)
+    if 'FISH_AUDIO_URL' in updates: FISH_AUDIO_URL = updates['FISH_AUDIO_URL'] or FISH_AUDIO_URL
+    if 'FISH_AUDIO_API_KEY' in updates: FISH_AUDIO_API_KEY = updates['FISH_AUDIO_API_KEY']
+    if 'WHISPER_URL' in updates: WHISPER_URL = updates['WHISPER_URL'] or WHISPER_URL
+    if 'OLLAMA_URL' in updates: OLLAMA_URL = updates['OLLAMA_URL'] or OLLAMA_URL
+    if 'ACE_STEP_URL' in updates: ACE_STEP_URL = updates['ACE_STEP_URL'] or ACE_STEP_URL
+    if 'ACE_STEP_API_KEY' in updates: ACE_STEP_API_KEY = updates['ACE_STEP_API_KEY']
+    if 'WOOSH_URL' in updates: WOOSH_URL = updates['WOOSH_URL'] or WOOSH_URL
+
+def current_config_values():
+    return {
+        'FISH_AUDIO_URL': FISH_AUDIO_URL, 'FISH_AUDIO_API_KEY': FISH_AUDIO_API_KEY,
+        'WHISPER_URL': WHISPER_URL,
+        'OLLAMA_URL': OLLAMA_URL, 'ACE_STEP_URL': ACE_STEP_URL, 'ACE_STEP_API_KEY': ACE_STEP_API_KEY,
+        'WOOSH_URL': WOOSH_URL,
+    }
+
+# ---- Production defaults (Config > Production) ----
+# Settings that are deployment-wide standards rather than per-promo creative
+# choices, moved off the generator form where they were 25-odd controls
+# everyone had to scroll past on every single job:
+#   * Loudness/true-peak/dual-mono are broadcast COMPLIANCE values (EBU R128 /
+#     ATSC A/85). They should be identical on every promo a station ships --
+#     varying them per job is a delivery-spec violation waiting to happen, not
+#     a feature.
+#   * Duck depth/hold/music level are the house mix standard.
+#   * Scene-detection thresholds are tuning knobs most operators can't
+#     reason about, where a wrong value silently produces bad cuts rather
+#     than an obvious error.
+# The generator still accepts all of these as form fields (saved templates
+# carry them, and a genuine one-off override stays possible via the API), but
+# when a field ISN'T supplied it now falls back to these configured values
+# instead of a constant hardcoded in the request parser.
+PRODUCTION_DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'production_defaults.json')
+PRODUCTION_DEFAULT_SPEC = {
+    'target_loudness':   {'default': -14.0, 'type': 'float', 'label': 'Loudness target (LUFS)',
+                          'help': 'Broadcast standard is -23 LUFS (EBU R128) or -24 LKFS (ATSC A/85); -14 suits online/streaming delivery.'},
+    'true_peak':         {'default': -1.5, 'type': 'float', 'label': 'True peak ceiling (dBTP)',
+                          'help': 'Maximum permitted peak. -1.5 is a safe default; broadcast delivery often specifies -2.0.'},
+    'music_duck_db':     {'default': -3.0, 'type': 'float', 'label': 'Music bed level (dB)',
+                          'help': 'How far the music sits below full scale before any ducking is applied.'},
+    'duck_depth_db':     {'default': -15.0, 'type': 'float', 'label': 'Duck depth (dB)',
+                          'help': 'How far the music drops underneath dialogue and narration.'},
+    'duck_release_hold': {'default': 0.7, 'type': 'float', 'label': 'Duck hold (seconds)',
+                          'help': 'How long the music stays ducked after a line ends before coming back up. Higher values prevent music from swelling back during short pauses or while a speaker is still finishing a thought.'},
+    'broadcast_stereo':  {'default': False, 'type': 'bool', 'label': 'Broadcast dual-mono',
+                          'help': 'Force all audio identical in L/R -- required by some broadcast delivery specs.'},
+    'scene_threshold':   {'default': 30.0, 'type': 'float', 'label': 'Cut sensitivity',
+                          'help': 'Lower finds more cuts (content detector). 30 suits most broadcast footage.'},
+    'min_scene_len':     {'default': 0.5, 'type': 'float', 'label': 'Minimum scene length (seconds)',
+                          'help': 'Scenes shorter than this are ignored, filtering out flash frames and whip pans.'},
+    'detector':          {'default': 'content', 'type': 'choice', 'choices': ['content', 'adaptive'],
+                          'label': 'Scene detector',
+                          'help': "'content' suits most footage; 'adaptive' handles fades and gradual transitions better."},
+    'adaptive_threshold':{'default': 3.0, 'type': 'float', 'label': 'Adaptive threshold',
+                          'help': 'Only used when the detector above is set to adaptive.'},
+    'vision_model':      {'default': 'qwen3-vl:8b', 'type': 'text', 'label': 'AI Vision model',
+                          'help': 'Ollama model used to rate scene content. Must be a vision-capable model already pulled on the Ollama server.'},
+    'max_video_size_mb': {'default': 8000.0, 'type': 'float', 'label': 'Max source video size (MB)',
+                          'help': 'Rejects a HIRES source video larger than this, whether picked from a network share or uploaded directly. Set to 0 for no limit.'},
+    'unload_vision_after_scoring': {'default': True, 'type': 'bool', 'label': 'Unload AI Vision model after scoring',
+                          'help': "Frees GPU memory right after scoring finishes, before dialogue transcription starts. Turn off only if Ollama and faster-whisper run on separate GPUs (or you have VRAM to spare) and you'd rather keep the vision model warm for faster back-to-back renders."},
+}
+
+def load_production_defaults():
+    """Current production defaults, falling back to PRODUCTION_DEFAULT_SPEC's
+    built-ins for anything never configured. Always returns a complete dict so
+    callers never need their own fallback logic."""
+    values = {k: v['default'] for k, v in PRODUCTION_DEFAULT_SPEC.items()}
+    if os.path.exists(PRODUCTION_DEFAULTS_FILE):
+        try:
+            with open(PRODUCTION_DEFAULTS_FILE) as f:
+                saved = json.load(f)
+            for k, spec in PRODUCTION_DEFAULT_SPEC.items():
+                if k not in saved:
+                    continue
+                raw = saved[k]
+                try:
+                    if spec['type'] == 'float':
+                        values[k] = float(raw)
+                    elif spec['type'] == 'bool':
+                        values[k] = bool(raw)
+                    elif spec['type'] == 'text':
+                        values[k] = str(raw).strip() or spec['default']
+                    elif spec['type'] == 'choice':
+                        if raw in spec['choices']:
+                            values[k] = raw
+                except (TypeError, ValueError):
+                    pass  # keep the built-in default rather than a bad saved value
+        except Exception as e:
+            print(f'Production defaults load error ({PRODUCTION_DEFAULTS_FILE}): {e}')
+    return values
+
+def video_size_limit_bytes():
+    """Current max-source-video-size limit in bytes, or None for no limit
+    (0 or unset in Config > Production). Bytes rather than MB so every call
+    site can compare directly against a real file size without repeating
+    the unit conversion."""
+    mb = load_production_defaults().get('max_video_size_mb', 0)
+    return int(mb * 1024 * 1024) if mb and mb > 0 else None
+
+def check_video_size(size_bytes, label='This file'):
+    """(ok, error) against the current limit. Centralised so network-fetch,
+    direct upload, and the multi-file combine path all enforce the exact
+    same rule rather than three copies that could drift out of sync."""
+    limit = video_size_limit_bytes()
+    if limit is not None and size_bytes > limit:
+        limit_mb = limit / (1024 * 1024)
+        got_mb = size_bytes / (1024 * 1024)
+        # Enough decimal places that a small file/limit (a test fixture, or
+        # a deliberately tight admin-set limit) doesn't both round down to
+        # "0 MB" and produce a nonsensical "0 MB, over the 0 MB limit" --
+        # confirmed this was a real, reproducible bug by testing with an
+        # actual sub-1MB file rather than assuming large real footage would
+        # never hit the same rounding at some other boundary.
+        return False, f'{label} is {got_mb:.2f} MB, over the {limit_mb:.2f} MB limit set in Config > Production.'
+    return True, None
+
+def save_production_defaults(updates):
+    """Merges `updates` into the saved production defaults. Unknown keys and
+    values that don't parse are ignored rather than written through, so a
+    malformed request can't corrupt the delivery spec for every future job."""
+    current = load_production_defaults()
+    for k, spec in PRODUCTION_DEFAULT_SPEC.items():
+        if k not in updates:
+            continue
+        raw = updates[k]
+        try:
+            if spec['type'] == 'float':
+                current[k] = float(raw)
+            elif spec['type'] == 'bool':
+                current[k] = bool(raw)
+            elif spec['type'] == 'text':
+                # An empty string falls back to the built-in rather than
+                # saving a blank -- a blank vision model name would fail
+                # every scoring call with a confusing error rather than an
+                # obvious "you cleared this" one.
+                current[k] = str(raw).strip() or spec['default']
+            elif spec['type'] == 'choice':
+                if raw in spec['choices']:
+                    current[k] = raw
+        except (TypeError, ValueError):
+            continue
+    with open(PRODUCTION_DEFAULTS_FILE, 'w') as f:
+        json.dump(current, f, indent=2)
+    return current
+
+# ---- Branding ----
+# Moved to library_db.py (see there for load_branding/save_branding_text/etc.)
+# so both this module's Config > Branding routes AND auth.py's login page can
+# import it without a circular import -- auth.py already imports from
+# library_db, and pipeline.py imports from auth, so branding couldn't live
+# here if the login page needed it too. Re-imported below under the same
+# names so nothing else in this file has to change.
+
+# ---- Fish Audio S2 (fish.audio) — primary voiceover engine (self-hosted or cloud REST API) ----
+# How long to wait for a TTS server to synthesize. The old hardcoded 30s was
+# fine for a preview but too tight for a full narration script on a self-hosted
+# CPU instance -- when it expired the VO was silently dropped and the trailer
+# rendered mute, with the reason buried in the server log.
+TTS_TIMEOUT = int(os.environ.get('TTS_TIMEOUT', 180))
+
+def _looks_like_audio(data, content_type=''):
+    """True if `data` starts with a container signature we'd expect from a TTS
+    server. Used to reject the very common failure where a server answers HTTP
+    200 with a JSON or HTML error body instead of audio -- without this check
+    the error text gets written to disk as a .wav, passes a size>0 test, and is
+    reported as a successful render right up until ffmpeg chokes on it later."""
+    if not data:
+        return False
+    ct = (content_type or '').lower()
+    if ct.startswith(('application/json', 'text/html', 'text/plain')):
+        return False
+    sigs = (
+        b'RIFF',      # wav
+        b'ID3',       # mp3 with tag
+        b'OggS',      # ogg/opus
+        b'fLaC',      # flac
+        b'\xff\xfb', b'\xff\xf3', b'\xff\xf2',  # raw mp3 frame
+        b'\xff\xf1', b'\xff\xf9',               # adts aac
+    )
+    if data[:4] in (b'RIFF', b'OggS', b'fLaC') or data[:3] == b'ID3':
+        return True
+    if any(data.startswith(s) for s in sigs):
+        return True
+    # ISO-BMFF (m4a/mp4): 'ftyp' at offset 4
+    if len(data) > 12 and data[4:8] == b'ftyp':
+        return True
+    return False
+
+def _write_tts_response(r, output_path, engine_label):
+    """Validates a TTS HTTP response and writes it out. Returns (ok, error)."""
+    if not r.ok:
+        detail = (r.text or '')[:300]
+        try:
+            j = r.json()
+            detail = j.get('error') or j.get('detail') or j.get('message') or detail
+        except Exception:
+            pass
+        return False, f'{engine_label} API error {r.status_code}: {detail}'
+    if not r.content:
+        return False, f'{engine_label} returned an empty response'
+    if not _looks_like_audio(r.content, r.headers.get('Content-Type', '')):
+        # 200 OK but the payload isn't audio -- surface whatever the server
+        # actually said rather than writing it to disk as a fake .wav.
+        detail = ''
+        try:
+            j = r.json()
+            detail = j.get('error') or j.get('detail') or j.get('message') or ''
+        except Exception:
+            detail = (r.text or '')[:200]
+        return False, (f'{engine_label} returned a non-audio response'
+                       + (f': {detail}' if detail else
+                          f' (Content-Type: {r.headers.get("Content-Type", "unknown")})'))
+    try:
+        with open(output_path, 'wb') as f:
+            f.write(r.content)
+    except OSError as e:
+        return False, f'{engine_label}: could not write output file: {e}'
+    if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+        return False, f'{engine_label} returned an empty response'
+    return True, None
+
+def fish_audio_tts(text, output_wav_path, voice_id=None, rate=175, reference_audio_path=None, language=None):
+    """Generate a voiceover WAV using a Fish Audio S2-compatible TTS server (POST /v1/tts) —
+    either your own self-hosted instance or Fish Audio's hosted cloud API. Returns
+    (ok, error_message). `voice_id`, if set, is passed as `reference_id` to reuse a
+    pre-registered voice. Otherwise, if `reference_audio_path` points at an existing WAV,
+    that sample is base64-encoded and sent as a `references` entry so the server clones
+    the voice from it directly (zero-shot cloning) — no pre-registration needed. `rate` is
+    the same wpm-style value used by the UI (default 175); mapped onto Fish Audio's
+    prosody.speed multiplier (1.0 = normal) so faster/slower selections keep the same
+    behavior as before. Language does not need to be specified — S2 auto-detects it
+    from the text (83 languages, including Tagalog)."""
+    speed = max(0.5, min(2.0, (rate or 175) / 175.0))
+    body = {
+        'text': text,
+        'format': 'wav',
+        'prosody': {'speed': speed, 'volume': 0, 'normalize_loudness': True},
+    }
+    if voice_id:
+        body['reference_id'] = voice_id
+    elif reference_audio_path and os.path.exists(reference_audio_path):
+        # Normalized to 16k mono PCM. The upload field
+        # accepts any audio/*, so this is routinely an MP3/M4A or a 48k stereo
+        # WAV; previously those bytes were base64-ed straight through as a
+        # "reference WAV" and the server either mis-cloned or failed at synthesis.
+        normalized_path = _normalize_reference_audio(reference_audio_path)
+        try:
+            with open(normalized_path, 'rb') as rf:
+                ref_b64 = base64.b64encode(rf.read()).decode('ascii')
+            body['references'] = [{'audio': ref_b64, 'text': ''}]
+        except Exception as e:
+            return False, f'Failed to read voice reference audio ({reference_audio_path}): {e}'
+        finally:
+            if normalized_path != reference_audio_path and os.path.exists(normalized_path):
+                try:
+                    os.remove(normalized_path)
+                except OSError:
+                    pass
+    if language and language != 'auto':
+        # Best-effort hint only: S2 normally auto-detects language from the text
+        # itself, but passing it explicitly helps disambiguate short/ambiguous
+        # scripts. A server that doesn't recognize this field just ignores it.
+        body['language'] = language
+    headers = {'Content-Type': 'application/json'}
+    if FISH_AUDIO_API_KEY:
+        # Only the hosted api.fish.audio endpoint needs these; a self-hosted server
+        # with no key configured just ignores their absence.
+        headers['Authorization'] = f'Bearer {FISH_AUDIO_API_KEY}'
+        headers['model'] = FISH_AUDIO_MODEL
+    try:
+        r = requests.post(FISH_AUDIO_URL, headers=headers, json=body, timeout=TTS_TIMEOUT)
+        return _write_tts_response(r, output_wav_path, 'Fish Audio')
+    except Exception as e:
+        return False, f'Fish Audio request failed: {e}'
+
+# ---- Shared voice-clone reference handling ----
+def _normalize_reference_audio(src_path):
+    """Re-encodes a reference/voice-clone sample to 16kHz mono 16-bit PCM WAV.
+
+    Used by BOTH engines. The upload field accepts any audio/*, so this is
+    routinely an MP3, M4A or a 48k stereo WAV. Voice-cloning servers can usually
+    fingerprint a voice from almost any input but then fail during the actual
+    synthesis pass that expects a specific format -- which is exactly the shape
+    of a 'voice is detected but can't generate speech' error. Returns the
+    normalized path, or the original path unchanged if ffmpeg isn't available or
+    the conversion fails (caller falls back to sending the original bytes rather
+    than hard-failing here)."""
+    if not FFMPEG or not os.path.exists(src_path):
+        return src_path
+    norm_path = os.path.join(app.config['UPLOAD_FOLDER'], f'ttsref_{uuid.uuid4().hex}.wav')
+    try:
+        r = subprocess.run([FFMPEG, '-y', '-i', src_path, '-ac', '1', '-ar', '16000',
+                             '-sample_fmt', 's16', norm_path],
+                            capture_output=True, text=True, timeout=60)
+        if os.path.exists(norm_path) and os.path.getsize(norm_path) > 0:
+            return norm_path
+        print(f'TTS: reference audio normalization failed, sending original file: {r.stderr[-300:]}')
+    except Exception as e:
+        print(f'TTS: reference audio normalization error, sending original file: {e}')
+    return src_path
+
+
+# Language codes offered in the narration UI. Fish Audio S2 auto-detects the
+# script's language, so this is an optional override rather than a requirement.
+FISH_AUDIO_LANGUAGES = [
+    {'code': 'auto', 'label': 'Auto-detect (recommended)'},
+    {'code': 'en', 'label': 'English'},
+    {'code': 'tl', 'label': 'Tagalog / Filipino'},
+    {'code': 'zh', 'label': 'Chinese'},
+    {'code': 'ja', 'label': 'Japanese'},
+    {'code': 'ko', 'label': 'Korean'},
+    {'code': 'es', 'label': 'Spanish'},
+    {'code': 'fr', 'label': 'French'},
+    {'code': 'de', 'label': 'German'},
+    {'code': 'ar', 'label': 'Arabic'},
+    {'code': 'pt', 'label': 'Portuguese'},
+    {'code': 'ru', 'label': 'Russian'},
+    {'code': 'id', 'label': 'Indonesian'},
+    {'code': 'vi', 'label': 'Vietnamese'},
+    {'code': 'th', 'label': 'Thai'},
+]
+
+# Voice lists are fetched from the TTS server and cached briefly: the dropdown is
+# reloaded on several UI events, and a self-hosted server can be slow to answer.
+_VOICES_CACHE_TTL = int(os.environ.get('VOICES_CACHE_TTL', 300))
+_VOICES_CACHE = {
+    'fish_audio': {'voices': None, 'source': 'none', 'error': None, 'fetched_at': 0.0},
+}
+
+def fish_audio_list_voices(force=False):
+    """List voices registered for narration via Fish Audio: registered voice
+    models from Fish Audio's cloud API (if FISH_AUDIO_API_KEY is set), or a
+    best-effort probe of a self-hosted server's own model-listing endpoint if
+    it has one. There's no fallback "default" entry — if nothing is
+    registered/listable, this returns an empty voices list, and the caller is
+    expected to fall back to "upload a reference sample" for zero-shot
+    cloning instead. Returns (voices, source, error) where source is
+    'cloud' | 'self_hosted' | 'none' | 'error', and each voice is
+    {'id': <reference_id>, 'title': <display name>, 'languages': [...]}."""
+    now = time.time()
+    cache = _VOICES_CACHE['fish_audio']
+    if not force and cache['voices'] is not None and now - cache['fetched_at'] < _VOICES_CACHE_TTL:
+        return cache['voices'], cache['source'], cache['error']
+
+    voices = []
+    source = 'none'
+    error = None
+
+    if FISH_AUDIO_API_KEY:
+        # Hosted cloud API: list voice models registered under this account.
+        try:
+            r = requests.get('https://api.fish.audio/model',
+                              headers={'Authorization': f'Bearer {FISH_AUDIO_API_KEY}'},
+                              params={'self_only': 'true', 'page_size': 100}, timeout=8)
+            if r.ok:
+                data = r.json()
+                items = data.get('items', data if isinstance(data, list) else [])
+                for it in items:
+                    vid = it.get('_id') or it.get('id')
+                    if not vid:
+                        continue
+                    voices.append({'id': vid, 'title': it.get('title') or vid,
+                                    'languages': it.get('languages') or []})
+                source = 'cloud'
+            else:
+                error = f'Fish Audio model list error {r.status_code}: {r.text[:200]}'
+        except Exception as e:
+            error = f'Fish Audio model list request failed: {e}'
+    else:
+        # Self-hosted probe. Fish Speech exposes its registered reference voices at
+        # /v1/references/list, NOT /v1/models (which 404s) -- probing only the
+        # latter silently produced an empty list, so the voice dropdown had nothing
+        # in it and generate_tts() then refused to run for want of a voice_id.
+        #
+        # Two quirks that matter:
+        #   * the endpoint defaults to application/msgpack, so Accept must ask for
+        #     JSON explicitly or r.json() fails on binary content;
+        #   * the response is {"reference_ids": ["name", ...]} -- bare strings, not
+        #     the {"items": [{"id": ...}]} objects the cloud API returns.
+        # Older/alternative builds are still tried afterwards, and both object and
+        # string entries are accepted, so this works across server versions.
+        base = FISH_AUDIO_URL.rsplit('/v1/', 1)[0] if '/v1/' in FISH_AUDIO_URL else FISH_AUDIO_URL
+        base = base.rstrip('/')
+        headers = {'Accept': 'application/json'}
+        for path in ('/v1/references/list', '/v1/models'):
+            try:
+                r = requests.get(base + path, headers=headers, timeout=4)
+            except Exception:
+                continue  # server down or path refused — try the next one
+            if not r.ok:
+                continue
+            try:
+                data = r.json()
+            except ValueError:
+                # Still msgpack (or otherwise not JSON) despite the Accept header.
+                error = (f'{path} returned {r.headers.get("Content-Type", "an unreadable format")} '
+                         'rather than JSON, so its voice list could not be parsed.')
+                continue
+            if isinstance(data, dict):
+                items = data.get('reference_ids') or data.get('items') or data.get('models') or []
+            elif isinstance(data, list):
+                items = data
+            else:
+                items = []
+            for it in items:
+                if isinstance(it, str):
+                    # /v1/references/list form: the id IS the display name.
+                    vid, title, langs = it, it, []
+                elif isinstance(it, dict):
+                    vid = it.get('id') or it.get('_id') or it.get('reference_id')
+                    title = it.get('title') or it.get('name') or vid
+                    langs = it.get('languages') or []
+                else:
+                    continue
+                if vid:
+                    voices.append({'id': vid, 'title': title, 'languages': langs})
+            # Set outside the loop so an endpoint that exists but returns nothing
+            # still reports 'self_hosted' rather than 'none', matching
+            # a server that exists but lists nothing.
+            source = 'self_hosted'
+            if voices:
+                error = None
+                break
+
+    _VOICES_CACHE['fish_audio'].update(voices=voices, source=source, error=error, fetched_at=now)
+    return voices, source, error
+
+def list_voices_for_engine(engine, force=False):
+    """Voice list for the requested engine. Fish Audio is the only narration
+    engine now; the parameter is kept so existing API callers and saved templates
+    that still pass vo_engine keep working."""
+    return fish_audio_list_voices(force=force)
+
+def _fish_audio_self_hosted_base():
+    """Server root derived from FISH_AUDIO_URL (which points at .../v1/tts),
+    e.g. http://localhost:8080 -- shared by list/clone/delete so they always
+    agree on which server they're talking to."""
+    base = FISH_AUDIO_URL.rsplit('/v1/', 1)[0] if '/v1/' in FISH_AUDIO_URL else FISH_AUDIO_URL
+    return base.rstrip('/')
+
+def fish_audio_add_reference(voice_id, audio_path, text, timeout=60):
+    """Registers a new named, reusable voice on a self-hosted Fish Speech
+    server via POST /v1/references/add -- confirmed against this server's own
+    /docs (multipart/form-data: id, audio, text), not assumed.
+
+    Unlike the zero-shot reference-audio upload elsewhere in this app (attach
+    a sample to a single TTS request, nothing saved), this one-time
+    registration makes the voice show up in the Voice dropdown for everyone
+    from then on, with no need to re-upload a sample per generation. `text`
+    must be the reference audio's exact transcript -- the model uses it to
+    align pronunciation to the audio, the same purpose as fish-speech's own
+    .lab sidecar files.
+
+    Only supports self-hosted servers (no FISH_AUDIO_API_KEY set). The hosted
+    cloud API's voice-management endpoints are a different, separate surface
+    this hasn't been verified against -- see fish_audio_list_voices' cloud
+    branch for the one hosted endpoint that has been."""
+    if FISH_AUDIO_API_KEY:
+        return False, ('Voice registration isn\u2019t implemented for the hosted Fish Audio cloud API '
+                       '(FISH_AUDIO_API_KEY is set) -- only for a self-hosted server. '
+                       'Manage cloud voices at fish.audio directly.')
+    voice_id = (voice_id or '').strip()
+    text = (text or '').strip()
+    if not voice_id:
+        return False, 'Enter a name for this voice.'
+    if not text:
+        return False, 'Enter the exact transcript of the reference audio.'
+    if not (audio_path and os.path.exists(audio_path)):
+        return False, 'No reference audio file.'
+    base = _fish_audio_self_hosted_base()
+    try:
+        with open(audio_path, 'rb') as f:
+            r = requests.post(f'{base}/v1/references/add',
+                              data={'id': voice_id, 'text': text},
+                              files={'audio': (os.path.basename(audio_path), f,
+                                               mimetypes.guess_type(audio_path)[0] or 'audio/wav')},
+                              timeout=timeout)
+    except Exception as e:
+        return False, f'Could not reach Fish Audio at {base}: {e}'
+    if not r.ok:
+        detail = (r.text or '')[:300]
+        try:
+            j = r.json()
+            detail = j.get('error') or j.get('detail') or j.get('message') or detail
+        except Exception:
+            pass
+        return False, f'Fish Audio API error {r.status_code}: {detail}'
+    return True, None
+
+def fish_audio_delete_reference(voice_id, timeout=15):
+    """Deletes a registered voice from a self-hosted Fish Speech server via
+    DELETE /v1/references/delete. Confirmed against this server's own /docs:
+    the request body is msgpack-encoded (Content-Type: application/msgpack),
+    not JSON -- {'reference_id': voice_id} -- matching the same
+    defaults-to-msgpack behavior fish_audio_list_voices already had to work
+    around for /v1/references/list's response. Sent as real encoded msgpack
+    bytes here, not JSON with a relabeled header, since there's no
+    confirmation this endpoint accepts JSON at all.
+
+    Only supports self-hosted servers, same reasoning as
+    fish_audio_add_reference above."""
+    if FISH_AUDIO_API_KEY:
+        return False, ('Voice deletion isn\u2019t implemented for the hosted Fish Audio cloud API '
+                       '(FISH_AUDIO_API_KEY is set) -- only for a self-hosted server. '
+                       'Manage cloud voices at fish.audio directly.')
+    voice_id = (voice_id or '').strip()
+    if not voice_id:
+        return False, 'No voice id given.'
+    base = _fish_audio_self_hosted_base()
+    try:
+        import msgpack
+        body = msgpack.packb({'reference_id': voice_id})
+        r = requests.delete(f'{base}/v1/references/delete', data=body,
+                            headers={'Content-Type': 'application/msgpack'}, timeout=timeout)
+    except ImportError:
+        return False, 'The msgpack package is required for voice deletion but is not installed (pip install msgpack).'
+    except Exception as e:
+        return False, f'Could not reach Fish Audio at {base}: {e}'
+    if not r.ok:
+        detail = (r.text or '')[:300]
+        try:
+            j = r.json()
+            detail = j.get('error') or j.get('detail') or j.get('message') or detail
+        except Exception:
+            pass
+        return False, f'Fish Audio API error {r.status_code}: {detail}'
+    return True, None
+
+# ---- Background job tracking (progress reporting for long-running trailer jobs) ----
+# Backed by SQLite (a dedicated jobs.db, not shared with the trailers/branding
+# library.db, so job churn never risks contending with or corrupting that
+# file) rather than an in-memory dict. The in-memory version lost every
+# running job's entire history on any restart -- crash, deploy, OOM -- with
+# no trace it had ever existed; the frontend's progress poll would just start
+# 404ing with no explanation. Every function here keeps its EXACT original
+# name and signature so none of the ~10 call sites elsewhere in this file
+# needed to change, only what happens inside these functions did.
+JOBS_DB_PATH = os.path.join(LIBRARY_DIR, 'jobs.db')
+JOBS_LOCK = threading.Lock()
+JOB_TTL = 60 * 60  # drop finished jobs after an hour so the table doesn't grow forever
+# Which feature a job belongs to. Every feature's jobs share this one table
+# and one queue, so each row says whose it is: a feature's own list of jobs
+# asks for its kind, and only the admin view shows them all.
+JOB_KINDS = ('promo', 'shorts', 'schedule')
+
+def _jobs_db():
+    return _sqlite_connect(JOBS_DB_PATH)
+
+def jobs_db_init():
+    conn = _jobs_db()
+    conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        percent INTEGER NOT NULL DEFAULT 0,
+        step TEXT,
+        done INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        status TEXT,
+        result_json TEXT,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        created REAL NOT NULL,
+        user_id INTEGER,
+        username TEXT,
+        orig_name TEXT,
+        kind TEXT
+    )''')
+    # A table from before jobs had a kind: add the column, and file what is
+    # already in it. Until then every job was listed as an episodic plug;
+    # the other two features have always labelled theirs, so those are told
+    # apart by the label and anything else is what it was listed as.
+    if 'kind' not in [r[1] for r in conn.execute('PRAGMA table_info(jobs)')]:
+        conn.execute('ALTER TABLE jobs ADD COLUMN kind TEXT')
+        conn.execute("UPDATE jobs SET kind='shorts' WHERE orig_name LIKE '%(vertical shorts: %'")
+        conn.execute("UPDATE jobs SET kind='schedule' WHERE orig_name LIKE '%(schedule plug, %'")
+        conn.execute("UPDATE jobs SET kind='promo' WHERE kind IS NULL")
+    # Anything still marked "not done" at startup was, by definition, being
+    # rendered by a process that no longer exists -- the whole point of
+    # persisting this at all is to tell the truth about that instead of
+    # leaving it looking like a job that's still quietly running at 45%
+    # forever. Marked interrupted rather than silently deleted, so it's
+    # still visible in history as "this didn't finish" rather than vanishing
+    # without a trace, which is exactly what the in-memory version did.
+    cur = conn.execute("UPDATE jobs SET done=1, status='error', "
+                       "error='Interrupted by a server restart before it finished.' "
+                       "WHERE done=0")
+    if cur.rowcount:
+        print(f'{cur.rowcount} job(s) were still running at last shutdown -- marked interrupted.')
+    conn.commit()
+    conn.close()
+
+jobs_db_init()
+
+class JobCancelled(Exception):
+    pass
+
+def job_new(user_id=None, username=None, kind='promo'):
+    """`kind` is the feature the job belongs to (JOB_KINDS): the episodic
+    plug's unless said otherwise."""
+    if kind not in JOB_KINDS:
+        raise ValueError(f'unknown job kind {kind!r}')
+    # random_suffix exists specifically to avoid a real (if rare) collision:
+    # timestamp_ms + thread_id alone can repeat if the same thread creates
+    # two jobs within the same millisecond -- rare in production, but a
+    # genuine flaky-test risk under a fast automated test run creating many
+    # jobs back-to-back. id is the primary key, so a collision would silently
+    # overwrite an existing job's row rather than erroring here specifically.
+    random_suffix = secrets.token_hex(3)
+    jid = f'{int(time.time()*1000)}_{threading.get_ident()}_{random_suffix}'
+    with JOBS_LOCK:
+        conn = _jobs_db()
+        conn.execute(
+            'INSERT INTO jobs (id, percent, step, done, error, status, result_json, '
+            'cancel_requested, created, user_id, username, orig_name, kind) '
+            'VALUES (?,0,?,0,NULL,?,NULL,0,?,?,?,NULL,?)',
+            (jid, 'Queued', 'queued', time.time(), user_id, username, kind))
+        # Same TTL cleanup the in-memory version did, just as a DELETE instead
+        # of a dict-pop loop.
+        conn.execute('DELETE FROM jobs WHERE done=1 AND created < ?', (time.time() - JOB_TTL,))
+        conn.commit()
+        conn.close()
+    return jid
+
+def job_set(jid, percent=None, step=None, error=None, done=None, result=None, status=None):
+    cancel_now = False
+    with JOBS_LOCK:
+        conn = _jobs_db()
+        row = conn.execute('SELECT cancel_requested FROM jobs WHERE id=?', (jid,)).fetchone()
+        if not row:
+            conn.close()
+            return
+        updates, args = [], []
+        if percent is not None:
+            updates.append('percent=?'); args.append(percent)
+        if step is not None:
+            updates.append('step=?'); args.append(step)
+        if status is not None:
+            updates.append('status=?'); args.append(status)
+        if error is not None:
+            updates.append('error=?'); args.append(error)
+            updates.append('done=1')
+            updates.append("status='error'")
+        if done is not None:
+            updates.append('done=?'); args.append(1 if done else 0)
+        if result is not None:
+            updates.append('result_json=?'); args.append(json.dumps(result))
+        # Deliberately never touches the cancel_requested column here -- that
+        # column belongs to job_cancel()'s own narrow UPDATE. Keeping each
+        # function's UPDATE scoped to only the columns IT manages means a
+        # cancel request arriving between this read and this write can never
+        # get silently clobbered back to 0 by an unrelated progress update,
+        # without needing an explicit cross-function transaction to prevent it.
+        if updates:
+            args.append(jid)
+            conn.execute(f'UPDATE jobs SET {", ".join(updates)} WHERE id=?', args)
+            conn.commit()
+        conn.close()
+        # Any progress update after a cancellation request raises, so the running
+        # job unwinds at its next checkpoint — this call itself (reporting the
+        # cancellation) is exempt so it doesn't recursively raise.
+        if row['cancel_requested'] and error is None and not done:
+            cancel_now = True
+    if cancel_now:
+        raise JobCancelled(jid)
+
+def job_cancel(jid):
+    """Request cancellation of a queued or running job. Queued jobs are removed
+    from the wait line immediately; running jobs unwind at their next progress
+    checkpoint (best-effort — an in-flight ffmpeg/API call still finishes first)."""
+    with JOBS_LOCK:
+        conn = _jobs_db()
+        row = conn.execute('SELECT done FROM jobs WHERE id=?', (jid,)).fetchone()
+        if not row or row['done']:
+            conn.close()
+            return False
+        conn.execute('UPDATE jobs SET cancel_requested=1 WHERE id=?', (jid,))
+        conn.commit()
+        conn.close()
+    with JOB_QUEUE_LOCK:
+        if jid in JOB_QUEUE:
+            JOB_QUEUE.remove(jid)
+            job_set(jid, error='Cancelled', status='cancelled')
+    return True
+
+def job_get(jid):
+    with JOBS_LOCK:
+        conn = _jobs_db()
+        row = conn.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+        conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    # result was a plain dict in the in-memory version; every caller expects
+    # that shape back, not a JSON string, so decode it here once rather than
+    # at every call site.
+    d['result'] = json.loads(d.pop('result_json')) if d.get('result_json') else None
+    d['done'] = bool(d['done'])
+    d['cancel_requested'] = bool(d['cancel_requested'])
+    d['kind'] = d.get('kind') or 'promo'
+    return d
+
+def job_set_orig_name(jid, orig_name):
+    """The one place outside job_new/job_set that ever wrote directly into
+    the old JOBS dict (JOBS[jid]['orig_name'] = orig_name, right after
+    creating the job but before params are fully built). Given its own
+    function for the same reason job_set's UPDATE stays narrowly scoped --
+    a dedicated single-column write can't collide with anything else."""
+    with JOBS_LOCK:
+        conn = _jobs_db()
+        conn.execute('UPDATE jobs SET orig_name=? WHERE id=?', (orig_name, jid))
+        conn.commit()
+        conn.close()
+
+def job_list_all():
+    """Every job row, decoded the same way job_get() decodes one. Used by the
+    monitor endpoint, which does its own per-request permission filtering
+    (_owns_or_admin) over the result -- that filtering needs session access
+    this function deliberately doesn't take a dependency on, so it stays
+    exactly where it already lived rather than duplicating it in here."""
+    with JOBS_LOCK:
+        conn = _jobs_db()
+        rows = conn.execute('SELECT * FROM jobs').fetchall()
+        conn.close()
+    out = {}
+    for row in rows:
+        d = dict(row)
+        d['result'] = json.loads(d.pop('result_json')) if d.get('result_json') else None
+        d['done'] = bool(d['done'])
+        d['cancel_requested'] = bool(d['cancel_requested'])
+        d['kind'] = d.get('kind') or 'promo'
+        out[d['id']] = d
+    return out
+
+def _owns_or_admin(owner_user_id):
+    """True if the current session is the owner of a job/trailer, or an
+    admin. Admins see and manage everything; everyone else sees only their
+    own. A record with no owner (user_id=None -- either created before this
+    app had accounts, or something went wrong capturing it) is treated as
+    admin-only rather than shown to whoever happens to ask, since there's no
+    one it can honestly be attributed to."""
+    if session.get('role') == 'admin':
+        return True
+    uid = session.get('user_id')
+    return uid is not None and owner_user_id == uid
+
+class JobGate:
+    """Caps how many trailer jobs run at once. Limit is adjustable at runtime
+    (e.g. via the /api/queue/limit endpoint) without needing to restart anything —
+    waiting jobs just re-check the current limit each time they're woken up."""
+    def __init__(self, limit):
+        self.limit = max(1, limit)
+        self.running = 0
+        self.cond = threading.Condition()
+
+    def set_limit(self, new_limit):
+        with self.cond:
+            self.limit = max(1, int(new_limit))
+            self.cond.notify_all()
+
+    def status(self):
+        with self.cond:
+            return {'running': self.running, 'limit': self.limit}
+
+MAX_CONCURRENT_JOBS = int(os.environ.get('MAX_CONCURRENT_JOBS', 2))
+# Parallel ffmpeg processes used for clip extraction within a single job. Kept
+# modest by default because MAX_CONCURRENT_JOBS jobs can each run this many at
+# once -- the effective ceiling is MAX_CONCURRENT_JOBS * EXTRACT_WORKERS.
+EXTRACT_WORKERS = int(os.environ.get('EXTRACT_WORKERS', 4))
+# Cap on how many scenes get an AI vision call per job. A long episode can detect
+# hundreds of scenes but only ~12 reach the trailer, so scoring all of them is
+# almost entirely wasted work; see the shortlist logic in _run_trailer_job().
+AI_SCORE_LIMIT = int(os.environ.get('AI_SCORE_LIMIT', 60))
+AI_SCORE_WORKERS = int(os.environ.get('AI_SCORE_WORKERS', 4))
+# Token budget for one vision reply. Must comfortably exceed the answer length,
+# because reasoning models count their (hidden) chain-of-thought against it -- a
+# tight cap returns an empty `response` and every scene silently falls back to
+# the neutral score.
+AI_NUM_PREDICT = int(os.environ.get('AI_NUM_PREDICT', 400))
+# Set to False the first time a server rejects the structured-output `format`
+# field, so older Ollama builds pay the cost of that discovery only once.
+AI_STRUCTURED_OK = True
+AI_NEUTRAL_SCORE = 3  # mid-range prior (on the 1-5 vision scale) for scenes that weren't or couldn't be scored
+GATE = JobGate(MAX_CONCURRENT_JOBS)
+JOB_QUEUE = []  # job_ids waiting for a free slot, in submission order
+JOB_QUEUE_LOCK = threading.Lock()
+
+def run_trailer_job_gated(jid, params, runner=None):
+    """Entry point used for every submitted job: waits for a free concurrency
+    slot (reporting queue position while it waits), then runs the job, then
+    frees the slot for the next one in line.
+
+    `runner` is the job body to run once a slot is free -- a callable taking
+    (jid, params). Left as None it is the promo render (run_trailer_job),
+    exactly as before this parameter existed. It exists so other heavy jobs
+    (Vertical Shorts' analyse and render, in shorts.py) queue behind the SAME
+    limit instead of each feature keeping its own: MAX_CONCURRENT_JOBS is a
+    cap on what the server can run at once, and a second, separate gate would
+    quietly let twice as many ffmpeg/GPU jobs run as that setting says."""
+    with JOB_QUEUE_LOCK:
+        JOB_QUEUE.append(jid)
+    acquired_slot = False
+    try:
+        with GATE.cond:
+            while GATE.running >= GATE.limit:
+                with JOB_QUEUE_LOCK:
+                    if jid not in JOB_QUEUE:  # cancelled while waiting
+                        return
+                    ahead = JOB_QUEUE.index(jid)
+                job_set(jid, step=(f'Queued — {ahead} job(s) ahead' if ahead else 'Queued — starting shortly'),
+                        percent=0, status='queued')
+                GATE.cond.wait(timeout=2)
+            GATE.running += 1
+            acquired_slot = True
+        with JOB_QUEUE_LOCK:
+            if jid in JOB_QUEUE:
+                JOB_QUEUE.remove(jid)
+        job_set(jid, step='Starting', percent=1, status='running')
+        (runner or run_trailer_job)(jid, params)
+    finally:
+        # Only release a slot this job actually acquired -- a real,
+        # confirmed bug: cancelling a job while it was still QUEUED (the
+        # early `return` above, before GATE.running was ever incremented
+        # for it) still ran this same finally block, which decremented
+        # GATE.running anyway. That's one job's worth of concurrency
+        # capacity vanishing from the gate's own count every time a queued
+        # job got cancelled, while every actually-running job kept its
+        # real slot the whole time -- silently allowing more jobs to run
+        # concurrently than MAX_CONCURRENT_JOBS intends, competing for the
+        # same CPU/ffmpeg/memory resources and producing exactly the kind
+        # of intermittent, hard-to-reproduce failures ("works the first or
+        # second time, no clear pattern") a real report described,
+        # especially right after cancelling a job that had been waiting in
+        # the queue.
+        if acquired_slot:
+            with GATE.cond:
+                GATE.running = max(0, GATE.running - 1)
+                GATE.cond.notify_all()
+        with JOB_QUEUE_LOCK:
+            if jid in JOB_QUEUE:
+                JOB_QUEUE.remove(jid)
+
+GENRE_PROMPTS = {
+    'action': 'Epic cinematic action trailer score, 150 BPM, powerful orchestral percussion, aggressive taiko drums, bold brass stabs, driving string ostinatos, rising tension, heroic energy, blockbuster soundtrack, high impact dynamics, instrumental only, no vocals',
+    'drama': 'Emotional cinematic drama score, 80 BPM, expressive piano melody, warm string ensemble, gentle emotional build, heartfelt atmosphere, reflective storytelling, film soundtrack style, instrumental only, no vocals',
+    'horror': 'Dark atmospheric horror soundtrack, 65 BPM, eerie drones, unsettling textures, dissonant strings, distant impacts, creeping suspense, psychological tension, cinematic dread, instrumental only, no vocals',
+    'comedy': 'Playful comedy soundtrack, 120 BPM, cheerful pizzicato strings, quirky woodwinds, light percussion, whimsical melodies, upbeat and humorous mood, family entertainment style, instrumental only, no vocals',
+    'documentary': 'Inspiring documentary score, 90 BPM, soft piano and strings, ambient orchestral textures, thoughtful emotional tone, uplifting cinematic storytelling, modern documentary soundtrack, instrumental only, no vocals',
+    'thriller': 'Suspenseful thriller soundtrack, 110 BPM, pulsing rhythmic patterns, dark atmospheric pads, subtle electronic elements, escalating tension, cinematic urgency, investigative mood, instrumental only, no vocals',
+    'scifi': 'Futuristic science fiction soundtrack, 120 BPM, atmospheric synthesizers, cosmic pads, electronic pulses, cinematic space exploration mood, advanced technology theme, immersive and expansive, instrumental only, no vocals',
+    'fantasy': 'Enchanting fantasy orchestral score, 105 BPM, magical strings and woodwinds, mystical choir textures, adventurous melodies, wonder and discovery, cinematic fantasy realm atmosphere, instrumental only, no vocals',
+    'romance': 'Romantic cinematic soundtrack, 75 BPM, tender piano melodies, warm strings, emotional intimacy, gentle orchestral swells, heartfelt and elegant atmosphere, instrumental only, no vocals',
+    'adventure': 'Epic adventure soundtrack, 130 BPM, heroic brass, sweeping strings, driving percussion, exploration and discovery theme, uplifting cinematic energy, triumphant orchestral score, instrumental only, no vocals',
+    'mystery': 'Intriguing mystery soundtrack, 90 BPM, subtle piano motifs, atmospheric strings, investigative mood, gradual tension build, enigmatic cinematic atmosphere, suspenseful yet elegant, instrumental only, no vocals',
+    'western': 'Classic western cinematic score, 105 BPM, acoustic guitar, harmonica, sparse percussion, dusty frontier atmosphere, rugged adventure mood, expansive desert landscapes, instrumental only, no vocals',
+    'sports': 'High-energy sports anthem, 155 BPM, driving drums, motivational brass, uplifting orchestral and modern hybrid elements, victory and competition theme, powerful momentum, instrumental only, no vocals',
+    'noir': 'Film noir jazz soundtrack, 85 BPM, smoky saxophone, upright bass, brushed drums, moody piano, mysterious detective atmosphere, dark urban night setting, instrumental only, no vocals',
+    'war': 'Epic war drama soundtrack, 115 BPM, military drums, emotional strings, heroic brass, sacrifice and courage theme, cinematic battlefield atmosphere, tragic yet triumphant, instrumental only, no vocals',
+}
+
+GENRE_PRESETS = {
+    # transition choices are deliberately genre-signature — 'fade' is only reused
+    # across drama/documentary/romance, the tonally-similar "soft/emotional" cluster,
+    # which stay differentiated from each other via xfade_dur instead.
+    'action': {'transition': 'zoomin', 'xfade_dur': 0.2, 'sfx': True},
+    'drama': {'transition': 'fade', 'xfade_dur': 0.6, 'sfx': False},
+    'horror': {'transition': 'wipeleft', 'xfade_dur': 0.3, 'sfx': True},
+    'comedy': {'transition': 'squeezev', 'xfade_dur': 0.25, 'sfx': True},
+    'documentary': {'transition': 'fade', 'xfade_dur': 0.5, 'sfx': False},
+    'thriller': {'transition': 'radial', 'xfade_dur': 0.2, 'sfx': True},
+    'scifi': {'transition': 'pixelize', 'xfade_dur': 0.3, 'sfx': True},
+    'fantasy': {'transition': 'dissolve', 'xfade_dur': 0.5, 'sfx': True},
+    'romance': {'transition': 'fade', 'xfade_dur': 0.8, 'sfx': False},
+    'adventure': {'transition': 'smoothright', 'xfade_dur': 0.2, 'sfx': True},
+    'mystery': {'transition': 'fadeblack', 'xfade_dur': 0.4, 'sfx': False},
+    'western': {'transition': 'diagbr', 'xfade_dur': 0.3, 'sfx': True},
+    'sports': {'transition': 'slideup', 'xfade_dur': 0.15, 'sfx': True},
+    'noir': {'transition': 'circleclose', 'xfade_dur': 0.6, 'sfx': False},
+    'war': {'transition': 'distance', 'xfade_dur': 0.3, 'sfx': True},
+}
+# NOTE: values above were already identical to the uploaded CSV's transition/crossfade/sfx_at_cuts
+# columns for all 15 genres — no changes were needed here.
+
+GENRE_NAMES = list(GENRE_PRESETS.keys())
+
+# Module-level so both api_trailer() and the show-template save route can validate
+# against the same list (it used to be a local inside api_trailer()).
+VALID_TRANSITIONS = {'fade','fadeblack','fadewhite','fadefast','fadegrays',
+    'wipeleft','wiperight','wipeup','wipedown',
+    'slideleft','slideright','slideup','slidedown',
+    'smoothleft','smoothright','smoothup','smoothdown',
+    'circlecrop','rectcrop','circleopen','circleclose',
+    'distance','pixelize','diagtl','diagtr','diagbl','diagbr',
+    'hlslice','hrslice','vuslice','vdslice',
+    'radial','zoomin','dissolve','hblur','squeezev','squeezeh',
+    'horzopen','horzclose','vertopen','vertclose','custom_matte'}
+
+GENRE_SFX_PROMPTS = {
+    'action': 'Massive cinematic impact, deep explosion boom, trailer hit, powerful transient, sound effect only',
+    'horror': 'Eerie horror sting, dark whoosh, unsettling impact, suspense accent, sound effect only',
+    'comedy': 'Cartoon boing, comedic pop, playful bounce, humorous sting, sound effect only',
+    'thriller': 'Tension hit, dark pulse, suspense sting, cinematic impact, sound effect only',
+    'scifi': 'Futuristic whoosh, electronic glitch impact, cybernetic sweep, sci-fi accent, sound effect only',
+    'fantasy': 'Magical sparkle chime, enchanted shimmer, mystical twinkle, fantasy accent, sound effect only',
+    'adventure': 'Heroic orchestral hit, cinematic impact, adventure accent, sound effect only',
+    'western': 'Whip crack, dusty impact, western accent, sound effect only',
+    'sports': 'Stadium crowd hit, whistle blast, energetic impact, sports accent, sound effect only',
+    'war': 'Battlefield explosion hit, military impact, distant artillery boom, sound effect only',
+}
+
+GENRE_LAVFI = {
+    'default': 'sin(261.63*t)*0.25+sin(329.63*t)*0.18+sin(392.00*t)*0.14+sin(523.25*t)*0.1+sin(130.81*t)*0.12',
+    'action': 'sin(55*t)*(1+0.3*sin(4*t))+sin(110*t)*0.4+sin(220*t)*0.2+sin(440*t)*0.1+sin(880*t)*0.05',
+    'drama': 'sin(130.81*t)*0.3+sin(196*t)*0.2+sin(261.63*t)*0.15+sin(392*t)*0.08',
+    'horror': 'sin(30*t)*0.5+sin(35*t)*0.3+sin(2000*t)*0.05+sin(2100*t)*0.04+random(t)*0.02',
+    'comedy': 'sin(523.25*t)*0.3+sin(659.25*t)*0.25+sin(783.99*t)*0.2+sin(1046.5*t)*0.1+sin(1318.5*t)*0.05',
+    'documentary': 'sin(261.63*t)*0.2+sin(329.63*t)*0.15+sin(392*t)*0.12+sin(523.25*t)*0.08',
+    'thriller': 'sin(50*t)*0.4+sin(100*t)*0.2+sin(150*t)*0.1+sin(800*t)*0.05+sin(1200*t)*0.03',
+    'scifi': 'sin(220*t)*0.2+sin(440*t)*0.15+sin(880*t)*0.1+sin(1760*t)*0.05+sin(200*t*(1+0.1*sin(0.5*t)))*0.15',
+    'fantasy': 'sin(261.63*t)*0.2+sin(392*t)*0.15+sin(523.25*t)*0.12+sin(659.25*t)*0.08+sin(783.99*t)*0.05',
+    'romance': 'sin(261.63*t)*0.25+sin(329.63*t)*0.2+sin(392*t)*0.15+sin(523.25*t)*0.08',
+    'adventure': 'sin(65.41*t)*0.3+sin(130.81*t)*0.2+sin(261.63*t)*0.15+sin(392*t)*0.1+sin(523.25*t)*0.08',
+    'mystery': 'sin(100*t)*0.3+sin(150*t)*0.15+sin(1200*t)*0.05+sin(1800*t)*0.03',
+    'western': 'sin(196*t)*0.25+sin(220*t)*0.15+sin(261.63*t)*0.12+sin(329.63*t)*0.08+sin(392*t)*0.05',
+    'sports': 'sin(110*t)*(0.5+0.3*lt(sin(2*t),0))+sin(220*t)*0.2+sin(440*t)*0.1+sin(880*t)*0.05',
+    'noir': 'sin(98*t)*0.25+sin(130.81*t)*0.2+sin(196*t)*0.15+sin(246.94*t)*0.1',
+    'war': 'sin(55*t)*0.3+sin(65.41*t)*0.2+sin(110*t)*0.15+sin(200*t*(1+0.2*sin(2*t)))*0.1+sin(440*t)*0.05',
+}
+
+FFMPEG = shutil.which('ffmpeg') or 'C:\\ffmpeg\\bin\\ffmpeg.exe'
+FFPROBE = shutil.which('ffprobe') or 'C:\\ffmpeg\\bin\\ffprobe.exe'
+
+# ---- Hard timeouts on every external media call ----
+# A subprocess.run() without a timeout can block its worker thread forever if
+# ffmpeg wedges on a malformed stream. That thread holds a GATE slot (see
+# JobGate), so with MAX_CONCURRENT_JOBS=2 two hung jobs stall the whole server
+# with no way to recover short of a restart. Every ffmpeg/ffprobe call therefore
+# goes through run_ffmpeg()/run_ffprobe() below, which always pass a timeout and
+# always kill the whole process group on expiry.
+FFPROBE_TIMEOUT = int(os.environ.get('FFPROBE_TIMEOUT', 30))
+FFMPEG_TIMEOUT = int(os.environ.get('FFMPEG_TIMEOUT', 300))       # per encode/mix step
+FFMPEG_LONG_TIMEOUT = int(os.environ.get('FFMPEG_LONG_TIMEOUT', 900))  # full-source passes
+
+# How much a title/end card's duration may be stretched or shrunk, combined
+# across both cards, as a last-resort gap-filler when scene-clip-based
+# duration correction (rebalancing, growing the last clip, topping up from
+# unused scenes) has already been tried and a residual gap remains. Kept
+# small and user-confirmed: a card is branding/informational, not content,
+# so it should absorb only the last sliver of a gap, never carry it.
+CARD_DURATION_ADJUST_LIMIT = 1.0
+
+class MediaToolTimeout(RuntimeError):
+    """Raised when ffmpeg/ffprobe exceeded its timeout and was killed."""
+
+def _run_media_tool(cmd, timeout, label):
+    """subprocess.run with a guaranteed timeout and a guaranteed kill.
+
+    subprocess.run(timeout=...) sends SIGKILL to the direct child only; ffmpeg
+    rarely spawns children, but Popen.kill() can still leave a stuck process if
+    it's blocked in an uninterruptible read, so we kill then reap with a short
+    second wait and surface a clean exception either way."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        print(f'{label} timed out after {timeout}s and was killed: {" ".join(str(c) for c in cmd[:6])}...')
+        raise MediaToolTimeout(f'{label} exceeded {timeout}s') from e
+
+def run_ffmpeg(cmd, timeout=None, label='ffmpeg'):
+    return _run_media_tool(cmd, timeout or FFMPEG_TIMEOUT, label)
+
+def run_ffprobe(cmd, timeout=None, label='ffprobe'):
+    return _run_media_tool(cmd, timeout or FFPROBE_TIMEOUT, label)
+
+def probe_duration(path, default=None):
+    """Duration of `path` in seconds, or `default` if it can't be determined.
+
+    Returning None (the default default) lets callers distinguish "unknown" from
+    a real value instead of silently substituting a guess -- a wrong duration
+    here feeds the xfade offset maths and desynchronises the entire concat."""
+    try:
+        r = run_ffprobe([FFPROBE, '-v', 'error', '-show_entries', 'format=duration',
+                         '-of', 'default=noprint_wrappers=1:nokey=1', path])
+        return float(r.stdout.strip())
+    except (MediaToolTimeout, ValueError, AttributeError):
+        return default
+
+def probe_media_info(path):
+    """One ffprobe call returning {'duration': float|None, 'has_audio': bool}.
+
+    Replaces the previous pattern of three separate ffprobe spawns per input
+    (duration, audio-stream check, duration again after normalisation) -- on a
+    15-input job that was ~46 process spawns just to read metadata."""
+    info = {'duration': None, 'has_audio': False}
+    try:
+        r = run_ffprobe([FFPROBE, '-v', 'error', '-show_entries',
+                         'format=duration:stream=codec_type', '-of', 'json', path])
+        data = json.loads(r.stdout or '{}')
+    except (MediaToolTimeout, ValueError):
+        return info
+    try:
+        info['duration'] = float(data.get('format', {}).get('duration'))
+    except (TypeError, ValueError):
+        info['duration'] = None
+    info['has_audio'] = any(s.get('codec_type') == 'audio' for s in data.get('streams', []))
+    return info
+
+# Precomputed once at import time for the Docs tab's genre reference table —
+# pulls straight from GENRE_PRESETS/GENRE_PROMPTS/GENRE_SFX_PROMPTS so the docs
+# can never drift out of sync with the actual per-genre behavior.
+GENRE_DOCS_ROWS = [{
+    'genre': g,
+    'transition': GENRE_PRESETS[g]['transition'],
+    'xfade_dur': GENRE_PRESETS[g]['xfade_dur'],
+    'sfx': GENRE_PRESETS[g]['sfx'],
+    'music_theme': GENRE_PROMPTS.get(g, ''),
+    'sfx_theme': GENRE_SFX_PROMPTS.get(g, '—'),
+} for g in GENRE_NAMES]
+
+# ---- Download/export format options ----
+# 'mp4_high' is a genuine, standard H.264 High Profile MP4 — no caveats.
+# The two ProRes options use ffmpeg's real prores_ks encoder, which is a
+# legitimate, widely-used open implementation (not an approximation).
+# 'avci100i' is NOT a certified Panasonic AVC-Intra stream — ffmpeg has no
+# actual AVC-Intra encoder. It's a best-effort approximation built from
+# all-intra libx264 at a similar spec (1080i, 4:2:2 10-bit, ~100Mb/s CBR),
+# meant to be visually/structurally similar, not a guaranteed match for
+# equipment that specifically validates the AVC-Intra codec ID.
+EXPORT_FORMATS = {
+    'mp4_high':        {'ext': 'mp4', 'label': 'MP4 (H.264 High Profile)'},
+    'prores_hq_2997':  {'ext': 'mov', 'label': 'Apple ProRes 422 HQ — 29.97fps'},
+    'prores_hq_2398':  {'ext': 'mov', 'label': 'Apple ProRes 422 HQ — 23.976fps'},
+    'avci100i':        {'ext': 'mov', 'label': 'AVC-Intra 100i (H.264 Intra approximation)'},
+}
+
+# ---- Audio level (integrated loudness of the finished file) ----
+# Config > Production's target is the house default for promos. A schedule
+# plug and a set of shorts are each for somewhere in particular -- a feed, a
+# channel, a playout server -- so those two tabs let it be chosen per render.
+LOUDNESS_RANGE = (-30.0, -8.0)      # LUFS; outside this is a typo, not a target
+LOUDNESS_PRESETS = [(-12.0, 'loud'), (-14.0, 'online video: YouTube, TikTok, Reels'),
+                    (-16.0, 'mobile and podcasts'), (-18.0, 'quiet online'),
+                    (-23.0, 'broadcast, EBU R128'), (-24.0, 'broadcast, ATSC A/85')]
+
+
+def resolve_loudness(requested, default):
+    """A requested loudness target in LUFS, or `default` for anything that
+    is not a number in LOUDNESS_RANGE -- a stale form, a typo, nothing sent.
+    Like resolve_delivery_format: an odd value should render at the usual
+    level, not fail the render or produce something unlistenable."""
+    try:
+        v = float(requested)
+    except (TypeError, ValueError):
+        return float(default)
+    if not (math.isfinite(v) and LOUDNESS_RANGE[0] <= v <= LOUDNESS_RANGE[1]):
+        return float(default)
+    return round(v, 1)
+
+
+def loudness_choices(default):
+    """[{'value', 'label', 'default'}] for a tab's Audio level menu: the
+    presets, with `default` marked -- and added, if it is not one of them."""
+    default = round(float(default), 1)
+    rows = dict(LOUDNESS_PRESETS)
+    rows.setdefault(default, 'this server\'s setting')
+    return [{'value': v, 'label': f"{v:g} LUFS \u2014 {rows[v]}".replace('-', '\u2212', 1), 'default': v == default}
+            for v in sorted(rows, reverse=True)]
+
+
+def resolve_delivery_format(requested):
+    """Validates a requested delivery-format key against EXPORT_FORMATS,
+    falling back to the MP4 master rather than raising -- an unrecognised
+    or missing value (a stale form, a hand-crafted request, a future format
+    key that got renamed) should degrade to a safe, always-exportable
+    default, not break the render. Pulled out of the generate route as its
+    own function specifically so it's unit-testable on its own, matching
+    how save_production_defaults' validation already works the same way."""
+    return requested if requested in EXPORT_FORMATS else 'mp4_high'
+
+def build_ai_vision_prompt(base_prompt, genre, priority_prompt=None, negative_prompt=None):
+    """Assembles the actual scoring prompt sent to the vision model for each
+    frame, layering in genre, an optional free-text description of what the
+    promo should favour, and an optional free-text description of what it
+    should avoid. Pulled out of the scoring loop as its own function so
+    each layer can be verified independently, rather than only ever
+    checked as part of a full render.
+
+    priority_prompt and negative_prompt are deliberately two separate,
+    clearly-labelled instructions rather than one combined sentence --
+    "prefer X, avoid Y" folded together is more likely to confuse a vision
+    model than PRIORITY: and AVOID: as their own distinct blocks. Both
+    steer the 1-5 score itself (matching scenes rated higher or lower)
+    rather than filtering scenes outright -- a scene that's otherwise
+    clearly the best available can still get used if nothing better
+    exists, for either direction."""
+    ai_prompt = base_prompt
+    if genre in GENRE_PRESETS and 'DESC:' in base_prompt:
+        ai_prompt = base_prompt.replace('for a movie trailer', f'for a {genre} promo trailer', 1)
+    if priority_prompt:
+        ai_prompt = (f"{ai_prompt}\n\nPRIORITY: This promo should especially feature: "
+                     f"{priority_prompt}. Score scenes matching that description "
+                     f"noticeably higher than scenes that don't.")
+    if negative_prompt:
+        ai_prompt = (f"{ai_prompt}\n\nAVOID: This promo should NOT feature: "
+                     f"{negative_prompt}. Score scenes matching that description "
+                     f"noticeably lower than scenes that don't.")
+    return ai_prompt
+
+def _detect_silence_intervals(audio_path, noise_db=-35, min_dur=0.35, timeout=120, sample_rate=44100):
+    """Runs ffmpeg's silencedetect filter and parses stderr for silence_start/silence_end
+    pairs. Returns a list of (start, end) SILENT intervals in audio_path. A silence_start
+    with no matching silence_end (file ends mid-silence) is dropped rather than guessed at —
+    the caller treats "not explicitly silent" as active, which is the safe default.
+
+    Defaults are intentionally conservative (noise_db=-35, min_dur=0.35) so that
+    quiet speech, breathy delivery, and short trailing syllables are still treated
+    as "active". This prevents music from recovering while someone is still talking.
+
+    Runs against a fresh PCM decode of `audio_path`, not the file directly -- a real,
+    observed bug: a loudnorm-processed track re-encoded to AAC (uploaded VO's own prep
+    step does exactly this) made silencedetect stop reliably recognizing genuinely-silent
+    stretches (confirmed by direct sample inspection: RMS and peak both exactly 0 in the
+    region silencedetect was misreading as active) after roughly its first ~0.3s -- the
+    same PCM audio, decoded and analyzed directly with no AAC round-trip in between,
+    detected the real silent interval correctly and completely. This mattered because this
+    function is what determines exactly where BGM/dialogue duck under VO -- silencedetect
+    misreading the silent gap before VO actually starts as "VO already playing" ducks BGM
+    too early, for however long that confusion lasts, not from the real, correct moment
+    the voiceover actually begins."""
+    pcm_path = None
+    try:
+        pcm_path = os.path.join(app.config['UPLOAD_FOLDER'], f'sildet_{uuid.uuid4().hex}.wav')
+        subprocess.run([FFMPEG, '-y', '-i', audio_path, '-ac', '1', '-ar', str(sample_rate),
+                                '-c:a', 'pcm_s16le', pcm_path],
+                               capture_output=True, text=True, timeout=timeout)
+        analyze_path = pcm_path if (os.path.exists(pcm_path) and os.path.getsize(pcm_path) > 0) else audio_path
+        r = subprocess.run([FFMPEG, '-i', analyze_path, '-af',
+                             f'silencedetect=noise={noise_db}dB:d={min_dur}', '-f', 'null', '-'],
+                            capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        print(f'Silence detection error ({audio_path}): {e}')
+        return []
+    finally:
+        if pcm_path and os.path.exists(pcm_path):
+            try:
+                os.remove(pcm_path)
+            except OSError:
+                pass
+    # -? handles a silence_start ffmpeg itself sometimes reports as slightly
+    # negative right at the very start of a file -- silently dropping the
+    # sign here (the original pattern had no way to match one at all) would
+    # turn an edge-of-file silence into a small POSITIVE timestamp instead,
+    # which is a different, wrong moment, not a harmlessly-rounded one.
+    starts = [float(m) for m in re.findall(r'silence_start:\s*(-?[\d.]+)', r.stderr)]
+    ends = [float(m) for m in re.findall(r'silence_end:\s*(-?[\d.]+)', r.stderr)]
+    return list(zip(starts, ends))
+
+def _active_windows_from_silence(silence_intervals, total_duration, content_duration=None):
+    """Inverts silent intervals into the (start, end) windows where audio IS
+    present.
+
+    `content_duration` is the real length of the file that was analyzed. It
+    defaults to `total_duration` for the common case (e.g. SOT, where the
+    analyzed file genuinely spans the whole trailer) -- but when the source is
+    SHORTER than `total_duration` (a VO clip placed early in a longer
+    trailer), the trailing "active" extension must stop at the real end of
+    that file, not run all the way out to total_duration. Without this bound:
+    a short VO clip with no detected internal silence (nothing for
+    silencedetect to report) gets treated as "playing" for the entire
+    remainder of the trailer, which then ducks BGM/SOT under a VO that
+    actually stopped minutes earlier -- including under the cards."""
+    if content_duration is None:
+        content_duration = total_duration
+    silence_intervals = sorted(silence_intervals)
+    windows = []
+    cursor = 0.0
+    for s, e in silence_intervals:
+        if s > cursor:
+            windows.append((cursor, s))
+        cursor = max(cursor, e)
+    end_bound = min(content_duration, total_duration)
+    if cursor < end_bound:
+        windows.append((cursor, end_bound))
+    return windows
+
+def _union_windows(window_lists):
+    """Unions multiple lists of (start, end) windows (e.g. SOT-active ∪ VO-active) into
+    one merged, sorted, non-overlapping list."""
+    all_w = sorted(w for lst in window_lists for w in lst)
+    if not all_w:
+        return []
+    merged = [list(all_w[0])]
+    for s, e in all_w[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+def _merge_windows_with_hold(windows, hold_sec):
+    """Bridges any gap between consecutive windows that's shorter than hold_sec — this is
+    the actual 'minimum gap of no VO/SOT before the duck releases and music is heard again'
+    behavior: a brief pause in dialogue no longer lets BGM swell back up and immediately
+    duck again, since the gap has to be at least hold_sec long to count as a real release."""
+    if not windows:
+        return []
+    windows = sorted(windows)
+    merged = [list(windows[0])]
+    for s, e in windows[1:]:
+        if s - merged[-1][1] <= hold_sec:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+DUCK_ATTACK = float(os.environ.get('DUCK_ATTACK', 0.12))    # seconds to duck down (slightly longer = smoother, less abrupt)
+DUCK_RELEASE = float(os.environ.get('DUCK_RELEASE', 0.55))  # seconds to come back up
+# Extra guard time added after the last detected speech before music is allowed to rise.
+# Prevents music recovering while a speaker is still finishing a word or taking a short breath.
+DUCK_POST_SPEECH_GUARD = float(os.environ.get('DUCK_POST_SPEECH_GUARD', 0.18))
+# How far before the detected start of speech to begin ducking (anticipatory duck).
+DUCK_PRE_ROLL = float(os.environ.get('DUCK_PRE_ROLL', 0.10))
+# How far a beat-synced cut point may be nudged from its already-computed,
+# word/phrase-aware target when "Sync cuts to beat" is also on. Deliberately
+# tight -- a real, reported problem: the beat search used to span the whole
+# remaining scene, so a cut carefully placed at a VO word boundary could get
+# dragged seconds away to the nearest music beat, landing mid-word or
+# mid-phrase. nearest_speech_out() (the safety net that runs after this) only
+# searches a similarly tight window of its own (~0.45s for a word end, ~1.2s
+# for a phrase end) -- if the beat nudge moves the target further than that,
+# the speech-safety pass can't find anything nearby to correct it and simply
+# falls back to the (now wrong) beat-shifted point unchanged. Keeping this
+# nudge within that same scale means beat-sync can still land a cut cleanly
+# on a very close beat, but never far enough away to escape the safety net
+# behind it.
+BEAT_SYNC_MAX_NUDGE = float(os.environ.get('BEAT_SYNC_MAX_NUDGE', 0.4))
+
+def _build_duck_volume_expr(duck_windows, duck_depth_db, attack=None, release=None):
+    """ffmpeg volume expression that ducks by duck_depth_db across duck_windows,
+    with real attack/release ramps.
+
+    This used to emit a bare step -- if(between(t,s,e), gain, 1) -- which changes
+    gain by the full depth between one sample and the next. A 15 dB discontinuity
+    is a broadband click, and there were typically 9-13 of them in a 30s promo, so
+    it read as a fault rather than as ducking.
+
+    The envelope is built as a sum of trapezoids rather than a nested if
+    chain, which matters as much as the ramps do: the old form nested one if()
+    per window, so expression depth grew with the amount of dialogue. The sum
+    is written with shorts_core.expr_sum(), because a plain a+b+c+... is one
+    level deeper per term too, and FFmpeg 8 refuses anything over 100 levels.
+
+        gain(t) = 1 - (1 - g) * min(1, SUM_i trapezoid_i(t))
+        trapezoid_i(t) = clip((t - s_i + a)/a, 0, 1) * clip((e_i + r - t)/r, 0, 1)
+
+    Each trapezoid ramps 0->1 over the attack window ending at s_i, holds at 1
+    through the window, then ramps 1->0 over the release after e_i. min(1, ...)
+    keeps overlapping ramps from over-ducking: two windows closer together than
+    attack+release simply stay ducked through the gap, which is what you'd want
+    anyway."""
+    if not duck_windows:
+        return None
+    import shorts_core      # no PRISM imports of its own, so nothing circular
+    a = max(0.01, attack if attack is not None else DUCK_ATTACK)
+    r = max(0.01, release if release is not None else DUCK_RELEASE)
+    gain = 10 ** (duck_depth_db / 20)
+    terms = [f'clip((t-{s:.3f}+{a})/{a},0,1)*clip(({e:.3f}+{r}-t)/{r},0,1)'
+             for s, e in duck_windows]
+    return f'1-{1 - gain:.5f}*min(1,{shorts_core.expr_sum(terms)})'
+
+
+def build_export_cmd(src, dst, fmt_key):
+    """Build the ffmpeg command that transcodes a finished trailer (src) into the
+    requested delivery format (dst). Returns None for an unknown fmt_key."""
+    if fmt_key == 'mp4_high':
+        # A distinct higher-quality delivery pass vs. the crf22/fast preset used
+        # internally while assembling the trailer.
+        return [FFMPEG, '-y', '-i', src,
+                '-c:v', 'libx264', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
+                '-preset', 'slow', '-crf', '16',
+                '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', dst]
+    if fmt_key == 'prores_hq_2997':
+        return [FFMPEG, '-y', '-i', src, '-vf', 'fps=30000/1001',
+                '-c:v', 'prores_ks', '-profile:v', '3', '-vendor', 'apl0',
+                '-pix_fmt', 'yuv422p10le', '-c:a', 'pcm_s16le', dst]
+    if fmt_key == 'prores_hq_2398':
+        return [FFMPEG, '-y', '-i', src, '-vf', 'fps=24000/1001',
+                '-c:v', 'prores_ks', '-profile:v', '3', '-vendor', 'apl0',
+                '-pix_fmt', 'yuv422p10le', '-c:a', 'pcm_s16le', dst]
+    if fmt_key == 'avci100i':
+        return [FFMPEG, '-y', '-i', src, '-vf', 'fps=30000/1001,format=yuv422p10le',
+                '-c:v', 'libx264', '-profile:v', 'high422',
+                '-x264-params', 'keyint=1:bframes=0:cabac=1:interlaced=1',
+                '-b:v', '100M', '-minrate', '100M', '-maxrate', '100M', '-bufsize', '100M',
+                '-flags', '+ildct+ilme', '-pix_fmt', 'yuv422p10le',
+                '-c:a', 'pcm_s16le', dst]
+    return None
+
+# Find ONNX model for face detection
+ONNX_PATH = next((p for p in [
+    os.path.join(os.environ.get('TEMP', '/tmp'), 'face_detection_yunet.onnx'),
+    os.path.join(os.environ.get('TMP', '/tmp'), 'face_detection_yunet.onnx'),
+    os.path.join(str(pathlib.Path.home()), 'face_detection_yunet.onnx'),
+    os.path.join(os.path.dirname(cv2.__file__), 'face_detection_yunet.onnx'),
+    os.path.join(os.path.dirname(cv2.__file__), 'data', 'face_detection_yunet.onnx'),
+] if os.path.exists(p)), None)
+
+# Cache the face detector (reused across requests)
+_fd_lock = threading.Lock()
+_fd = None
+
+def get_fd(w, h):
+    global _fd
+    if _fd is None:
+        with _fd_lock:
+            if _fd is None:
+                _fd = cv2.FaceDetectorYN.create(model=ONNX_PATH, config='', input_size=(320, 320),
+                                                score_threshold=0.8, nms_threshold=0.3, top_k=5000)
+    _fd.setInputSize((w, h))
+    return _fd
+
+def allowed_file(filename, exts=None):
+    exts = ALLOWED_EXTENSIONS if exts is None else exts
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in exts
+
+def load_video(req):
+    if 'file' in req.files and req.files['file'].filename != '':
+        if not ALLOW_LOCAL_MEDIA_UPLOAD:
+            # See _resolve_upload's docstring for the reasoning. Same rule,
+            # enforced separately because the main source video takes this
+            # path rather than that one.
+            return None, ('Direct file upload is disabled on this deployment. '
+                          'Use Browse Library to pick a file from a configured network folder.')
+        f = req.files['file']
+        if not allowed_file(f.filename):
+            return None, 'File type not allowed'
+        fn = secure_filename(f.filename)
+        if not fn:
+            return None, 'Invalid filename'
+        # Two people can easily upload same-named files at once (e.g. two
+        # different "episode1.mp4"s) while both jobs run concurrently (see
+        # MAX_CONCURRENT_JOBS / GATE below) -- without a per-request-unique
+        # disk name, the second upload would silently overwrite the first
+        # one's staged file out from under its still-running job. orig_name
+        # (the display name shown in results/history) stays the clean one.
+        disk_name = f'src_{int(time.time()*1000)}_{threading.get_ident()}_{fn}'
+        path = os.path.join(app.config['UPLOAD_FOLDER'], disk_name)
+        f.save(path)
+        # Checked against the saved file's real size, not a content-length
+        # header (not always present/reliable for a multipart upload) --
+        # same limit and same message-building as the network-fetch path,
+        # via the shared check_video_size() helper.
+        ok, err = check_video_size(os.path.getsize(path), label=fn)
+        if not ok:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return None, err
+        return path, fn
+    # The main dropzone's own richer browser posts 'network_file'; the shared
+    # "Browse library" modal used elsewhere (title/end card, BGM, SFX, VO, and
+    # now this Vision form) posts '<field>_network' -- for a field literally
+    # named 'file' that's 'file_network'. Accept either so the shared modal
+    # works here without needing its own bespoke field-naming convention.
+    staged = req.form.get('network_file') or req.form.get('file_network')
+    if staged:
+        # Must be a name we generated ourselves in fetch_network_video() (net_<ts>_<name>)
+        # and that still exists in UPLOAD_FOLDER -- never trust an arbitrary path here.
+        safe = os.path.basename(staged)
+        path = staged_path(safe)          # the copy here, or the file where it was left on the share
+        if safe.startswith('net_') and os.path.exists(path):
+            return path, safe
+        return None, 'Selected network file is no longer available -- please re-select it'
+    return None, 'No video provided'
+
+def _resolve_upload(field_name, exts=None):
+    """Resolves `field_name` to a local file path from a network-folder file
+    already staged into UPLOAD_FOLDER by /api/network/fetch
+    (request.form[field_name + '_network']). Returns None if not present/valid.
+    Used for every optional media field that supports "browse library"
+    (title/end card video, BG music, VO, SFX).
+
+    Direct browser file uploads are REJECTED for these fields (see
+    ALLOW_LOCAL_MEDIA_UPLOAD). Media supplied here is handed to ffmpeg, which
+    is a large C attack surface with a long CVE history -- so on a deployment
+    reachable beyond a trusted LAN, the meaningful control is that arbitrary
+    media never enters the pipeline at all. Files must instead come from the
+    curated network shares an admin configured, which someone would already
+    need internal access to write to.
+
+    Enforced HERE rather than only by hiding the browse button in the UI:
+    hiding a control stops honest users from using it and stops nobody else,
+    since the endpoint still accepts a hand-crafted multipart POST. The
+    server has to be the one saying no."""
+    if field_name in request.files and request.files[field_name].filename:
+        if not ALLOW_LOCAL_MEDIA_UPLOAD:
+            print(f'Rejected direct media upload for "{field_name}" '
+                  f'(ALLOW_LOCAL_MEDIA_UPLOAD is off -- use Browse Library instead).')
+            return None
+        f = request.files[field_name]
+        if exts is not None and not allowed_file(f.filename, exts):
+            return None
+        fn = secure_filename(f.filename)
+        if not fn:
+            return None
+        dest = os.path.join(app.config['UPLOAD_FOLDER'], f'{field_name}_{int(time.time()*1000)}_{threading.get_ident()}{os.path.splitext(fn)[1]}')
+        f.save(dest)
+        return dest
+    staged = (request.form.get(field_name + '_network') or '').strip()
+    if staged:
+        # Must be a name we generated ourselves in fetch_network_file() (net_<ts>_<name>)
+        # and that still exists in UPLOAD_FOLDER -- never trust an arbitrary path here.
+        safe = os.path.basename(staged)
+        path = staged_path(safe)
+        if safe.startswith('net_') and os.path.exists(path):
+            return path
+    return None
+
+def _upload_display_name(field_name):
+    """The human-readable original filename behind whatever _resolve_upload() would
+    return for `field_name` -- a browser upload's own name, or the network file's
+    name with the net_<ts>_ staging prefix stripped back off. Used so saved show
+    templates list "PLUG_BED_2024.wav" rather than an internal storage name."""
+    if field_name in request.files and request.files[field_name].filename:
+        return os.path.basename(request.files[field_name].filename)
+    staged = (request.form.get(field_name + '_network') or '').strip()
+    if staged:
+        return re.sub(r'^net_\d+_', '', os.path.basename(staged))
+    return None
+
+def _clean_ai_desc(raw):
+    """Tidies a vision model's DESC field for display in the scene table: single
+    line, no trailing punctuation, sentence-cased, and capped so one rambling
+    response can't stretch the column."""
+    t = ' '.join((raw or '').split())
+    t = re.sub(r'^(the\s+)?(image|frame|shot|scene)\s+(shows|depicts|features)\s+', '', t, flags=re.I)
+    t = t.strip(' .;:,-')
+    if len(t) > 120:
+        t = t[:117].rsplit(' ', 1)[0] + '…'
+    return (t[:1].upper() + t[1:]) if t else ''
+
+def _scene_desc(s):
+    """One human-readable line describing the shot, for the scene table.
+
+    Prefers the vision model's literal description of what's in frame. Without
+    AI rating there's no semantic information available at all, so the fallback
+    describes the measurable properties in plain words -- a close-up vs a wide,
+    how bright, how busy -- rather than emitting raw metric tags."""
+    ai = s.get('ai_desc', '') or ''
+    if ai:
+        return ai
+
+    sat = s.get('mean_sat', 0)
+    val = s.get('mean_val', 0)
+    edge = s.get('edge_ratio', 0)
+    hue = s.get('mean_hue', 0)
+    dur = s.get('duration', 0)
+
+    subject = 'Person in shot' if s.get('has_face') else (
+        'Busy, detailed shot' if edge > 0.15 else
+        'Wide, open shot' if edge < 0.06 else 'Medium shot')
+
+    light = ('very dark' if val < 40 else
+             'dim' if val < 90 else
+             'bright' if val > 200 else 'well lit')
+
+    colour = ('almost monochrome' if sat < 30 else
+              'strongly coloured' if sat > 100 else None)
+
+    palette = ('greens/outdoors' if 90 < hue < 150 else
+               'warm tones' if (0 < hue < 30 or 160 < hue < 180) else None)
+
+    bits = [light]
+    if colour: bits.append(colour)
+    if palette: bits.append(palette)
+    tail = f' — {dur:.1f}s take' if dur > 5 else ''
+    return f'{subject}, {", ".join(bits)}{tail}'
+
+def _to_scalar(x):
+    """Robustly converts a value that may already be a Python/numpy scalar, or
+    may be a 0-d or 1-d numpy array, into a plain Python float. Needed because
+    librosa.beat.beat_track's `tempo` return value changed from a plain float
+    to a numpy array (shape (1,), one entry per audio channel) in librosa
+    0.10+ -- calling float() directly on that array is what raises numpy's
+    'only 0-dimensional arrays can be converted to Python scalars' error.
+    np.ravel(x)[0] normalizes every shape (scalar, 0-d, 1-d) to a single
+    value before the float() conversion."""
+    return float(np.ravel(x)[0])
+
+def beat_match_audio(video_path, bgm_path, target_dur, output_path):
+    try:
+        import librosa
+        # Extract audio from source video, resample to consistent rate
+        audio_tmp = os.path.join(app.config['UPLOAD_FOLDER'], f'beat_video_{int(time.time())}.wav')
+        subprocess.run([FFMPEG, '-y', '-i', video_path, '-vn', '-ar', '22050', '-ac', '1', audio_tmp],
+                       capture_output=True, text=True, timeout=60)
+        if not os.path.exists(audio_tmp) or os.path.getsize(audio_tmp) == 0:
+            return False
+        y_vid, sr = librosa_load(audio_tmp, sr=22050)
+        os.remove(audio_tmp)
+        tempo_vid, _ = librosa.beat.beat_track(y=y_vid, sr=sr)
+        tempo_vid = _to_scalar(tempo_vid)
+        if tempo_vid < 30 or tempo_vid > 300:
+            tempo_vid = 120
+    except Exception as e:
+        print(f'Beat detection error: {e}')
+        return False
+
+    try:
+        y_bgm, sr_bgm = librosa_load(bgm_path, sr=22050)
+        # Detect BGM tempo
+        tempo_bgm, _ = librosa.beat.beat_track(y=y_bgm, sr=sr_bgm)
+        tempo_bgm = _to_scalar(tempo_bgm)
+        if tempo_bgm < 30 or tempo_bgm > 300:
+            tempo_bgm = tempo_vid
+
+        # Time-stretch to match video tempo (preserves pitch)
+        stretch = tempo_vid / tempo_bgm
+        if abs(stretch - 1.0) > 0.01:
+            y_bgm = librosa.effects.time_stretch(y=y_bgm, rate=stretch)
+
+        # Loop or trim to fill target_dur seconds
+        target_samples = int(target_dur * sr_bgm)
+        if len(y_bgm) < target_samples:
+            repeats = int(np.ceil(target_samples / len(y_bgm)))
+            y_bgm = np.tile(y_bgm, repeats)
+        y_bgm = y_bgm[:target_samples]
+
+        # Write processed BGM with proper sample rate
+        import soundfile as sf
+        sf.write(output_path, y_bgm, sr_bgm)
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        print(f'Beat match processing error: {e}')
+        return False
+
+def apply_filter(frame, mode, prev_gray=None):
+    if mode == 'gray':
+        return cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR), prev_gray
+    if mode == 'edges':
+        return cv2.cvtColor(cv2.Canny(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 100, 200), cv2.COLOR_GRAY2BGR), prev_gray
+    if mode == 'hsv':
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), prev_gray
+    if mode == 'blur':
+        return cv2.GaussianBlur(frame, (15, 15), 0), prev_gray
+    if mode == 'face':
+        if ONNX_PATH is None:
+            return frame, prev_gray
+        h, w = frame.shape[:2]
+        _, faces = get_fd(w, h).detect(frame)
+        if faces is not None:
+            for f in faces:
+                x, y, fw, fh = map(int, f[:4])
+                cv2.rectangle(frame, (x, y), (x + fw, y + fh), (0, 255, 0), 3)
+        return frame, prev_gray
+    if mode == 'motion':
+        gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0)
+        if prev_gray is None:
+            return frame, gray
+        diff = cv2.absdiff(prev_gray, gray)
+        thresh = cv2.dilate(cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)[1], None, iterations=2)
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        n = 0
+        for c in cnts:
+            if cv2.contourArea(c) > 500:
+                x, y, w, h = cv2.boundingRect(c)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                n += 1
+        if n:
+            cv2.putText(frame, f'Motion: {n}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        return frame, gray
+    return frame, prev_gray
+
+def synth_sfx_waveform(genre, sample_rate=22050, sfx_dur=0.6):
+    """Synthesize a single procedural 'hit' waveform for a genre. Returns a
+    1-D float array in [-1, 1], or None if the genre has no synth SFX defined."""
+    n_sfx = int(sfx_dur * sample_rate)
+    t = np.arange(n_sfx) / sample_rate
+    if genre == 'action' or genre == 'war':
+        # low sine "thump" for body + short filtered-feeling noise burst for texture,
+        # instead of pure white noise (which reads as hiss, not boom)
+        thump = np.sin(2*np.pi * 65 * t) * np.exp(-t * 14)
+        crackle = np.random.randn(n_sfx) * np.exp(-t * 22) * 0.35
+        sfx = thump * 0.8 + crackle
+    elif genre == 'horror':
+        # lower, narrower sweep than before (was up to 8kHz — shrill/painful);
+        # add a sub-bass rumble underneath for dread rather than a piercing shriek
+        sweep = np.sin(2*np.pi * (1200 + t * 3000) * t) * np.exp(-t * 8) * 0.25
+        rumble = np.sin(2*np.pi * 42 * t) * np.exp(-t * 6) * 0.3
+        sfx = sweep + rumble
+    elif genre == 'comedy':
+        sfx = np.sin(2*np.pi * (600 - t * 1200) * t) * np.exp(-t * 5) * 0.4
+    elif genre in ('thriller', 'adventure', 'scifi'):
+        sfx = np.sin(2*np.pi * (100 + t * 3000) * t) * np.exp(-t * 6) * 0.3
+    elif genre == 'western':
+        # sharp transient crack plus a touch of low-mid body so it reads as a
+        # gunshot/whip-crack rather than a thin, bodyless tick
+        crack = np.random.randn(n_sfx) * np.exp(-t * 35) * 0.55
+        body = np.sin(2*np.pi * 180 * t) * np.exp(-t * 16) * 0.3
+        sfx = crack + body
+    elif genre == 'sports':
+        # sine-based whistle tone in real whistle range (~2.8-3.1kHz) instead of a
+        # raw square wave, which aliases into a harsh electronic buzz
+        sfx = (np.sin(2*np.pi * 2800 * t) * 0.35 + np.sin(2*np.pi * 3100 * t) * 0.2) * np.exp(-t * 4)
+    elif genre == 'fantasy':
+        sfx = (np.sin(2*np.pi * 528 * t) * 0.3 + np.sin(2*np.pi * 1056 * t) * 0.15 +
+               np.sin(2*np.pi * 1584 * t) * 0.08) * np.exp(-t * 4)
+    else:
+        return None
+    peak = np.max(np.abs(sfx))
+    if peak > 0:
+        sfx = sfx / peak * 0.85
+    return sfx
+
+def load_hit_waveform(path, sample_rate=22050, max_dur=1.2, offset=0.0, trim_end=None):
+    """Load an uploaded or AI-generated one-shot SFX file (any format ffmpeg/librosa
+    can read) as a short mono waveform, trimmed and fade-tailed so it behaves like
+    a 'hit' when stamped at multiple cut points. Returns None on failure.
+
+    offset: seconds into the file to start reading from (the IN point set via
+    the waveform's own bracket buttons) -- lets a user skip past leading
+    silence or noise in their own uploaded file rather than always reading
+    from its very start.
+    trim_end: seconds into the file to stop reading at, or None for no
+    explicit cap beyond max_dur. The one-shot's own actual length is still
+    whichever is shorter of max_dur and (trim_end - offset) -- trim_end can
+    only shorten a one-shot, never lengthen it past max_dur, since a longer
+    "hit" stamped at every cut would stop sounding like one."""
+    try:
+        import librosa
+        dur = max_dur if trim_end is None else max(0.05, min(max_dur, trim_end - offset))
+        y, sr = librosa_load(path, sr=sample_rate, mono=True, offset=max(0.0, offset), duration=dur)
+        if y is None or len(y) == 0:
+            return None
+        # short fade-out so repeated stamping never clicks at the tail
+        fade_n = min(len(y), int(0.05 * sample_rate))
+        if fade_n > 0:
+            y[-fade_n:] *= np.linspace(1, 0, fade_n)
+        peak = np.max(np.abs(y))
+        if peak > 0:
+            y = y / peak * 0.85
+        return y
+    except Exception as e:
+        print(f'SFX load error: {e}')
+        return None
+
+def write_wav_pcm16(track, output_path, sample_rate=22050):
+    track = np.clip(track, -1, 1)
+    track_int = (track * 32767).astype(np.int16)
+    import struct
+    with open(output_path, 'wb') as f:
+        data_len = len(track_int) * 2
+        f.write(b'RIFF')
+        f.write(struct.pack('<I', 36 + data_len))
+        f.write(b'WAVE')
+        f.write(b'fmt ')
+        f.write(struct.pack('<I', 16))
+        f.write(struct.pack('<H', 1))
+        f.write(struct.pack('<H', 1))
+        f.write(struct.pack('<I', sample_rate))
+        f.write(struct.pack('<I', sample_rate * 2))
+        f.write(struct.pack('<H', 2))
+        f.write(struct.pack('<H', 16))
+        f.write(b'data')
+        f.write(struct.pack('<I', data_len))
+        f.write(track_int.tobytes())
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+def stamp_hits(hit_wave, timestamps, output_path, sample_rate=22050):
+    """Place a copy of `hit_wave` at every timestamp (seconds) into one continuous
+    track and write it as a WAV. This is what makes SFX land on *every* cut,
+    regardless of whether the hit sound came from synth, upload, or ACE-Step."""
+    try:
+        if hit_wave is None or len(hit_wave) == 0 or not timestamps:
+            return False
+        total_dur = max(timestamps) + (len(hit_wave) / sample_rate) + 0.5
+        total_samples = int(total_dur * sample_rate)
+        track = np.zeros(total_samples)
+        for i, ts in enumerate(timestamps):
+            # slight per-hit variation (pitch + level) so repeated cuts on a long
+            # trailer don't sound like an obviously copy-pasted stock sound
+            rng = np.random.RandomState(int(ts * 1000) & 0xffffffff)
+            pitch = 1.0 + rng.uniform(-0.08, 0.08)
+            amp = 0.9 + rng.uniform(-0.1, 0.1)
+            if abs(pitch - 1.0) > 1e-6:
+                idx = np.clip((np.arange(len(hit_wave)) * pitch).astype(int), 0, len(hit_wave) - 1)
+                hit = hit_wave[idx] * amp
+            else:
+                hit = hit_wave * amp
+            start = int(ts * sample_rate)
+            end = min(start + len(hit), total_samples)
+            if end > start:
+                track[start:end] += hit[:end - start]
+        return write_wav_pcm16(track, output_path, sample_rate)
+    except Exception as e:
+        print(f'SFX stamping error: {e}')
+        return False
+
+def _woosh_generate_raw(prompt, timeout=15):
+    """One call to Woosh's /generate. Returns (flac_bytes, error).
+
+    Request shape confirmed directly against this server's own /openapi.json
+    (an earlier version of this comment claimed the same rigor for a flatter
+    {prompt, token} body and was wrong -- that shape 500'd on '/generate' with
+    a Pydantic "extra_forbidden" error on the field it lives on now,
+    'args.prompt'). The real schema wraps every generation parameter inside
+    a nested `args` object, alongside top-level `version`/`token`:
+
+        {"version": "0.1", "token": "string", "args": {"prompt": ..., "cfg": 1,
+         "sampler": "heun", "num_steps": 100, "sigma_min": 0.00001,
+         "sigma_max": 80, "rho": 7, "S_churn": 1, "S_min": 0, "S_noise": 1,
+         "guidance_scale": 7.5, "noise_scheduler": "karras", "model": "Woosh-DFlow"}}
+
+    `token` still isn't read/validated server-side -- "string" (the schema's
+    own example placeholder) satisfies it with nothing to configure. Every
+    `args` field besides `prompt` is left at the schema's own example/default
+    value rather than guessed at, since there's no way to verify what
+    changing e.g. `sampler` or `guidance_scale` would actually do without
+    access to the model itself.
+
+    The response is FLAC (media_type="audio/flac"), not WAV -- this was
+    previously saved with a .wav extension and served as-is, which lies about
+    the container in both the filename and the Content-Type Flask would
+    derive from it, and could fail to play in a browser depending on how
+    strictly it trusts that mismatch.
+
+    `duration` is not a field anywhere in this schema. Callers that need a
+    specific length enforce it themselves by trimming the response (see
+    _woosh_generate below), since the API has no way to ask for one."""
+    try:
+        r = requests.post(f'{WOOSH_URL}/generate', json={
+            'version': '0.1',
+            'token': 'string',
+            'args': {
+                'prompt': prompt,
+                'cfg': 1,
+                'sampler': 'heun',
+                'num_steps': 100,
+                'sigma_min': 0.00001,
+                'sigma_max': 80,
+                'rho': 7,
+                'S_churn': 1,
+                'S_min': 0,
+                'S_noise': 1,
+                'guidance_scale': 7.5,
+                'noise_scheduler': 'karras',
+                'model': 'Woosh-DFlow',
+            },
+        }, timeout=timeout)
+    except Exception as e:
+        return None, f'Could not reach Woosh at {WOOSH_URL}: {e}'
+    if not r.ok:
+        return None, f'Woosh API error {r.status_code}: {(r.text or "")[:300]}'
+    if not r.content:
+        return None, 'Woosh returned an empty response.'
+    return r.content, None
+
+def _woosh_generate(prompt, dest_flac_path, duration=None, timeout=15):
+    """Fetches one Woosh generation and writes it to `dest_flac_path` (must end
+    in .flac), trimming to `duration` seconds if given. Returns (ok, error).
+
+    Trimming is done here, client-side, because the API has no duration
+    parameter of its own -- this is the only way "duration" means anything."""
+    raw, err = _woosh_generate_raw(prompt, timeout=timeout)
+    if err:
+        return False, err
+    if duration is None:
+        try:
+            with open(dest_flac_path, 'wb') as f:
+                f.write(raw)
+        except OSError as e:
+            return False, f'Could not write output file: {e}'
+        return os.path.exists(dest_flac_path) and os.path.getsize(dest_flac_path) > 0, None
+
+    raw_path = dest_flac_path + '.raw.flac'
+    try:
+        with open(raw_path, 'wb') as f:
+            f.write(raw)
+    except OSError as e:
+        return False, f'Could not write output file: {e}'
+    try:
+        run_ffmpeg([FFMPEG, '-y', '-i', raw_path, '-t', str(duration), '-c:a', 'flac', dest_flac_path],
+                   timeout=30, label='woosh trim')
+    except MediaToolTimeout as e:
+        return False, f'Trimming the Woosh output timed out: {e}'
+    finally:
+        if os.path.exists(raw_path):
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+    return os.path.exists(dest_flac_path) and os.path.getsize(dest_flac_path) > 0, None
+
+def woosh_sfx(genre, output_path, duration=0.8):
+    """Generate a one-shot SFX using Sony AI's Woosh text-to-audio model via its
+    local API server. `output_path` should end in .flac (Woosh's real output
+    format -- see _woosh_generate_raw). Returns True/False — failures fall
+    through silently so the caller can fall back to the procedural synth
+    (ACE-Step is a music model, not used for SFX)."""
+    prompt = GENRE_SFX_PROMPTS.get(genre)
+    if not prompt:
+        return False
+    ok, err = _woosh_generate(prompt, output_path, duration=duration, timeout=15)
+    if not ok and err:
+        print(f'Woosh SFX error: {err}')
+    return ok
+
+WOOSH_MAX_SAMPLES = int(os.environ.get('WOOSH_MAX_SAMPLES', 4))
+
+def woosh_sfx_generate(prompt, duration=None, samples=1, base_ts=None):
+    """Generate SFX from free-text prompts, for the Tools tab. Returns (paths, error).
+
+    Unlike woosh_sfx() above (which the trailer pipeline calls with a fixed
+    genre-derived prompt and silently falls back to a procedural synth on
+    failure, since *some* sound must occupy that slot), this is the raw
+    generator behind the Text to SFX tool: any prompt the user types, and no
+    fallback -- if Woosh is down the tool should say so rather than hand back
+    a synth click the user didn't ask for.
+
+    duration=None (the default, and the only option the Tools tab UI offers)
+    returns Woosh's own natural-length output untouched. A caller can still
+    pass a number to get it trimmed to that length client-side, since Woosh's
+    real API has no duration parameter of its own -- see _woosh_generate.
+
+    Multiple samples are produced by calling _woosh_generate repeatedly rather
+    than a batch parameter, since the real request schema has no such field
+    either (see _woosh_generate_raw)."""
+    prompt = (prompt or '').strip()
+    if not prompt:
+        return [], 'Enter a description of the sound you want.'
+    if duration is not None:
+        duration = max(0.2, min(10.0, float(duration)))
+    samples = max(1, min(WOOSH_MAX_SAMPLES, int(samples or 1)))
+    base_ts = base_ts or f'tool{int(time.time()*1000)}'
+
+    paths, last_err = [], None
+    for i in range(samples):
+        dest = os.path.join(app.config['UPLOAD_FOLDER'], f'sfx_{base_ts}_{i}.flac')
+        ok, err = _woosh_generate(prompt, dest, duration=duration, timeout=30)
+        if ok:
+            paths.append(dest)
+        else:
+            last_err = err
+
+    if not paths:
+        return [], (last_err or 'Generation failed.')
+    return paths, None
+
+def generate_tts(text, output_wav_path, rate=175, voice_id=None, reference_audio_path=None, language=None, engine='fish_audio'):
+    """Generate a narration WAV from text, via whichever engine the user picked:
+    'fish_audio' (Fish Audio S2, voice cloning, auto-detects language including
+    Tagalog). Returns (ok, error_message). There's
+    no bundled default voice — the caller must pass either `voice_id` (a voice
+    picked from list_voices_for_engine()) or `reference_audio_path` (an uploaded
+    sample to clone zero-shot); if neither is given, this returns an error
+    rather than silently falling back to some fixed voice file."""
+    text = (text or '').strip()
+    if not text:
+        return False, 'No text provided'
+    if not voice_id and not (reference_audio_path and os.path.exists(reference_audio_path)):
+        return False, 'No voice selected — choose a voice from the list or upload a reference sample to clone.'
+    # Fish Audio is the only narration engine. Anything else (an old template
+    # or API call naming a removed engine) falls through to it rather than failing.
+    engine_fn, engine_label = fish_audio_tts, 'Fish Audio'
+    try:
+        ok, err = engine_fn(text, output_wav_path, voice_id=voice_id, rate=rate,
+                             reference_audio_path=reference_audio_path, language=language)
+        if ok:
+            return True, None
+        print(f'{engine_label} TTS error: {err}')
+        return False, f'{engine_label}: {err}'
+    except Exception as e:
+        print(f'{engine_label} unavailable: {e}')
+        return False, f'{engine_label} unavailable: {e}'
+
+def _skip_leading_silence(path, trim_start, trim_end=None, max_skip=15.0):
+    """Music should not open on silence: when the part of the track that will be used starts with a quiet
+    stretch, start where the sound does. Returns the (possibly later) start time."""
+    try:
+        t0 = float(trim_start or 0.0)
+        sil = _detect_silence_intervals(path, noise_db=-45, min_dur=0.25, timeout=60)
+        for a, b in sorted(sil):
+            if a <= t0 + 0.05 and b > t0:
+                new = b - 0.05
+                if new - t0 <= max_skip and (trim_end is None or new < float(trim_end) - 1.0):
+                    return max(t0, new)
+                break
+    except Exception as e:
+        print(f'Leading-silence check skipped: {e}')
+    return float(trim_start or 0.0)
+
+
+def prepare_bgm_track(genre, scoring_mode, scoring_audio_path, duration, base_ts, fade_in=2.0, fade_out=3.0,
+                       trim_start=0.0, trim_end=None):
+    """Produce a ready-to-mix BGM track (AAC .m4a, faded, trimmed to `duration`).
+    Shared by the early beat-sync pass (approximate target duration) and the
+    final mix pass (reused as-is if already prepared, else generated fresh).
+    trim_start/trim_end select which portion of an UPLOADED source file to
+    use (ignored for 'generate' mode, which has no source file to trim) --
+    before this, an upload was always read from its own beginning, with no
+    way to pick a different part of a longer track.
+    Returns (path_or_None, source) where source is 'uploaded' | 'ai_generated' | 'synth_fallback' | 'none'."""
+    bgm_source = 'none'
+    if not scoring_audio_path:
+        return None, bgm_source
+    if scoring_audio_path != 'GENERATE' and os.path.exists(scoring_audio_path):
+        trim_start = _skip_leading_silence(scoring_audio_path, trim_start, trim_end)
+    if scoring_audio_path == 'GENERATE':
+        gen_audio = os.path.join(app.config['UPLOAD_FOLDER'], f'gen_{base_ts}_{int(time.time()*1000)%100000}.m4a')
+        acestep_ok = False
+        try:
+            prompt = GENRE_PROMPTS.get(genre, 'Cinematic background music, instrumental, no vocals')
+            payload = {
+                'prompt': prompt,
+                'audio_duration': duration,
+                'thinking': False,
+                # 8 steps was well below ACE-Step's usable range and was the main
+                # reason generated beds sounded thin/smeared. 27 is the model's
+                # own documented default; raise ACE_STEP_STEPS for more quality
+                # at proportionally more GPU time.
+                'inference_steps': ACE_STEP_STEPS,
+                'batch_size': 1,
+                # "no vocals" in the prompt text is only a soft hint. ACE-Step
+                # takes a dedicated lyrics field, and [inst] is its explicit
+                # instrumental marker -- a far stronger guarantee of no vocals.
+                'lyrics': '[inst]',
+            }
+            if ACE_STEP_NEGATIVE_PROMPT:
+                payload['negative_prompt'] = ACE_STEP_NEGATIVE_PROMPT
+            r = requests.post(f'{ACE_STEP_URL}/release_task', json=payload, headers=_ace_step_headers(), timeout=10)
+            try:
+                data = r.json()
+            except ValueError:
+                # Same distinction as acestep_generate(): a response that
+                # isn't JSON usually means a wrong path or rejected auth for
+                # this specific server, not that it's unreachable -- worth
+                # having the real status/body in the server log even though
+                # this path just falls back to a synth bed rather than
+                # surfacing an error to the user directly.
+                print(f'ACE-Step at {ACE_STEP_URL} responded without JSON '
+                      f'(HTTP {r.status_code}): {(r.text or "(empty body)")[:300]!r}')
+                data = {}
+            task_id = data.get('data', {}).get('task_id')
+            if task_id:
+                for _ in range(60):
+                    time.sleep(2)
+                    q = requests.post(f'{ACE_STEP_URL}/query_result', json={'task_id_list': [task_id]}, headers=_ace_step_headers(), timeout=5)
+                    qd = q.json()
+                    items = qd.get('data', [])
+                    if items and items[0].get('status') == 1:
+                        result = json.loads(items[0]['result'])
+                        audio_path = result[0]['file'] if isinstance(result, list) else result.get('file', '')
+                        if audio_path:
+                            dl_url = f'{ACE_STEP_URL}{audio_path}'
+                            resp = requests.get(dl_url, headers=_ace_step_headers(), timeout=60)
+                            with open(gen_audio, 'wb') as f:
+                                f.write(resp.content)
+                            if os.path.getsize(gen_audio) > 0:
+                                acestep_ok = True
+                        break
+                    elif items and items[0].get('status') == 2:
+                        break
+        except Exception as e:
+            print(f'ACE-Step error: {e}')
+        if acestep_ok:
+            bgm_source = 'ai_generated'
+        else:
+            lavfi_src = GENRE_LAVFI.get(genre, GENRE_LAVFI['default'])
+            subprocess.run([FFMPEG, '-y', '-f', 'lavfi', '-i',
+                            f'aevalsrc=exprs=\'{lavfi_src}\':d={duration}:s=44100:c=stereo',
+                            '-af',
+                            f'lowpass=f=6000,tremolo=f=0.15:d=0.4,volume=1.5,'
+                            f'aecho=0.8:0.7:60:0.25,'
+                            f'afade=t=in:d={fade_in},'
+                            f'afade=t=out:st={max(duration - fade_out, 0)}:d={min(fade_out, duration)}',
+                            '-c:a', 'aac', '-b:a', '192k', gen_audio],
+                           capture_output=True, text=True, timeout=30)
+            bgm_source = 'synth_fallback'
+        if os.path.exists(gen_audio) and os.path.getsize(gen_audio) > 0:
+            return gen_audio, bgm_source
+        return None, 'none'
+    else:
+        processed_audio = os.path.join(app.config['UPLOAD_FOLDER'], f'score_{base_ts}_{int(time.time()*1000)%100000}.m4a')
+        # Same -ss/-to-before-the-input pattern already used for uploaded VO
+        # trimming: seeking at the input level (not via an -af atrim start=)
+        # is both faster (ffmpeg can skip straight there) and simpler to
+        # combine with the *duration*-based atrim right after it, which
+        # fits whatever portion this selects to the render's actual needed
+        # length -- trim_start/trim_end pick WHICH part of the source to
+        # use, the af filter below decides how much of THAT to keep.
+        cmd = [FFMPEG, '-y']
+        if trim_start > 0 or trim_end is not None:
+            cmd.extend(['-ss', str(trim_start)])
+            if trim_end is not None:
+                cmd.extend(['-to', str(trim_end)])
+        cmd.extend(['-i', scoring_audio_path,
+                    '-af', (f'atrim=duration={duration},'
+                            f'afade=t=in:d={fade_in},'
+                            f'afade=t=out:st={max(duration - fade_out, 0)}:d={min(fade_out, duration)}'),
+                    '-c:a', 'aac', '-b:a', '192k', '-vn', processed_audio])
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if os.path.exists(processed_audio) and os.path.getsize(processed_audio) > 0:
+            return processed_audio, 'uploaded'
+        return None, 'none'
+
+def finalize_bgm_duration(src_path, duration, base_ts, fade_in=2.0, fade_out=3.0):
+    """Re-trim/pad + re-fade an already-generated BGM track to an exact final
+    duration (used when the early beat-sync pass generated it against an
+    estimate that ended up slightly off from the final trailer length)."""
+    out = os.path.join(app.config['UPLOAD_FOLDER'], f'bgmfit_{base_ts}_{int(time.time()*1000)%100000}.m4a')
+    subprocess.run([FFMPEG, '-y', '-i', src_path,
+                        '-af', (f'atrim=duration={duration},apad=whole_dur={duration},'
+                                f'afade=t=in:d={fade_in},'
+                                f'afade=t=out:st={max(duration - fade_out, 0)}:d={min(fade_out, duration)}'),
+                        '-c:a', 'aac', '-b:a', '192k', out],
+                       capture_output=True, text=True, timeout=30)
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        return out
+    return None
+
+def trim_card_video(video_path, trim_start, trim_end, output_path):
+    """Cut a title/end card's own VIDEO to [trim_start, trim_end) seconds
+    (trim_end=None means to the end of the file) -- the card's own visual
+    content, as opposed to mux_card_vo() below which replaces its AUDIO
+    with a separately-uploaded VO track. Re-encodes (not -c copy) since an
+    accurate cut at an arbitrary, non-keyframe point is worth far more here
+    than the speed of a copy -- these cards are short, so the cost is
+    small for an ordinary web-friendly source. A real, reported failure
+    showed this isn't true for every source, though: a large,
+    professional-codec master (ProRes/DNxHD .mov, hundreds of MB) can take
+    genuinely long to decode and re-encode even for a short trim, and the
+    original version of this function used a flat 60s timeout with no
+    handling for it timing out at all -- subprocess.run kills ffmpeg
+    mid-write on a timeout, which for a plain (non-faststart) MP4 leaves a
+    truncated file with real video bytes but no trailing moov atom (the
+    duration/index metadata, normally written last) -- passing this
+    function's own "exists and has some bytes" check while being
+    genuinely unreadable by ffprobe, which is exactly what surfaced much
+    later as a confusing "could not read the duration" failure instead of
+    a clear one here. Uses FFMPEG_LONG_TIMEOUT (900s default, the same
+    budget already used elsewhere for full-source passes) instead of a
+    short, fixed one, explicitly handles an actual timeout by returning
+    None rather than leaving a corrupt file to be discovered downstream,
+    and confirms the output's own duration is genuinely readable before
+    ever calling this a success. Returns output_path on success, or None
+    if the trim failed for any reason (caller should keep the card's
+    original, untrimmed video in that case, exactly like mux_card_vo's
+    own failure contract) -- and cleans up any partial output file itself
+    in the failure case, rather than leaving a corrupt one on disk that
+    could be mistaken for a valid cached result later."""
+    cmd = [FFMPEG, '-y', '-ss', str(trim_start)]
+    if trim_end is not None:
+        cmd += ['-to', str(trim_end)]
+    cmd += ['-i', video_path, '-c:v', 'libx264', '-preset', 'fast', '-c:a', 'aac', '-b:a', '192k', output_path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_LONG_TIMEOUT)
+        stderr = r.stderr
+    except subprocess.TimeoutExpired:
+        stderr = f'Trim timed out after {FFMPEG_LONG_TIMEOUT}s'
+    if (os.path.exists(output_path) and os.path.getsize(output_path) > 0
+            and (probe_duration(output_path) or 0) > 0):
+        return output_path
+    print(f'Card video trim error ({video_path}): {stderr[:500]}')
+    if os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+    return None
+
+CARD_VO_PAUSE_MIN = 0.30       # a pause between words this long or longer is tightened
+CARD_VO_PAUSE_KEEP = 0.18      # ... to this
+CARD_VO_LONG = 10.0            # a recording this long (seconds of speech and pauses) is tightened harder
+CARD_VO_LEAD = 0.08            # silence kept before the first word
+CARD_VO_TAIL = 0.25            # silence kept after the last word
+CARD_VO_MIN_SAVING = 0.25      # not worth a re-cut for less than this
+
+
+def tighten_card_vo(vo_path, trim_start, trim_end, upload_dir=None, tag='cardvo'):
+    """The narration of a title or end card with the dead air taken out: the silence before the first word,
+    after the last, and the long pauses between words, which are brought down to a natural short breath.
+    Matters most when the recording runs long for its card (the card keeps its own length and a longer voice
+    is cut off at the end of it). -> (path, start, end, seconds_saved); the inputs unchanged and 0.0 when there
+    is nothing worth taking out or the recording could not be read."""
+    unchanged = (vo_path, trim_start, trim_end, 0.0)
+    if not vo_path or not os.path.exists(vo_path):
+        return unchanged
+    try:
+        t0 = float(trim_start or 0.0)
+        t1 = float(trim_end) if trim_end is not None else (probe_duration(vo_path) or 0.0)
+        if t1 - t0 < 0.6:
+            return unchanged
+        long_ = (t1 - t0) > CARD_VO_LONG
+        pause_min = 0.25 if long_ else CARD_VO_PAUSE_MIN
+        keep = 0.12 if long_ else CARD_VO_PAUSE_KEEP
+        # Silence is looked for on the window itself, so times are relative to its start.
+        win = os.path.join(upload_dir or app.config['UPLOAD_FOLDER'], f'{tag}_win_{uuid.uuid4().hex}.wav')
+        r = subprocess.run([FFMPEG, '-y', '-loglevel', 'error', '-ss', f'{t0:.3f}', '-t', f'{t1 - t0:.3f}', '-i', vo_path,
+                            '-ac', '1', '-ar', '44100', '-c:a', 'pcm_s16le', win],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0 or not os.path.exists(win):
+            return unchanged
+        try:
+            sil = sorted(_detect_silence_intervals(win, noise_db=-38, min_dur=min(pause_min, 0.25)))
+        finally:
+            try:
+                os.remove(win)
+            except OSError:
+                pass
+        dur = t1 - t0
+        # Speech runs: what lies between the silences.
+        runs, pos = [], 0.0
+        for a, b in sil:
+            if a - pos > 0.04:
+                runs.append([pos, a])
+            pos = max(pos, b)
+        if dur - pos > 0.04:
+            runs.append([pos, dur])
+        if not runs:
+            return unchanged
+        # Pauses shorter than the minimum are speech's own; join runs across them.
+        merged = [runs[0]]
+        for a, b in runs[1:]:
+            if a - merged[-1][1] < pause_min:
+                merged[-1][1] = b
+            else:
+                merged.append([a, b])
+        ranges = []
+        for k, (a, b) in enumerate(merged):
+            lead = CARD_VO_LEAD if k == 0 else keep / 2.0
+            tail = CARD_VO_TAIL if k == len(merged) - 1 else keep / 2.0
+            ranges.append((t0 + max(0.0, a - lead), t0 + min(dur, b + tail)))
+        kept = sum(b - a for a, b in ranges)
+        saved = dur - kept
+        if saved < CARD_VO_MIN_SAVING:
+            return unchanged
+        out = os.path.join(upload_dir or app.config['UPLOAD_FOLDER'], f'{tag}_tight_{int(time.time() * 1000)}.wav')
+        joined = _concat_audio_ranges(vo_path, ranges, out)
+        if not joined:
+            return unchanged
+        return joined, 0.0, None, round(saved, 2)
+    except Exception as e:
+        print(f'Card narration not tightened ({vo_path}): {e}')
+        return unchanged
+
+
+def mux_card_vo(video_path, vo_path, trim_start, trim_end, output_path):
+    """Replace a title/end card video's audio with a trimmed window of an uploaded
+    VO file: [trim_start, trim_end) seconds of vo_path (trim_end=None means to the
+    end of the file). The VO is padded with silence if shorter than the card video
+    so the card keeps its full original length either way. Returns output_path on
+    success, or None if the mux failed (caller should keep the card's original
+    audio/video untouched in that case).
+
+    Same timeout/validation hardening as trim_card_video's own, and for the
+    same real reason: -c:v copy usually makes this fast regardless of
+    source size, but a slow enough disk/network or a container ffmpeg
+    still has to at least partially re-parse could still exceed a short,
+    fixed timeout for a large enough professional-codec source."""
+    cmd = [FFMPEG, '-y', '-i', video_path, '-ss', str(trim_start)]
+    if trim_end is not None:
+        cmd.extend(['-to', str(trim_end)])
+    cmd.extend(['-i', vo_path,
+                '-map', '0:v', '-map', '1:a',
+                '-af', 'apad', '-shortest',
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', output_path])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_LONG_TIMEOUT)
+        stderr = r.stderr
+    except subprocess.TimeoutExpired:
+        stderr = f'Mux timed out after {FFMPEG_LONG_TIMEOUT}s'
+    if (os.path.exists(output_path) and os.path.getsize(output_path) > 0
+            and (probe_duration(output_path) or 0) > 0):
+        return output_path
+    print(f'Card VO mux error ({video_path}): {stderr[:500]}')
+    if os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+    return None
+
+CARD_TITLE_SCAN = os.environ.get('CARD_TITLE_SCAN', '1') != '0'
+CARD_SCAN_SECS = 12.0           # how far into a card the title is looked for
+CARD_SCAN_FPS = 4
+
+
+def _scan_frames(video_path, secs, fps, width=1280):
+    """[(time, BGR frame)] sampled from the start of a video."""
+    import tempfile
+    out = []
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            subprocess.run([FFMPEG, '-y', '-loglevel', 'error', '-t', f'{secs:.2f}', '-i', video_path, '-an',
+                            '-vf', f'fps={fps},scale={width}:-2', '-q:v', '3', os.path.join(d, 'f_%04d.jpg')],
+                           capture_output=True, timeout=120)
+        except Exception as e:
+            print(f'Card frame scan failed: {e}')
+            return out
+        for n, name in enumerate(sorted(os.listdir(d))):
+            img = cv2.imread(os.path.join(d, name))
+            if img is not None:
+                out.append((n / float(fps), img))
+    return out
+
+
+def _title_seen_by_ocr(img, title):
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        for variant in (gray, 255 - gray):
+            text = pytesseract.image_to_string(Image.fromarray(variant), config='--psm 11')
+            if cutcraft.title_in_text(title, text):
+                return True
+        return False
+    except Exception as e:
+        print(f'Card OCR failed: {e}')
+        return None
+
+
+def _title_seen_by_model(img, title):
+    """Asks the vision model whether the title is on screen, whole and readable."""
+    import shorts_core
+    prod = load_production_defaults()
+    model = prod.get('vision_model') or 'qwen3-vl:8b'
+    ok, buf = cv2.imencode('.jpg', cv2.resize(img, (960, int(img.shape[0] * 960 / img.shape[1]))), [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        return None
+    reply, _ = shorts_core.ollama_generate(OLLAMA_URL, {
+        'model': model, 'stream': False, 'format': 'json', 'images': [base64.b64encode(buf.tobytes()).decode('ascii')],
+        'prompt': (f'This is one frame of a TV title card. Is the title "{title}" completely on screen and readable '
+                   '(not still animating in, not partly covered, not faded)? Reply with JSON only: {"visible": true} or {"visible": false}.'),
+        'options': {'temperature': 0.0, 'num_predict': 40}}, timeout=120)
+    m = re.search(r'\{.*\}', reply or '', re.S)
+    try:
+        return bool(json.loads(m.group(0)).get('visible')) if m else None
+    except ValueError:
+        return None
+
+
+def _find_title_time(video_path, duration, title):
+    """When is `title` fully on screen in a card? -> (seconds, how) or (None, None). Reads the card's text
+    with OCR, frame by frame from the start; when OCR is not installed or finds nothing, the vision model
+    is asked about a frame a second. Nothing found is not an error: the card is then measured as before."""
+    if not (CARD_TITLE_SCAN and str(title or '').strip()):
+        return None, None
+    frames = _scan_frames(video_path, min(float(duration), CARD_SCAN_SECS), CARD_SCAN_FPS)
+    if not frames:
+        return None, None
+    for t, img in frames:
+        seen = _title_seen_by_ocr(img, title)
+        if seen is None:
+            break
+        if seen:
+            return t, 'text reading'
+    # OCR cannot read a stylised logo: ask the model, a frame a second.
+    try:
+        if _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
+            for t, img in frames[::CARD_SCAN_FPS]:
+                if _title_seen_by_model(img, title):
+                    return t, 'AI model'
+    except Exception as e:
+        print(f'Card title check by model failed: {e}')
+    return None, None
+
+
+def _card_measure(video_path, duration, title=None, window=False):
+    """How short can this card safely get? -> (floor, details).
+
+    A card's own voice has to finish and its animation has to settle before
+    anything is trimmed off the end. The voice end comes from silence
+    detection on the card's audio, the settle point from ffmpeg's freezedetect
+    (the picture stops changing). With `title` (the show's title, from the
+    script), the card's frames are read to find when the title is fully on
+    screen; the card is never cut before that plus a hold, and a card whose
+    picture keeps moving to the very end (a light sweep, a loop) can then be
+    cut after the title has been seen. A card with sound that runs to the end,
+    or where nothing can be measured, keeps its full length (the last-resort
+    pass in the job can still use the old fixed 1.0 s floor if the plug would
+    otherwise miss its length)."""
+    voice_end = still_from = None
+    info = probe_media_info(video_path)
+    try:
+        if info.get('has_audio'):
+            sil = _detect_silence_intervals(video_path, noise_db=-40, min_dur=0.15, timeout=60)
+            voice_end = cutcraft.voice_end_from_silences(sil, duration)
+        r = subprocess.run([FFMPEG, '-hide_banner', '-i', video_path, '-vf',
+                            'freezedetect=n=-55dB:d=0.3', '-an', '-f', 'null', '-'],
+                           capture_output=True, text=True, timeout=120)
+        still_from = cutcraft.parse_freeze_tail(r.stderr, duration)
+    except Exception as e:
+        print(f'Card measure error ({video_path}): {e}')
+        return duration, {'voice_end': None, 'still_from': None}
+    title_at, title_by = (None, None)
+    try:
+        title_at, title_by = _find_title_time(video_path, duration, title)
+    except Exception as e:
+        print(f'Card title search skipped: {e}')
+    why = None
+    if title_at is not None:
+        # The script names the title: once it has been on screen long enough to read, the rest of the card is
+        # free to go. The card's own sound (a music bed or sting that runs to the end) and a picture that never
+        # settles (a light sweep) used to keep every such card at full length.
+        if window:
+            # the piece is cut from the card's end (or from just before the title), so any piece that holds the
+            # title for its hold, with a little build-in before it, will do
+            floor = min(float(duration), cutcraft.TITLE_HOLD + cutcraft.TITLE_LEAD)
+            why = f'title seen at {title_at:.1f}s; a piece that holds it {cutcraft.TITLE_HOLD:g}s is cut from the card'
+        else:
+            floor = min(float(duration), max(cutcraft.CARD_MIN, title_at + cutcraft.TITLE_HOLD))
+            why = f'title seen at {title_at:.1f}s, kept {cutcraft.TITLE_HOLD:g}s after it'
+    elif still_from is None:
+        # The picture is still moving at the very end (or never settles), so
+        # nothing can be trimmed without cutting the animation.
+        floor = duration
+        why = ('title not found in the card, and the picture never settles' if title
+               else 'the picture never settles')
+    else:
+        floor = cutcraft.card_floor(duration, voice_end=voice_end, still_from=still_from)
+        if title:
+            why = 'title not found in the card (needs tesseract or the vision model)'
+    return floor, {'why': why, 'voice_end': voice_end, 'still_from': still_from, 'title_at': title_at, 'title_by': title_by,
+                   'title': title if title_at is not None else None}
+
+
+def _adjust_card_duration(video_path, delta, output_path, start=0.0):
+    """Grow or shrink a title/end card's duration by `delta` seconds
+    (positive to grow, negative to shrink) as a last-resort gap-filler when
+    scene-clip-based duration correction alone couldn't close a residual
+    gap -- e.g. every selected scene is already at zero headroom. Bounded
+    by the caller to CARD_DURATION_ADJUST_LIMIT combined across both cards;
+    this function just performs one card's share of that adjustment.
+
+    Growing freezes the card's last frame for the extra time (ffmpeg's
+    `tpad=stop_mode=clone`), rather than looping or stretching the card,
+    since a frozen end frame reads as a natural, intentional hold on a
+    broadcast card and never introduces a visible seam. If the card has an
+    audio track, it's extended with silence (`apad`) so video/audio stay in
+    sync; a silent extra second on a card's own audio is inaudible against
+    the trailer's other audio (VO/BGM/SFX) mixed in downstream. Shrinking
+    re-encodes with a plain tail trim (`-t <new_duration>`), matching
+    trim_card_video's existing approach for accurate arbitrary-length cuts.
+
+    Same timeout/validation/cleanup contract as trim_card_video and
+    mux_card_vo: uses FFMPEG_LONG_TIMEOUT, confirms the output's duration is
+    genuinely readable before calling it a success, cleans up any partial
+    output on failure, and returns output_path on success or None on
+    failure (caller should keep the card's original, unadjusted file in
+    that case)."""
+    if abs(delta) < 0.01:
+        return None
+    info = probe_media_info(video_path)
+    orig_dur = info.get('duration')
+    if not orig_dur or orig_dur <= 0:
+        return None
+    if delta > 0:
+        if info.get('has_audio'):
+            filter_complex = (f'[0:v]tpad=stop_mode=clone:stop_duration={delta}[v];'
+                               f'[0:a]apad=pad_dur={delta}[a]')
+            cmd = [FFMPEG, '-y', '-i', video_path, '-filter_complex', filter_complex,
+                   '-map', '[v]', '-map', '[a]',
+                   '-c:v', 'libx264', '-preset', 'fast', '-c:a', 'aac', '-b:a', '192k', output_path]
+        else:
+            cmd = [FFMPEG, '-y', '-i', video_path,
+                   '-vf', f'tpad=stop_mode=clone:stop_duration={delta}',
+                   '-c:v', 'libx264', '-preset', 'fast', '-an', output_path]
+    else:
+        new_duration = max(0.3, orig_dur + delta)
+        start = max(0.0, min(float(start or 0.0), orig_dur - new_duration))
+        # `start` > 0 cuts the piece out of the card's middle or end instead of keeping its head.
+        cmd = [FFMPEG, '-y'] + (['-ss', f'{start:.3f}'] if start > 0.001 else []) + ['-i', video_path, '-t', str(new_duration)]
+        if info.get('has_audio'):
+            # A short fade so the new end never clicks, even when the cut
+            # lands after the card's own voice (see _card_measure).
+            fade = min(0.12, new_duration / 4)
+            af = f'afade=t=out:st={max(0.0, new_duration - fade):.3f}:d={fade:.3f}'
+            if start > 0.001:
+                af = f'afade=t=in:st=0:d={min(0.06, new_duration / 8):.3f},' + af
+            cmd += ['-af', af]
+        cmd += ['-c:v', 'libx264', '-preset', 'fast', '-c:a', 'aac', '-b:a', '192k', output_path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_LONG_TIMEOUT)
+        stderr = r.stderr
+    except subprocess.TimeoutExpired:
+        stderr = f'Card duration adjust timed out after {FFMPEG_LONG_TIMEOUT}s'
+    if (os.path.exists(output_path) and os.path.getsize(output_path) > 0
+            and (probe_duration(output_path) or 0) > 0):
+        return output_path
+    print(f'Card duration adjust error ({video_path}, delta={delta}): {stderr[:500]}')
+    if os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+    return None
+
+def detect_beat_times(audio_path, duration):
+    """Return a sorted list of beat timestamps (seconds) within an audio file, or
+    an empty list if librosa/beat detection isn't available. Used to snap cut
+    points onto the music so edits land 'on the beat'."""
+    try:
+        import librosa
+        y, sr = librosa_load(audio_path, sr=22050, duration=duration)
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        times = librosa.frames_to_time(beat_frames, sr=sr)
+        return sorted(_to_scalar(t) for t in times)
+    except Exception as e:
+        print(f'Beat detection error: {e}')
+        return []
+
+def nearest_beat(target, beats, lo, hi):
+    """Nearest beat time to `target` within [lo, hi]; falls back to `target` if none in range."""
+    candidates = [b for b in beats if lo <= b <= hi]
+    if not candidates:
+        return target
+    return min(candidates, key=lambda b: abs(b - target))
+
+# ---- whisper service — dialogue transcription to improve scene selection ----
+# How long one transcription request may take. A whole episode on a busy or
+# CPU-only whisper server runs well past the ten minutes this used to be
+# fixed at, and a request cut off at the limit looks exactly like a file
+# with no speech in it.
+WHISPER_TIMEOUT = int(os.environ.get('WHISPER_TIMEOUT', 1800))
+
+
+class WhisperNoTimings(ValueError):
+    """The service transcribed the audio but said nothing usable about WHEN
+    anything was said. `text` is what it heard."""
+
+    def __init__(self, message, text=''):
+        super().__init__(message)
+        self.text = text
+
+
+# How each speech-to-text server has been found to answer with timings, so
+# the search below is paid for once per server, not once per file.
+_WHISPER_FORMAT = {}
+WHISPER_FORMATS = ('verbose_json', 'srt', 'vtt')
+
+
+# Languages Whisper is asked for by name, (ISO 639-1 code, name). Telling it
+# the language skips its own guess from the first 30 seconds -- which is
+# what goes wrong on a programme that opens on music, or on Tagalog read as
+# Malay or Indonesian -- and its accuracy is better for it.
+WHISPER_LANGUAGES = (
+    ('en', 'English'), ('tl', 'Filipino / Tagalog'), ('id', 'Indonesian'), ('ms', 'Malay'),
+    ('th', 'Thai'), ('vi', 'Vietnamese'), ('zh', 'Chinese'), ('ja', 'Japanese'), ('ko', 'Korean'),
+    ('hi', 'Hindi'), ('ar', 'Arabic'), ('es', 'Spanish'), ('pt', 'Portuguese'), ('fr', 'French'),
+    ('de', 'German'), ('it', 'Italian'), ('ru', 'Russian'), ('tr', 'Turkish'),
+)
+WHISPER_PROMPT_MAX = 400
+
+
+def normalize_language(value):
+    """The language code to send, or None for "let Whisper decide". Anything
+    that is not a code in WHISPER_LANGUAGES is left to Whisper rather than
+    sent: a server answers an unknown code with an error for the whole file."""
+    v = str(value or '').strip().lower()
+    return v if v in dict(WHISPER_LANGUAGES) else None
+
+
+def normalize_stt_prompt(value):
+    """Names and terms to hand Whisper as context, tidied, or None."""
+    v = ' '.join(str(value or '').split())[:WHISPER_PROMPT_MAX]
+    return v or None
+
+
+def _whisper_request(audio_path, upload_name, fmt='verbose_json', language=None, prompt=None):
+    """One transcription request. For verbose_json both granularities are
+    asked for by name: asked for 'word' alone, some servers leave `segments`
+    out or send it as null, which is not the same as there being no speech.
+    `language` (a code) and `prompt` (names and terms that are spoken) are
+    sent only when given."""
+    data = {'model': WHISPER_MODEL, 'response_format': fmt}
+    if language:
+        data['language'] = language
+    if prompt:
+        data['prompt'] = prompt
+    if fmt == 'verbose_json':
+        data['timestamp_granularities[]'] = ['word', 'segment']
+    with open(audio_path, 'rb') as f:
+        return requests.post(
+            f'{WHISPER_URL}/v1/audio/transcriptions',
+            files={'file': (upload_name, f, 'audio/wav')},
+            data=data,
+            timeout=WHISPER_TIMEOUT,
+        )
+
+
+def _clock(v):
+    """Seconds, from a number or from a timestamp such as '00:01:02,500',
+    '1:02.5' or '62.5'. None if it is neither."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = re.match(r'^\s*(?:(\d+):)?(?:(\d+):)?(\d+(?:[.,]\d+)?)\s*$', str(v))
+    if not m:
+        return None
+    parts = [float(p.replace(',', '.')) for p in m.groups() if p is not None]
+    return sum(p * 60 ** k for k, p in enumerate(reversed(parts)))
+
+
+def _row_times(row):
+    """(start, end) in seconds for one line or word of a reply, however the
+    server spells it: start/end (OpenAI, faster-whisper), timestamp: [s, e]
+    (transformers), offsets: {from, to} in milliseconds or timestamps:
+    {from, to} as clock text (whisper.cpp), t0/t1 in hundredths."""
+    for a, b in (('start', 'end'), ('start_time', 'end_time'), ('from', 'to'), ('begin', 'end')):
+        if a in row and b in row:
+            x, y = _clock(row[a]), _clock(row[b])
+            if x is not None and y is not None:
+                return x, y
+    off = row.get('offsets')
+    if isinstance(off, dict) and _clock(off.get('from')) is not None and _clock(off.get('to')) is not None:
+        return _clock(off['from']) / 1000.0, _clock(off['to']) / 1000.0
+    ts = row.get('timestamp', row.get('timestamps'))
+    if isinstance(ts, (list, tuple)) and len(ts) == 2:
+        x, y = _clock(ts[0]), _clock(ts[1])
+        if x is not None:
+            return x, (y if y is not None else x)       # transformers leaves the last end open
+    if isinstance(ts, dict):
+        x, y = _clock(ts.get('from')), _clock(ts.get('to'))
+        if x is not None and y is not None:
+            return x, y
+    if 't0' in row and 't1' in row:
+        x, y = _clock(row['t0']), _clock(row['t1'])
+        if x is not None and y is not None:
+            return x / 100.0, y / 100.0
+    raise ValueError('no times')
+
+
+def _whisper_reply(data):
+    """(words, segments) from a JSON reply, whatever the server left out or
+    spelled its own way: a missing or null list is an empty one, a row
+    without usable times is skipped, lines are built from the words when
+    only words came, and the lines may be under `segments`, `chunks` or
+    `transcription` with their times in any of the forms _row_times reads.
+
+    Raises WhisperNoTimings when the reply holds the dialogue's text but no
+    timing for any of it. Reading that as "no speech" sent editors looking
+    for a fault in the file when the fault was in what the server returned."""
+    if isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
+        data = {'segments': data}
+    if not isinstance(data, dict):
+        raise ValueError(f'unexpected reply ({type(data).__name__}, not a JSON object)')
+    rows = next((data[k] for k in ('segments', 'chunks', 'transcription') if isinstance(data.get(k), list)), [])
+    words, segments, nested = [], [], []
+    for seg in rows:
+        try:
+            text = (seg.get('text') or '').strip()
+            if text:
+                start, end = _row_times(seg)
+                segments.append({'start': start, 'end': end, 'text': text})
+            nested.extend(seg.get('words') or [])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+    for w in (data.get('words') or nested):
+        try:
+            word = (w.get('word') or w.get('text') or '').strip()
+            if word:
+                start, end = _row_times(w)
+                words.append({'start': start, 'end': end, 'word': word})
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+    if words and not segments:
+        import shorts_core      # no PRISM imports of its own, so nothing circular
+        segments = shorts_core.segments_from_words(words)
+    text = str(data.get('text') or '').strip() or ' '.join(
+        str(r.get('text') or '').strip() for r in rows if isinstance(r, dict)).strip()
+    if not words and not segments and text:
+        # What it did send, so the next person to read this knows what to fix.
+        shape = 'fields ' + ', '.join(sorted(str(k) for k in data)[:10])
+        first = next((r for r in rows if isinstance(r, dict)), None)
+        if first is not None:
+            shape += '; each line has ' + ', '.join(sorted(str(k) for k in first)[:10])
+        raise WhisperNoTimings('it returned the dialogue as text with no timings for it; PRISM needs the start '
+                               f'and end of each line or word (its reply had {shape})', text)
+    return words, segments
+
+
+_CUE_TIMES = re.compile(r'^\s*((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})\s*-->\s*((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})')
+
+
+def _subtitle_segments(body):
+    """Lines with their times from an SRT or WebVTT body ([] if it is neither)."""
+    segments, times, lines = [], None, []
+
+    def flush():
+        text = ' '.join(re.sub(r'<[^>]+>', '', ln).strip() for ln in lines).strip()
+        if times and text:
+            segments.append({'start': times[0], 'end': times[1], 'text': text})
+    for ln in str(body or '').replace('\r', '').split('\n'):
+        m = _CUE_TIMES.match(ln)
+        if m:
+            flush()
+            times, lines = (_clock(m.group(1)), _clock(m.group(2))), []
+        elif not ln.strip():
+            flush()
+            times, lines = None, []
+        elif times:
+            lines.append(ln)
+    flush()
+    return segments
+
+
+def _whisper_transcribe(audio_path, upload_name, language=None, prompt=None):
+    """(words, segments) for one audio file, asking the service in whichever
+    way gets timings out of it.
+
+    The OpenAI way is response_format=verbose_json, and a good many servers
+    that are otherwise compatible answer it with the text alone. Every one
+    of them can write subtitles, though, and a subtitle file is lines with
+    times. So when verbose_json comes back without timings the same audio
+    is asked for as SRT, then as WebVTT -- line timings rather than word
+    timings, which is enough for everything PRISM does with a transcript --
+    and the format that worked is remembered for that server.
+
+    Raises what requests raises for a failed request (see _whisper_problem),
+    and WhisperNoTimings if no format gave any timing."""
+    known = _WHISPER_FORMAT.get(WHISPER_URL)
+    order = ([known] if known else []) + [f for f in WHISPER_FORMATS if f != known]
+    untimed, refused = None, None
+    for fmt in order:
+        extra = {k: v for k, v in (('language', language), ('prompt', prompt)) if v}
+        r = _whisper_request(audio_path, upload_name, fmt, **extra)
+        try:
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            # A server that does not offer this format says so with a 4xx.
+            # Anything else -- or the first format failing -- is a failure.
+            status = getattr(e.response, 'status_code', None)
+            if fmt != 'verbose_json' and status in (400, 404, 415, 422) and (untimed or len(order) > 1):
+                refused = refused or e
+                continue
+            raise
+        words, segments, heard = [], [], ''
+        body = r.text if isinstance(getattr(r, 'text', None), str) else ''
+        try:
+            if fmt == 'verbose_json' or body.lstrip()[:1] in ('{', '['):
+                words, segments = _whisper_reply(r.json())
+            else:
+                segments = _subtitle_segments(body)
+                heard = '' if segments else re.sub(r'^WEBVTT.*$', '', body, flags=re.M).strip()
+        except WhisperNoTimings as e:
+            untimed = untimed or e
+            continue
+        if words or segments:
+            if _WHISPER_FORMAT.get(WHISPER_URL) != fmt:
+                _WHISPER_FORMAT[WHISPER_URL] = fmt
+                if fmt != 'verbose_json':
+                    print(f'Whisper: this service gives no timings as verbose_json; using {fmt} for it from now on '
+                          '(line timings, no word timings).')
+            return words, segments
+        if heard:
+            untimed = untimed or WhisperNoTimings(f'asked for {fmt}, it returned text with no timings', heard)
+            continue
+        if untimed is None:
+            return [], []               # asked properly, answered properly, nothing said: no speech
+    if untimed is not None:
+        raise WhisperNoTimings(f'{untimed}. It was also asked for subtitles (SRT and WebVTT) and gave no timings '
+                               'that way either', untimed.text)
+    if refused is not None:
+        raise refused
+    return [], []
+
+
+def _whisper_problem(e):
+    """A sentence an editor can act on for why a transcription request failed."""
+    if isinstance(e, requests.exceptions.Timeout):
+        return (f'the speech-to-text service at {WHISPER_URL} did not answer within {WHISPER_TIMEOUT} seconds. '
+                'It may be overloaded or running without a GPU; WHISPER_TIMEOUT in .env raises the limit')
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return f'could not connect to the speech-to-text service at {WHISPER_URL}'
+    if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+        body = ' '.join((e.response.text or '').split())[:240]
+        return (f'the speech-to-text service at {WHISPER_URL} answered with an error '
+                f'(HTTP {e.response.status_code} for model "{WHISPER_MODEL}")' + (f': {body}' if body else ''))
+    if isinstance(e, WhisperNoTimings):
+        return (f'the speech-to-text service at {WHISPER_URL} heard the dialogue but gave no timings for it: {e}. '
+                'This is the service, not the file: it needs to support response_format=verbose_json with '
+                'timestamps, or srt, or vtt')
+    return f'the speech-to-text service at {WHISPER_URL} sent a reply that could not be read ({e})'
+
+
+# --- Which of a file's audio to transcribe -----------------------------------
+#
+# "ffmpeg -i file -ac 1" takes the audio stream with the most channels and
+# folds all of its channels into one. That is right for a stereo MP4 and wrong
+# for a broadcast master in several different ways: the first of eight mono
+# tracks may be silent or music-and-effects, dialogue may sit on tracks 3-4, a
+# dual-mono pair recorded out of phase cancels to nothing when summed, and a
+# full mix folded in with six silent channels is seven times quieter. Each of
+# those reaches the speech-to-text service as audio with no speech in it, and
+# comes back as "no dialogue" for a programme that is nothing but dialogue.
+#
+# So the file's channels are measured first, the silent ones are set aside,
+# and the rest are tried in turn -- as they are, never as a blind fold-down --
+# until one of them has speech in it.
+
+STT_SILENT_DB = -55.0       # a channel whose loudest sampled stretch is below this carries nothing
+STT_MAX_TAKES = 4           # how many different channels/pairs are tried before giving up
+STT_TARGET_DB = -23.0       # quiet takes are raised toward this before they are sent
+
+
+def _audio_streams(path):
+    """[{'channels', 'layout'}] for each audio stream, in file order ([] if
+    there are none or the file cannot be probed)."""
+    try:
+        r = run_ffprobe([FFPROBE, '-v', 'error', '-select_streams', 'a', '-show_entries',
+                         'stream=channels,channel_layout', '-of', 'json', path])
+        rows = json.loads(r.stdout or '{}').get('streams', [])
+    except (MediaToolTimeout, ValueError):
+        return []
+    out = []
+    for row in rows:
+        try:
+            n = int(row.get('channels') or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            out.append({'channels': n, 'layout': str(row.get('channel_layout') or '').lower()})
+    return out
+
+
+def _audio_samples(path, streams, duration):
+    """Ten short stretches spread through the file, every channel of every
+    audio stream side by side: float array (samples, total channels) at
+    8 kHz, or None if it could not be read. Enough to tell which channels
+    carry sound and which of them are the same sound; cheap enough to do
+    before every transcription."""
+    total = sum(st['channels'] for st in streams)
+    if not total or total > 64:
+        return None
+    if len(streams) == 1:
+        graph = ['-map', '0:a:0']
+    else:
+        graph = ['-filter_complex', ''.join(f'[0:a:{k}]' for k in range(len(streams)))
+                 + f'amerge=inputs={len(streams)}[a]', '-map', '[a]']
+    span = 15.0
+    if not duration or duration <= 10 * span:
+        windows = [(0.0, max(1.0, float(duration or 10 * span)))]
+    else:
+        windows = [((k + 0.5) * duration / 10.0 - span / 2.0, span) for k in range(10)]
+    chunks = []
+    for start, length in windows:
+        cmd = [FFMPEG, '-v', 'error', '-nostdin', '-ss', f'{max(0.0, start):.3f}', '-t', f'{length:.3f}', '-i', path,
+               '-vn'] + graph + ['-ar', '8000', '-c:a', 'pcm_s16le', '-f', 's16le', '-']
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=120)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        raw = r.stdout or b''
+        usable = len(raw) - len(raw) % (2 * total)
+        if r.returncode != 0 and not usable:
+            return None
+        if usable:
+            chunks.append(np.frombuffer(raw[:usable], dtype='<i2').reshape(-1, total).astype(np.float32) / 32768.0)
+    return np.concatenate(chunks) if chunks else None
+
+
+def stt_takes(streams, samples):
+    """What to try transcribing, best guess first: ([take], levels) where a
+    take is the list of channels to send as one (one channel, or two that
+    are a stereo pair of the same programme) and levels is the dBFS of
+    every channel. Channels are numbered straight through the file's audio
+    streams, in order.
+
+      * A channel that is silent is never part of a take.
+      * A surround stream's centre channel goes first: that is where a film
+        or drama mix puts the dialogue.
+      * Otherwise in file order -- the full mix is conventionally first --
+        pairing a channel with the next one when they carry the same
+        programme. Two channels that are the same sound upside down are not
+        a pair: summed they are silence, so one of them is sent alone.
+      * A channel that only repeats one already chosen is skipped."""
+    total = sum(st['channels'] for st in streams)
+    rms = np.sqrt(np.mean(np.square(samples.astype(np.float64)), axis=0)) if len(samples) else np.zeros(total)
+    levels = [float(20.0 * math.log10(v)) if v > 1e-9 else -120.0 for v in rms]
+    live = [c for c in range(total) if levels[c] > STT_SILENT_DB]
+
+    def alike(a, b):
+        x, y = samples[:, a].astype(np.float64), samples[:, b].astype(np.float64)
+        den = math.sqrt(float(np.dot(x, x)) * float(np.dot(y, y)))
+        return float(np.dot(x, y)) / den if den > 0 else 0.0
+
+    takes, taken = [], []
+    base = 0
+    for st in streams:
+        # Tried first, not instead: eight separate tracks are often written
+        # out labelled "7.1", and then channel 3 is just the third track.
+        if st['channels'] >= 6 and st['layout'].startswith(('5.1', '6.1', '7.1')) and base + 2 in live:
+            takes.append([base + 2])
+            taken.append(base + 2)
+        base += st['channels']
+    rest = [c for c in live if c not in taken]
+    k = 0
+    while k < len(rest):
+        a = rest[k]
+        k += 1
+        if any(abs(alike(a, t)) > 0.97 for t in taken):
+            continue                                    # the same sound as something already chosen
+        take = [a]
+        if k < len(rest):
+            r = alike(a, rest[k])
+            if r > 0.3:
+                take.append(rest[k])                    # a stereo pair of one programme
+                k += 1
+            elif r < -0.6:
+                k += 1                                  # the same thing out of phase: one side says it all
+        takes.append(take)
+        taken.extend(take)
+    return takes[:STT_MAX_TAKES], levels
+
+
+def _channel_home(streams, channel):
+    """(audio stream, channel within it), both from 0."""
+    for k, st in enumerate(streams):
+        if channel < st['channels']:
+            return k, channel
+        channel -= st['channels']
+    raise IndexError(channel)
+
+
+def describe_take(streams, take):
+    """'track 3 channels 1+2' -- how an editor would point at it. A track
+    with one channel is just 'track 3'; a file with one track just
+    'channels 1+2'."""
+    homes = [_channel_home(streams, c) for c in take]
+    many = len(streams) > 1
+    if len({h[0] for h in homes}) > 1:
+        return 'tracks ' + '+'.join(str(h[0] + 1) for h in homes)
+    stream = homes[0][0]
+    chans = '+'.join(str(h[1] + 1) for h in homes)
+    if streams[stream]['channels'] == 1:
+        return f'track {stream + 1}' if many else 'the audio track'
+    part = f"channel{'s' if len(homes) > 1 else ''} {chans}"
+    return f'track {stream + 1} {part}' if many else part
+
+
+def _take_filter(streams, take, level_db):
+    """-filter_complex for one take as mono on [m]: the chosen channel, or
+    the two averaged, raised toward STT_TARGET_DB if it is quiet."""
+    homes = [_channel_home(streams, c) for c in take]
+    if len(homes) == 1:
+        g = f'[0:a:{homes[0][0]}]pan=mono|c0=c{homes[0][1]}'
+    elif homes[0][0] == homes[1][0]:
+        g = f'[0:a:{homes[0][0]}]pan=mono|c0=0.5*c{homes[0][1]}+0.5*c{homes[1][1]}'
+    else:
+        g = (f'[0:a:{homes[0][0]}]pan=mono|c0=c{homes[0][1]}[p];[0:a:{homes[1][0]}]pan=mono|c0=c{homes[1][1]}[q];'
+             '[p][q]amerge=inputs=2,pan=mono|c0=0.5*c0+0.5*c1')
+    gain = min(30.0, STT_TARGET_DB - level_db)
+    if gain > 3.0:
+        g += f',volume={gain:.1f}dB'
+    return g + '[m]'
+
+
+def transcribe_video_detailed(path, language=None, prompt=None):
+    """Transcribe the source's dialogue via the local whisper service
+    (WHISPER_URL, an OpenAI-compatible /v1/audio/transcriptions endpoint), with
+    word-level timestamps. Returns (words, segments, outcome):
+      words:    [{'start','end','word'}, ...]
+      segments: [{'start','end','text'}, ...]
+      outcome:  {'ok': bool, 'reason': str or None} and, for a file with
+                more in it than one mono or stereo track, 'audio': where the
+                dialogue was found ('track 3 channels 1+2') and 'take': the
+                same as [[audio stream, channel], ...] counted from 0, for a
+                caller that goes on to use that file's sound -- except for a
+                surround mix, which should be folded down whole, not reduced
+                to the channel the dialogue was read from
+
+    The outcome is what tells an empty result apart. ok=False: it FAILED
+    (audio could not be extracted, the service refused, errored or timed
+    out) and `reason` says how -- nothing is known about the dialogue.
+    ok=True with nothing transcribed: it worked and there was nothing to
+    hear, `reason` saying whether that is a file with no audio track, audio
+    that is silent, or audio with no speech in it -- and, for a file with
+    more than plain stereo in it, which channels were tried at what level.
+    The two used to be indistinguishable, so a whisper server answering
+    HTTP 500 was reported to editors as "the file contains no speech".
+
+    What is sent is chosen by stt_takes() (see the note above it) and
+    extracted to 16 kHz mono WAV. This used to POST the whole source
+    container -- for a 45-minute episode that meant pushing several GB over
+    HTTP so the service could demux and discard the video track anyway.
+    Whisper resamples to 16 kHz mono internally regardless, so doing it here
+    costs one cheap ffmpeg pass and cuts the upload by ~100x.
+
+    `language` is a code from WHISPER_LANGUAGES, for a programme whose
+    language is known (None: Whisper decides); `prompt` is names and terms
+    to spell the way they are meant."""
+    language, prompt = normalize_language(language), normalize_stt_prompt(prompt)
+    audio_path = None
+    try:
+        audio_path = os.path.join(app.config['UPLOAD_FOLDER'], f'stt_{uuid.uuid4().hex}.wav')
+        streams = _audio_streams(path)
+        plain = ['-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le']
+        # (ffmpeg arguments, description or None for "the audio, as ffmpeg takes it")
+        attempts, layout, homes = [(plain, None)], '', {}
+        if streams:
+            samples = _audio_samples(path, streams, probe_media_info(path).get('duration'))
+            if samples is not None and len(samples):
+                takes, levels = stt_takes(streams, samples)
+                n_ch = sum(st['channels'] for st in streams)
+                layout = (f'{len(streams)} audio tracks' if len(streams) > 1 else f'one audio track of {n_ch} channels')
+                if not takes:
+                    print(f'Whisper: every audio channel of the source is silent ({layout}); nothing to transcribe.')
+                    return [], [], {'ok': True, 'reason': 'every audio channel in the file is silent '
+                                                          f'(below {int(STT_SILENT_DB)} dB; {layout})'}
+                attempts, homes = [], {}
+                for take in takes:
+                    level = max(levels[c] for c in take)
+                    what = f'{describe_take(streams, take)} at {level:.0f} dB'
+                    attempts.append((['-vn', '-filter_complex', _take_filter(streams, take, level), '-map', '[m]',
+                                      '-ar', '16000', '-c:a', 'pcm_s16le'], what))
+                    homes[what] = [list(_channel_home(streams, c)) for c in take]
+        upload_name = os.path.splitext(os.path.basename(path))[0] + '.wav'
+        tried = []
+        for n, (args, what) in enumerate(attempts):
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+            try:
+                r = run_ffmpeg([FFMPEG, '-y', '-i', path] + args + [audio_path],
+                               timeout=FFMPEG_LONG_TIMEOUT, label='STT audio extract')
+            except MediaToolTimeout as e:
+                print(f'Whisper: audio extraction timed out ({e}); skipping transcription.')
+                return [], [], {'ok': False, 'reason': f'extracting the audio took too long and was stopped ({e})'}
+            if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 0):
+                if what is not None and args is not plain:
+                    # The chosen channels could not be cut out (an ffmpeg that
+                    # cannot address this layout): the plain fold-down is
+                    # still better than nothing, once.
+                    print(f'Whisper: could not extract {what}; falling back to the default audio.')
+                    if not any(a is plain for a, _ in attempts):
+                        attempts.append((plain, None))
+                    continue
+                print('Whisper: could not extract an audio track from the source; skipping transcription.')
+                if not probe_media_info(path).get('has_audio'):
+                    return [], [], {'ok': True, 'reason': 'the file has no audio track'}
+                import shorts_core
+                why = shorts_core.ffmpeg_error(getattr(r, 'stderr', '') or '', 300)
+                return [], [], {'ok': False,
+                                'reason': 'ffmpeg could not read the audio track' + (f' ({why})' if why else '')}
+            try:
+                words, segments = _whisper_transcribe(audio_path, upload_name, language, prompt)
+            except Exception as e:
+                print(f'Whisper transcription error (service at {WHISPER_URL}): {e}')
+                return [], [], {'ok': False, 'reason': _whisper_problem(e)}
+            if words or segments:
+                outcome = {'ok': True, 'reason': None}
+                if what is not None and (n > 0 or len(streams) > 1 or streams[0]['channels'] > 2):
+                    outcome['audio'] = what.split(' at ')[0]
+                    surround = any(st['layout'].startswith(('5.1', '6.1', '7.1')) for st in streams)
+                    if not surround and what in homes:
+                        outcome['take'] = homes[what]
+                    print(f'Whisper: dialogue transcribed from {what} ({layout}).')
+                return words, segments, outcome
+            tried.append(what)
+            if what is not None:
+                print(f'Whisper: no speech found in {what}' + ('; trying the next.' if n + 1 < len(attempts) else '.'))
+        reason = 'the speech-to-text service found no speech in the audio'
+        named = [t for t in tried if t]
+        if named and (len(named) > 1 or len(streams) > 1 or streams[0]['channels'] > 2):
+            reason += '; tried ' + ', '.join(named) + (f'; the file has {layout}' if layout else '')
+        return [], [], {'ok': True, 'reason': reason}
+    except Exception as e:
+        print(f'Whisper transcription error (service at {WHISPER_URL}): {e}')
+        return [], [], {'ok': False, 'reason': f'unexpected error ({e})'}
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+
+
+def transcribe_video(path):
+    """(words, segments) only -- ([], []) when nothing was transcribed for
+    whatever reason. For callers to which a missing transcript just means
+    carrying on without one (the promo pipeline's dialogue-aware cuts). A
+    caller that has to tell someone WHY uses transcribe_video_detailed()."""
+    words, segments, _ = transcribe_video_detailed(path)
+    return words, segments
+
+
+def transcribe_audio_file(path, trim_start=0.0, trim_end=None):
+    """Transcribe a standalone audio file (e.g. uploaded promo VO) via Whisper.
+
+    Optional trim_* match the VO upload trim controls so selection uses the same
+    span that will be mixed into the promo. Returns (words, segments) in the same
+    shape as transcribe_video().
+    """
+    if not path or not os.path.exists(path):
+        return [], []
+    audio_path = None
+    try:
+        # Normalize to wav; apply trim when requested so text matches the mix.
+        audio_path = os.path.join(app.config['UPLOAD_FOLDER'], f'vo_stt_{int(time.time()*1000)}.wav')
+        cmd = [FFMPEG, '-y', '-i', path]
+        if trim_start and trim_start > 0:
+            cmd += ['-ss', f'{float(trim_start):.3f}']
+        if trim_end is not None and float(trim_end) > float(trim_start or 0):
+            cmd += ['-to', f'{float(trim_end):.3f}']
+        cmd += ['-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', audio_path]
+        try:
+            run_ffmpeg(cmd, timeout=FFMPEG_TIMEOUT, label='VO STT extract')
+        except Exception as e:
+            print(f'Whisper VO: extract failed ({e}); skipping uploaded-VO transcription.')
+            return [], []
+        if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 0):
+            return [], []
+        upload_name = os.path.splitext(os.path.basename(path))[0] + '.wav'
+        try:
+            words, segments = _whisper_transcribe(audio_path, upload_name)
+        except WhisperNoTimings as e:
+            # A service that can give the words but not when: the text alone
+            # still tells VO selection what the read says.
+            words, segments = [], ([{'start': 0.0, 'end': 0.0, 'text': e.text}] if e.text else [])
+        return words, segments
+    except Exception as e:
+        print(f'Whisper VO transcription error (service at {WHISPER_URL}): {e}')
+        return [], []
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+
+
+_VO_STT_CACHE = {}
+
+
+def _transcribe_vo_cached(path, trim_start, trim_end):
+    """transcribe_audio_file, remembered for this file: the narration is read once for the card fit
+    and again for its plan, and the speech service is the slow part."""
+    try:
+        key = (path, os.stat(path).st_mtime_ns, float(trim_start or 0.0), trim_end)
+    except OSError:
+        return transcribe_audio_file(path, trim_start=trim_start, trim_end=trim_end)
+    if key not in _VO_STT_CACHE:
+        if len(_VO_STT_CACHE) > 8:
+            _VO_STT_CACHE.clear()
+        _VO_STT_CACHE[key] = transcribe_audio_file(path, trim_start=trim_start, trim_end=trim_end)
+    words, segments = _VO_STT_CACHE[key]
+    return list(words), list(segments)
+
+
+def _same_recording(a, b):
+    """True when two uploaded audio files are the same recording (same bytes)."""
+    import hashlib
+    if not a or not b or not os.path.exists(a) or not os.path.exists(b):
+        return False
+    if a == b:
+        return True
+    if os.path.getsize(a) != os.path.getsize(b):
+        return False
+    def _h(p):
+        h = hashlib.sha1()
+        with open(p, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    return _h(a) == _h(b)
+
+
+def _drop_duplicate_card_vo(params):
+    """One recording loaded for the narration AND a card: the narration plan already cuts each line out of it and
+    places it (the tune-in line at the title card), so muxing the card's own copy would play it a second time.
+    -> (title_card_vo_path, end_card_vo_path, notes) with the duplicates removed."""
+    notes = []
+    narr = params.get('vo_upload_path')
+    t, e = params.get('title_card_vo_path'), params.get('end_card_vo_path')
+    smart = params.get('vo_mode') == 'upload' and params.get('vo_smart', True) and narr
+    vo = (params.get('script_brief') or {}).get('vo') or []
+    if smart and t and _same_recording(narr, t) and any(v['anchor']['kind'] == 'card' for v in vo):
+        notes.append('The title card voice-over is the same recording as the narration, so its line is placed from the '
+                     'narration at the card instead of being added a second time.')
+        t = None
+    if smart and e and _same_recording(narr, e) and params.get('end_card_vo_start', 0.0) <= 0 and params.get('end_card_vo_end') is None:
+        notes.append('The end card voice-over is the whole narration recording with no In/Out, so it was left out; '
+                     'set its In/Out to the line it should say.')
+        e = None
+    return t, e, notes
+
+
+def _card_voice_need(params, brief):
+    """How long the tune-in voice-over line is, in the recording: the cards have to last that long. None when the
+    script has no such line, there is no uploaded narration, or its words cannot be found."""
+    vo = (brief or {}).get('vo') or []
+    idx = [i for i, v in enumerate(vo) if v['anchor']['kind'] == 'card']
+    path = params.get('vo_upload_path')
+    if not idx or params.get('vo_mode') != 'upload' or not path or not os.path.exists(path) or not params.get('vo_smart', True):
+        return None
+    words, segments = _transcribe_vo_cached(path, params.get('vo_trim_start') or 0.0, params.get('vo_trim_end'))
+    if not words:
+        words = cutcraft.words_from_segments(segments)
+    if not words:
+        return None
+    aligned = cutcraft.align_script([{'text': v['text'], 'at': None, 'optional': False} for v in vo], words)
+    lens = [cutcraft.spoken_length(words, a['w0'], a['w1']) for k, a in enumerate(aligned) if k in idx and a['w0'] is not None]
+    if not lens:
+        return None
+    return sum(lens) + cutcraft.LINE_GAP * (len(lens) - 1)
+
+
+def _build_vo_plan(vo_path, vo_text, trim_start, trim_end, vo_start, window_end):
+    """Plan the uploaded narration: where each line goes and where it is cut.
+
+    Reads the recording with Whisper (word times), reads the script text for
+    timed lines ("00:03 VO: ..."), finds every line in the recording, and
+    returns cutcraft.plan_vo()'s plan plus bookkeeping:
+      edited    True when the render should build the narration from the plan
+                (timed script lines, or the recording would overrun the plug);
+                False means the recording plays as before, plan is advisory
+      scripted  the text had lines to match
+      coarse    the speech service gave line times only, so cuts are phrase-level
+    Returns None when there is nothing to plan (no speech service, no speech)."""
+    if not vo_path or not os.path.exists(vo_path):
+        return None
+    words, segments = _transcribe_vo_cached(vo_path, trim_start, trim_end)
+    if not words and not segments:
+        return None
+    coarse = not words
+    if coarse:
+        words = cutcraft.words_from_segments(segments)
+        if not words:
+            return None
+    try:
+        sil = _detect_silence_intervals(vo_path, noise_db=-38, min_dur=0.08, timeout=120)
+        sil = [(a - (trim_start or 0.0), b - (trim_start or 0.0)) for a, b in sil]
+        refined = cutcraft.refine_words([(w['start'], w['end']) for w in words], sil)
+        words = [dict(w, start=s, end=e) for w, (s, e) in zip(words, refined)]
+    except Exception as e:
+        print(f'VO pause scan skipped: {e}')
+    lines = cutcraft.parse_vo_script(vo_text)
+    timed = any(l['at'] is not None for l in lines)
+    scripted = bool(lines)
+    if not lines:
+        lines = [{'at': None, 'text': (sg.get('text') or '').strip(), 'optional': False}
+                 for sg in segments if (sg.get('text') or '').strip()]
+    plan = cutcraft.plan_vo(lines, words, start_at=float(vo_start or 0.0), window_end=window_end)
+    total = probe_duration(vo_path) or 0.0
+    span = (float(trim_end) if trim_end is not None else total) - float(trim_start or 0.0)
+    legacy_end = float(vo_start or 0.0) + max(0.0, span)
+    overruns = window_end is not None and legacy_end > window_end + 0.02
+    plan.update(edited=bool(plan['pieces']) and (timed or overruns), scripted=scripted, timed=timed,
+                coarse=coarse, legacy_end=round(legacy_end, 2), window_end=window_end,
+                overruns=overruns, trim_start=float(trim_start or 0.0), trim_end=trim_end)
+    if not plan['edited']:
+        plan['notes'] = [n for n in plan['notes'] if 'not found' in n]
+    return plan
+
+
+def _script_vo_text(brief, selected, card_durations, xfade_dur, jcut=0.0, card_jcut=0.0):
+    """The narration lines the script asks for, placed on this plug's timeline, as text _build_vo_plan reads.
+    -> (text, notes), or (None, []) when the script has no voice-over lines. A line sits where its clip starts
+    in the plug (found by the clip's source timecode) or where the cards begin; two lines on one clip follow
+    each other."""
+    vo = (brief or {}).get('vo') or []
+    if not vo or not selected:
+        return None, []
+    clip_starts, card_starts = scriptbrief.timeline_starts(
+        [s['selected_dur'] for s in selected], card_durations or [], xfade_dur)
+    lines, notes = scriptbrief.place_lines(vo, selected, clip_starts, card_starts, xfade_dur, jcut=jcut, card_jcut=card_jcut)
+    return scriptbrief.vo_script_text(lines), notes
+
+
+def _brief_summary(brief, plan=None):
+    """What the review screen shows of the script's voice-over reading."""
+    if not brief:
+        return None
+    placed = {}
+    for l in (plan or {}).get('lines') or []:
+        placed[l.get('text')] = l
+    vo = []
+    for v in brief.get('vo') or []:
+        row = placed.get(v['text']) or {}
+        vo.append({'text': v['text'], 'anchor': v['anchor'].get('label') or v['anchor']['kind'], 'kind': v['anchor']['kind'],
+                   'how': v.get('how'), 'at': row.get('at'), 'end': row.get('end'), 'status': row.get('status')})
+    tc = brief.get('tcard') or {}
+    return {'vo': vo, 'tone': brief.get('tone'), 'title': tc.get('title'), 'card_lines': tc.get('lines') or [],
+            'music': brief.get('music'), 'read_by': brief.get('read_by'), 'notes': (brief.get('notes') or [])[:4],
+            'sot': len(brief.get('sot') or [])}
+
+
+def _parse_ranges(raw, limit=12):
+    """[[in, out], ...] from the form's JSON: only well-formed pairs with 0 <= in < out."""
+    try:
+        data = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    out = []
+    for pair in data if isinstance(data, list) else []:
+        try:
+            a, b = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if a >= 0 and b > a:
+            out.append((a, b))
+    return out[:limit]
+
+
+def _concat_audio_ranges(src, ranges, out_path):
+    """Several parts of one recording, one after the other -> out_path (wav), or None. Each part has a 20 ms
+    fade at its edges so the joins do not click."""
+    if not ranges:
+        return None
+    graph, labels = [], []
+    for i, (a, b) in enumerate(ranges):
+        d = max(0.05, b - a)
+        graph.append(f'[0:a]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,'
+                     f'afade=t=in:st=0:d=0.02,afade=t=out:st={max(0.0, d - 0.02):.3f}:d=0.02[s{i}]')
+        labels.append(f'[s{i}]')
+    graph.append(''.join(labels) + f'concat=n={len(ranges)}:v=0:a=1[out]')
+    try:
+        r = subprocess.run([FFMPEG, '-y', '-loglevel', 'error', '-i', src, '-filter_complex', ';'.join(graph),
+                            '-map', '[out]', '-ar', '48000', '-c:a', 'pcm_s16le', out_path],
+                           capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        print(f'Joining recording parts failed: {e}')
+        return None
+    return out_path if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0 else None
+
+
+def _apply_extra_ranges(path, start, end, raw_extra, upload_dir=None, tag='vo'):
+    """The recording's in/out plus the extra ranges the person added, joined into one file.
+    -> (path, start, end): the joined file with no trim, or the inputs unchanged when there are no extra ranges."""
+    extra = _parse_ranges(raw_extra)
+    if not path or not extra:
+        return path, start, end
+    first_end = end
+    if first_end is None:
+        first_end = probe_duration(path)
+    ranges = ([(float(start or 0.0), float(first_end))] if first_end and first_end > float(start or 0.0) else []) + extra
+    out = os.path.join(upload_dir or app.config['UPLOAD_FOLDER'], f'parts_{tag}_{int(time.time() * 1000)}.wav')
+    joined = _concat_audio_ranges(path, ranges, out)
+    return (joined, 0.0, None) if joined else (path, start, end)
+
+
+def _suggest_card_vo_ranges(params, brief):
+    """Where the script's words are in the title card's and the end card's own narration files:
+    {'title': {'in', 'out', 'text'}, 'end': {...}}. Read only: the person's own in/out stay as they are
+    until they press the button that applies these."""
+    out = {}
+    vo = (brief or {}).get('vo') or []
+    tcard = (brief or {}).get('tcard') or {}
+    targets = {
+        'title': [v['text'] for v in vo if v['anchor']['kind'] == 'card'] or ([tcard.get('title')] if tcard.get('title') else []),
+        'end': list(tcard.get('highlighted') or []),
+    }
+    for key, path_key in (('title', 'title_card_vo_path'), ('end', 'end_card_vo_path')):
+        path = params.get(path_key)
+        texts = [t for t in targets[key] if t]
+        if not path or not os.path.exists(path) or not texts:
+            continue
+        try:
+            words, segments = _transcribe_vo_cached(path, 0.0, None)
+            words = words or cutcraft.words_from_segments(segments)
+            if not words:
+                continue
+            al = cutcraft.align_script([{'text': t} for t in texts], words)
+            hit = [(words[a['w0']]['start'], words[a['w1']]['end'], texts[i]) for i, a in enumerate(al) if a['w0'] is not None]
+            if hit:
+                out[key] = {'in': round(max(0.0, min(h[0] for h in hit) - 0.25), 2),
+                            'out': round(max(h[1] for h in hit) + 0.35, 2), 'text': ' / '.join(h[2] for h in hit)}
+        except Exception as e:
+            print(f'Card narration not read for {key}: {e}')
+    return out
+
+
+def _plan_view(params, plan, card_fit_info, estimated, xfade_dur):
+    """What the script's plan did to the narration, the cards and the music, for the strips under their selectors."""
+    view = {'jcut': params.get('vo_jcut') or 0.0}
+    if plan and plan.get('lines'):
+        src = {}
+        for pc in plan.get('pieces') or []:
+            lo, hi = src.get(pc['line'], (pc['a'], pc['b']))
+            src[pc['line']] = (min(lo, pc['a']), max(hi, pc['b']))
+        view['narration'] = [{'text': l.get('text'), 'at': l.get('at'), 'end': l.get('end'), 'status': l.get('status'),
+                              'heard': l.get('heard'), 'strays': l.get('strays'),
+                              'src_in': src[k][0] if k in src else None, 'src_out': src[k][1] if k in src else None}
+                             for k, l in enumerate(plan['lines'][:30])]
+    cards = []
+    for c in (card_fit_info or {}).get('cards') or []:
+        det = c.get('details') or {}
+        cards.append({'label': c.get('label'), 'secs': c.get('secs'), 'was': c.get('was'), 'title': det.get('title'),
+                      'title_at': det.get('title_at'), 'title_by': det.get('title_by'), 'why': det.get('why')})
+    view['cards'] = cards
+    if params.get('card_vo_suggest'):
+        view['card_vo'] = params['card_vo_suggest']
+    t0 = float(params.get('scoring_audio_trim_start') or 0.0)
+    t1 = params.get('scoring_audio_trim_end')
+    view['music'] = {'in': t0, 'out': float(t1) if t1 else round(t0 + float(estimated or 0.0), 1),
+                     'beat_synced': bool(params.get('sync_beats')), 'plug': estimated,
+                     'named_by_script': (params.get('script_brief') or {}).get('music')}
+    return view
+
+
+def _vo_plan_summary(plan):
+    """What the review screen shows of a narration plan."""
+    if not plan:
+        return None
+    return {'edited': plan['edited'], 'scripted': plan['scripted'], 'timed': plan['timed'],
+            'coarse': plan['coarse'], 'fits': plan['fits'], 'end': plan['end'],
+            'overruns': plan['overruns'], 'legacy_end': plan['legacy_end'],
+            'window_end': plan['window_end'], 'notes': plan['notes'][:8],
+            'lines': [dict(l) for l in plan['lines'][:30]]}
+
+
+def _render_vo_from_plan(plan, vo_path, out_path):
+    """Cut and place the narration as planned -> out_path, or None."""
+    graph, label = cutcraft.vo_filter(plan['pieces'])
+    if not graph:
+        return None
+    cmd = [FFMPEG, '-y']
+    if plan.get('trim_start'):
+        cmd += ['-ss', str(plan['trim_start'])]
+    if plan.get('trim_end') is not None:
+        cmd += ['-to', str(plan['trim_end'])]
+    cmd += ['-i', vo_path, '-filter_complex', graph, '-map', label,
+            '-ar', '44100', '-c:a', 'pcm_s16le', out_path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_LONG_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print('VO edit timed out')
+        return None
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    print(f'VO edit error: {r.stderr[-500:]}')
+    return None
+
+
+def _vo_beats_from_segments(segments):
+    """Build VO beats from Whisper segments (uploaded VO), with real durations."""
+    import re
+    beats = []
+    for seg in segments or []:
+        text = (seg.get('text') or '').strip()
+        if not text:
+            continue
+        words = re.findall(r"[A-Za-z0-9']+", text.lower())
+        if not words:
+            continue
+        dur = max(0.0, float(seg.get('end') or 0) - float(seg.get('start') or 0))
+        beats.append({
+            'text': text,
+            'words': words,
+            'word_count': len(words),
+            'duration': dur if dur > 0.05 else None,
+            'start': float(seg.get('start') or 0),
+            'end': float(seg.get('end') or 0),
+        })
+    return beats
+
+
+def nearest_word_boundary(target, boundaries, max_snap=0.45, hard_limit=None):
+    """Nearest timestamp in `boundaries` to `target`, but only if within
+    `max_snap` seconds — otherwise returns `target` unchanged (no nearby word
+    to snap to, e.g. a silent B-roll clip, so leave the cut point as-is),
+    UNLESS `hard_limit` is given.
+
+    `hard_limit` is the furthest this cut point is allowed to move (e.g. the
+    scene's own start/end) -- if nothing is within max_snap, the search
+    widens all the way out to hard_limit before giving up, rather than
+    silently accepting a cut that lands mid-word. A clip running a bit
+    longer or shorter than originally planned is a smaller problem than
+    audibly cutting someone off before they finish a word -- this is what
+    lets a scene's own available footage be used to find a clean cut
+    instead of settling for whatever the untouched target happened to land
+    on. Still always returns the CLOSEST boundary within whatever range
+    ends up being searched, so a nearby word always wins over a distant one
+    even when the wider search is what finds it."""
+    if not boundaries:
+        return target
+    candidates = [b for b in boundaries if abs(b - target) <= max_snap]
+    if not candidates and hard_limit is not None:
+        lo, hi = (target, hard_limit) if hard_limit >= target else (hard_limit, target)
+        candidates = [b for b in boundaries if lo <= b <= hi]
+    if not candidates:
+        return target
+    return min(candidates, key=lambda b: abs(b - target))
+
+def nearest_speech_out(target, phrase_ends, word_ends,
+                       phrase_snap=1.6, word_snap=0.45, hard_limit=None,
+                       breath_after=0.08):
+    """Best out-point near `target`, preferring the end of a complete phrase
+    over the end of a mere word.
+
+    Landing on a word boundary is enough to avoid severing a syllable, but
+    a cut at "...and then she |" is still audibly clipped -- the sentence
+    just stops. A phrase end ("...and then she left. |") sounds finished.
+    So phrase ends get a much wider snap window (1.6s vs 0.45s): it's worth
+    moving the cut a noticeably longer way to land somewhere that sounds
+    deliberate, where a word boundary is only worth a small nudge since it
+    buys much less.
+
+    When a phrase end is chosen we also push the cut a short `breath_after`
+    (default 80 ms) past the last phoneme so the cut does not land flush on
+    the final consonant. This is the most common cause of "mid-word" sounding
+    cuts even when the mathematical boundary was correct.
+
+    Falls back to word boundaries, then to `target` unchanged when there's
+    no speech nearby at all (silent B-roll -- nothing to protect, so leave
+    the visual cut point alone). `hard_limit`, when given, is tried for
+    both phrase ends and the word-boundary fallback -- see
+    nearest_word_boundary for why widening the search this far is worth it
+    rather than accepting a cut mid-word or mid-sentence."""
+    if phrase_ends:
+        near = [b for b in phrase_ends if abs(b - target) <= phrase_snap]
+        if not near and hard_limit is not None:
+            lo, hi = (target, hard_limit) if hard_limit >= target else (hard_limit, target)
+            near = [b for b in phrase_ends if lo <= b <= hi]
+        if near:
+            best = min(near, key=lambda b: abs(b - target))
+            # Prefer landing just after the phrase so the final syllable is fully heard.
+            candidate = best + max(0.0, breath_after)
+            if hard_limit is not None:
+                candidate = min(candidate, hard_limit)
+            return candidate
+    return nearest_word_boundary(target, word_ends, max_snap=word_snap, hard_limit=hard_limit)
+
+def speech_free_slack(clip_start, clip_end, speech_spans, guard=0.18):
+    """How much of [clip_start, clip_end) can be trimmed off the END without
+    touching speech, given `speech_spans` [(start, end), ...].
+
+    Used by the exact-duration corrector so it takes its rounding error out
+    of silence rather than off the end of a spoken line. `guard` keeps a
+    small breath of silence after the last word instead of trimming flush
+    to it, which sounds abrupt even though technically no speech was cut.
+
+    Returns 0.0 when speech runs to (or past) the clip's end -- meaning this
+    clip has nothing safe to give and the corrector should leave it alone."""
+    if not speech_spans:
+        return max(0.0, clip_end - clip_start)
+    last_speech_end = 0.0
+    for s_start, s_end in speech_spans:
+        if s_start < clip_end and s_end > clip_start:
+            last_speech_end = max(last_speech_end, s_end)
+    if last_speech_end <= 0.0:
+        return max(0.0, clip_end - clip_start)   # no speech in this clip at all
+    safe_end = min(clip_end, max(clip_start, last_speech_end + guard))
+    return max(0.0, clip_end - safe_end)
+
+# ---- Script-driven scene priority ----
+# A production script/rundown usually already says which moments matter and
+# when they happen. These parse that out of an uploaded PDF or image and turn
+# it into a per-scene priority boost, so selection can follow the script's
+# intent instead of relying purely on the automatic scoring.
+
+# Matches the timecode formats a rundown realistically uses, in the order we
+# want to try them: HH:MM:SS(:FF or .mmm), then MM:SS. Broadcast scripts are
+# usually HH:MM:SS:FF (SMPTE, frames last); a plain MM:SS is common in
+# informal ones. Deliberately NOT matching a bare number of seconds -- far too
+# easy to false-positive on a scene number, page number or duration column.
+_TC_PATTERNS = [
+    re.compile(r'\b(\d{1,2}):(\d{2}):(\d{2})[:.](\d{1,3})\b'),  # HH:MM:SS:FF / HH:MM:SS.mmm
+    re.compile(r'\b(\d{1,2}):(\d{2}):(\d{2})\b'),               # HH:MM:SS
+    # Some scripts write every timecode field with periods instead of colons
+    # (e.g. "00.00.02.01" for HH.MM.SS.FF, or "2.11" / "0.06" for M.SS) --
+    # otherwise identical to the colon formats above, just a different house
+    # style some editors/writers use. Checked before the bare MM:SS/M.SS
+    # patterns for the same longest-first reason those are ordered that way.
+    re.compile(r'\b(\d{1,2})\.(\d{2})\.(\d{2})\.(\d{1,3})\b'),  # HH.MM.SS.FF (period-separated)
+    re.compile(r'\b(\d{1,2}):(\d{2})\b'),                       # MM:SS
+    re.compile(r'\b(\d{1,2})\.(\d{2})\b'),                      # M.SS / MM.SS (period-separated)
+]
+
+# A real video timecode never carries an AM/PM suffix -- that's exclusively
+# how a wall-clock broadcast time slot is written ("GMA 8:50 PM", "SECOND
+# TELECAST GTV 10:30 PM"). A rundown's own promo/schedule text sitting in the
+# same column as real M1/M2 cues (not a separate column-mixing problem --
+# this text is genuinely positioned alongside real cues in the source
+# document) can otherwise read exactly like a plausible MM:SS timecode to
+# _TC_PATTERNS, and get accepted as a spurious scene-selection cue. Checked
+# against whatever immediately follows a candidate match (past optional
+# whitespace/punctuation); a real timecode is never followed by this, so
+# rejecting on it never costs a genuine cue.
+_CLOCK_TIME_SUFFIX_RE = re.compile(r'^[\s.,:-]*[AaPp]\.?[Mm]\.?\b')
+
+# Optional material / segment labels on a cue line. Scripts are NOT standardised:
+# some writers use "M1", others "mats1", "mat 2", "material 1", "master 2",
+# "reel 1", etc. When present AND the user combined multiple source files
+# (segment_offsets provided), the matching segment's start offset is added so
+# per-file relative timecodes still land on the combined timeline.
+# When no label is present, the timecode is used as-is (the common case).
+_SEGMENT_PREFIX_RE = re.compile(
+    r'\b(?:mats?|materials?|masters?|reels?|parts?|segs?|segments?|m)'
+    r'[\s._-]*(\d{1,2})\b',
+    re.IGNORECASE,
+)
+
+def _seconds_to_tc(secs, fps=25.0):
+    """Format seconds as HH:MM:SS:FF for display in selection transparency."""
+    try:
+        secs = max(0.0, float(secs))
+    except (TypeError, ValueError):
+        return '00:00:00:00'
+    h = int(secs // 3600)
+    m = int((secs % 3600) // 60)
+    s = int(secs % 60)
+    f = int(round((secs - int(secs)) * max(fps, 1))) % max(int(fps), 1)
+    return f'{h:02d}:{m:02d}:{s:02d}:{f:02d}'
+
+def _match_to_seconds(m, pat_idx, fps=25.0):
+    """Convert a regex match from _TC_PATTERNS[pat_idx] into seconds."""
+    g = m.groups()
+    if pat_idx == 0:
+        h, mnt, s, frac = int(g[0]), int(g[1]), int(g[2]), g[3]
+        # HH:MM:SS.mmm → milliseconds; HH:MM:SS:FF → frames at fps
+        raw = m.group(0)
+        sep = raw[8] if len(raw) > 8 else ':'
+        sub = int(frac) / 1000.0 if sep == '.' else int(frac) / max(fps, 1)
+        return h * 3600 + mnt * 60 + s + sub
+    if pat_idx == 1:
+        return int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2])
+    if pat_idx == 2:
+        # HH.MM.SS.FF-shaped (period-separated), but real scripts using this
+        # style write it as a constant "00.00." prefix followed by the actual
+        # MM.SS cue (e.g. "00.00.03.53" means 3:53, not "0h 0m 3s 53f") --
+        # confirmed by comparing cue ranges across scripts that write the
+        # same cues as plain MM.SS elsewhere (0:06-3:38, 1:03-4:37, …): the
+        # 4-field version's 3rd/4th groups line up with that same MM:SS
+        # range only when the 2nd group is discarded, not treated as minutes
+        # of its own. The leading group is kept as hours in case a future
+        # script's raw source ever runs past an hour.
+        h, mnt, s = int(g[0]), int(g[2]), int(g[3])
+        return h * 3600 + mnt * 60 + s
+    if pat_idx == 3:
+        return int(g[0]) * 60 + int(g[1])
+    return int(g[0]) * 60 + int(g[1])  # pat_idx == 4: M.SS / MM.SS (period-separated)
+
+# Shorthand range notation a rundown commonly uses instead of writing the
+# out-point as a full second timecode: "3:33—37" or "00:35--42" means "in at
+# 3:33, out at 3:37" / "in at 0:35, out at 0:42" -- the trailing 1-2 digits
+# are just the out-point's OWN seconds, inheriting the in-point's hours and
+# minutes rather than restating them. Matched only immediately after the in
+# timecode (optional whitespace, one or two hyphen/dash characters, optional
+# whitespace, then the digits, word-bounded so it doesn't swallow the start
+# of an unrelated multi-digit number or word right after it).
+_SHORTHAND_OUT_RE = re.compile(r'^\s*[-\u2010-\u2015]{1,2}\s*(\d{1,2})\b')
+
+def _parse_timecode_line(line, fps=25.0):
+    """Parse timecode(s) on a script line for scene selection.
+
+    Returns (in_seconds, description, meta) or None.
+    meta may include out_seconds when the line has an in/out pair.
+
+    A **single** timecode is enough: it marks the moment to prefer when
+    selecting a scene. An in/out pair (two timecodes on one line) still
+    selects from the **in** point; the out is kept only for display. Lines
+    with no recognisable timecode return None and are ignored.
+
+    Also recognises the "3:33—37" shorthand (see _SHORTHAND_OUT_RE) as an
+    in/out pair even though only one full timecode appears on the line --
+    without this, that trailing "—37" was just left sitting in the
+    description text, unparsed, and the line was treated as a single
+    in-point with no out-point at all."""
+    for idx, pat in enumerate(_TC_PATTERNS):
+        matches = [m for m in pat.finditer(line) if not _CLOCK_TIME_SUFFIX_RE.match(line[m.end():])]
+        if not matches:
+            continue
+        in_secs = _match_to_seconds(matches[0], idx, fps=fps)
+        out_secs = None
+        shorthand_match = None
+        if len(matches) >= 2:
+            out_secs = _match_to_seconds(matches[1], idx, fps=fps)
+            if out_secs <= in_secs:
+                out_secs = None  # not a sensible range; treat as single
+        else:
+            shorthand_match = _SHORTHAND_OUT_RE.match(line[matches[0].end():])
+            if shorthand_match:
+                shorthand_secs = int(shorthand_match.group(1))
+                # Floor the in-point to its own minute boundary, then apply
+                # the shorthand digits as the out-point's seconds -- see
+                # _SHORTHAND_OUT_RE's own comment for why this, not the
+                # shorthand digits alone, is the out-point.
+                out_secs = (int(in_secs) // 60) * 60 + shorthand_secs
+                if out_secs <= in_secs:
+                    out_secs = None  # e.g. "3:33--10" would be earlier, not later
+        # Strip every matched TC span (and the shorthand span, if any) from
+        # the description text.
+        desc = line
+        if shorthand_match:
+            shorthand_end = matches[0].end() + shorthand_match.end()
+            desc = (desc[:matches[0].end()] + ' ' + desc[shorthand_end:])
+        for m in reversed(matches):
+            desc = (desc[:m.start()] + ' ' + desc[m.end():])
+        desc = re.sub(r'\s+', ' ', desc).strip(' \t-–—:|./')
+        meta = {'out': out_secs, 'tc_count': len(matches)}
+        return in_secs, desc, meta
+    return None
+
+def parse_script_cues(text, fps=25.0, segment_offsets=None, available_materials=None):
+    """Every scene-selection cue found in a script, sorted by time.
+
+    Each cue is a single point on the timeline (the in-point). A line needs
+    only one timecode — that alone is enough to boost the matching scene.
+    In/out pairs are accepted too: the in-point is used for selection; out
+    is optional metadata. Lines without any recognisable timecode are
+    ignored (rundowns are mostly prose and headers).
+
+    Material labels (mats1, M2, material 1, …) mean "time on that source
+    file", not a point on a combined timeline. Times are kept as written
+    (no offset). available_materials is the set of material numbers that
+    were actually uploaded (e.g. {1, 2}); cues naming a missing material
+    are skipped. segment_offsets is retained only for legacy combine jobs
+    and is ignored when available_materials is provided.
+    """
+    cues = []
+    segment_offsets = segment_offsets or {}
+    # Prefer multi-material mode when the job lists discrete sources.
+    multi = available_materials is not None
+    available_materials = set(available_materials or [])
+    for raw_line in (text or '').splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parsed = _parse_timecode_line(line, fps=fps)
+        if not parsed:
+            continue
+        secs, desc, meta = parsed
+        material = None
+        seg_match = _SEGMENT_PREFIX_RE.search(line)
+        if seg_match:
+            seg_num = int(seg_match.group(1))
+            material = seg_num
+            if multi:
+                # Time stays local to that material; only keep if we have it.
+                if seg_num not in available_materials:
+                    continue
+            else:
+                # Legacy combine path: optional offset onto one joined file.
+                if seg_num == 1:
+                    pass
+                elif seg_num in segment_offsets:
+                    off = segment_offsets[seg_num]
+                    secs += off
+                    if meta.get('out') is not None:
+                        meta['out'] = meta['out'] + off
+                else:
+                    continue
+        elif multi and available_materials and 1 not in available_materials:
+            # Unlabeled cue with only M2+ loaded is ambiguous — skip.
+            continue
+        cue = {'time': secs, 'desc': desc}
+        if material is not None:
+            cue['material'] = material
+        if meta.get('out') is not None:
+            cue['out'] = meta['out']
+        cues.append(cue)
+    cues.sort(key=lambda c: (c.get('material') or 1, c['time']))
+    return cues
+
+def _script_file_from_request():
+    """Local upload or Browse-library staged script. Returns (file-like, error).
+
+    file-like has .filename and .read() like Werkzeug's FileStorage so
+    extract_script_text can treat both paths the same.
+    """
+    script_file = request.files.get('script_file')
+    if script_file and script_file.filename:
+        return script_file, None
+    staged = (request.form.get('script_file_network') or '').strip()
+    if not staged:
+        return None, 'No script file was uploaded.'
+    # Only allow names we staged ourselves (net_<ts>_… from fetch_network_file).
+    safe = secure_filename(staged)
+    if not safe or safe != staged or not staged.startswith('net_'):
+        return None, 'Invalid staged script filename.'
+    path = os.path.join(app.config['UPLOAD_FOLDER'], safe)
+    if not os.path.isfile(path):
+        return None, 'That library script is no longer available. Pick it again.'
+    class _StagedScript:
+        def __init__(self, p, name):
+            self.filename = name
+            self._path = p
+        def read(self):
+            with open(self._path, 'rb') as f:
+                return f.read()
+    display = staged.split('_', 2)[-1] if staged.count('_') >= 2 else staged
+    return _StagedScript(path, display), None
+
+class _MemScript:
+    """A script file whose bytes were already read, so it can be read again."""
+    def __init__(self, name, raw):
+        self.filename, self._raw = name, raw
+
+    def read(self):
+        return self._raw
+
+
+SCRIPT_BRIEF_USE_LLM = os.environ.get('SCRIPT_BRIEF_USE_LLM', '1') != '0'
+_BRIEF_CACHE = {}
+
+
+def _ask_script_model(prompt):
+    """The language model's reply to a script-reading prompt. Raises when it is not reachable."""
+    import shorts_core
+    prod = load_production_defaults()
+    model = prod.get('vision_model') or 'qwen3-vl:8b'
+    if _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] != 'up':
+        raise RuntimeError('Ollama is not reachable')
+    reply, _ = shorts_core.ollama_generate(OLLAMA_URL, {
+        'model': model, 'prompt': prompt, 'stream': False, 'format': 'json',
+        'options': {'temperature': 0.1, 'num_predict': 900}}, timeout=150)
+    if prod.get('unload_vision_after_scoring', True):
+        unload_ollama_model(model)
+    return reply
+
+
+def read_script_brief(raw, name, text, cues):
+    """What the script says about voice-over, tone, music and the tune-in card (see scriptbrief.py), or
+    None. Read from the layout first; the language model reads what the layout cannot. Never raises:
+    a script that cannot be read this way still drives the cut as before."""
+    key = hashlib.sha1(raw or b'').hexdigest() + str(len(cues or []))
+    hit = _BRIEF_CACHE.get(key)
+    if hit and time.time() - hit[0] < 900:
+        return hit[1]
+    try:
+        brief = scriptbrief.read_script_brief(raw, name, text, cues, ask_llm=_ask_script_model if SCRIPT_BRIEF_USE_LLM else None)
+    except Exception as e:
+        print(f'Script brief not read: {e}')
+        brief = None
+    if len(_BRIEF_CACHE) > 50:
+        _BRIEF_CACHE.clear()
+    _BRIEF_CACHE[key] = (time.time(), brief)
+    return brief
+
+
+def _group_words_into_rows(words, y_tolerance=3):
+    """Groups words into visual rows by vertical (top) position. Used both
+    to detect a column split (a real gutter must recur at roughly the same
+    x-position across SEVERAL rows, not just show up as a coincidental gap
+    somewhere in one row's own word spacing) and, once a split is found, to
+    rebuild each kept row's words back into a left-to-right line."""
+    if not words:
+        return []
+    rows = []
+    for w in sorted(words, key=lambda w: (w['top'], w['x0'])):
+        placed = False
+        for row in rows:
+            if abs(row[0]['top'] - w['top']) <= y_tolerance:
+                row.append(w)
+                placed = True
+                break
+        if not placed:
+            rows.append([w])
+    for row in rows:
+        row.sort(key=lambda w: w['x0'])
+    return rows
+
+def _detect_two_column_split(rows, page_width):
+    """Looks for a column gutter that recurs at roughly the same
+    x-position across SEVERAL rows -- a real two-column layout (narrow
+    video-timecode column on the left, wider audio/SOT column on the
+    right) has its gutter fall in the same place row after row. Returns
+    the gutter's x-coordinate (averaged across the rows that agree on it)
+    or None if nothing consistent is found.
+
+    Deliberately per-row, not pooled across the whole page: an earlier
+    version looked for one gap across every word's x0 on the page at
+    once, which produced a false positive on an ordinary single-column
+    page where one line was short and the next was long -- their own
+    words' start positions happened to leave a gap in the pooled,
+    page-wide list purely by coincidence, with no real column behind it
+    at all. Requiring several rows to independently agree on nearly the
+    same gutter position is what a genuine, repeated column boundary
+    actually looks like, and a one-off coincidence in a single row's own
+    spacing can't produce that agreement.
+
+    The centered-band check (12%-48% of page width) matters too: a narrow
+    left column for timecodes sits well left of page-center, so
+    restricting candidates to that band avoids treating a stray, large
+    inter-word space anywhere else in a row as a column break."""
+    candidate_mids = []
+    for row in rows:
+        if len(row) < 2:
+            continue
+        xs = sorted(w['x0'] for w in row)
+        best_gap, best_mid = 0.0, None
+        for i in range(1, len(xs)):
+            gap = xs[i] - xs[i - 1]
+            mid = (xs[i] + xs[i - 1]) / 2
+            if 0.12 * page_width < mid < 0.48 * page_width and gap > best_gap and gap > 0.08 * page_width:
+                best_gap, best_mid = gap, mid
+        if best_mid is not None:
+            candidate_mids.append(best_mid)
+    if len(candidate_mids) < 2:
+        return None
+    # Cluster candidates within a tolerance band and require the largest
+    # cluster to cover a real majority of the rows that could have shown a
+    # gutter at all -- not just "at least two happened to roughly agree".
+    candidate_mids.sort()
+    tolerance = 0.05 * page_width
+    best_cluster = []
+    for m in candidate_mids:
+        cluster = [x for x in candidate_mids if abs(x - m) <= tolerance]
+        if len(cluster) > len(best_cluster):
+            best_cluster = cluster
+    if len(best_cluster) >= max(2, (len(candidate_mids) + 1) // 2):
+        return sum(best_cluster) / len(best_cluster)
+    return None
+
+def _split_row_at_column_gap(row, global_split_x, page_width):
+    """Given one row's words and the page's globally-detected column split
+    position, decides which of THIS row's own words are left-column.
+
+    Deliberately not "cut every row at global_split_x" (blind, uniform) or
+    "look for any locally-large gap near the expected position" (too loose
+    -- both were tried and both produced real, demonstrated bugs): checks
+    specifically whether a gap actually STRADDLES the global split -- one
+    word's own right edge (x1) ends before it and another word's own left
+    edge (x0) starts after it, with real empty space between those two
+    specific words. That's what an actual column gap in this row looks
+    like. A locally-large gap elsewhere in the row (ordinary word spacing
+    around a shorter word, unrelated to the column boundary) doesn't
+    straddle the expected split position and is correctly left alone; a
+    left-column line simply longer than most others, with no right-column
+    content on that specific row at all, has nothing straddling the split
+    to find and is kept whole rather than truncated."""
+    before = [w for w in row if w['x0'] < global_split_x]
+    at_or_after = [w for w in row if w['x0'] >= global_split_x]
+    if not before:
+        # Nothing on this row starts left of the split at all -- this row
+        # is purely right-column (audio/SOT) content and must be excluded
+        # entirely, not kept: an earlier version of this check conflated
+        # this with the opposite case below and returned the whole
+        # right-column-only row unchanged, defeating the point of this
+        # function for any row with no left-column words on it at all.
+        return []
+    if not at_or_after:
+        # Nothing on this row starts at/after the split -- purely
+        # left-column content (which may simply be a longer line than
+        # most others around it). Nothing to split here; keep it whole.
+        return row
+    last_before_x1 = max(w.get('x1', w['x0']) for w in before)
+    first_after_x0 = min(w['x0'] for w in at_or_after)
+    if first_after_x0 - last_before_x1 > 0.04 * page_width:
+        return before
+    # An "after" word this close to the split's left-side content is more
+    # likely still part of the same left-column line than genuine
+    # right-column text -- keep the row whole rather than guessing a cut.
+    return row
+
+def _extract_pdf_video_column_only(raw):
+    """When a PDF looks like a two-column rundown (narrow video-timecode
+    column on the left, wider audio/SOT script text on the right), returns
+    (text, True) built from ONLY the left column's words on every page that
+    shows that layout -- so a position-blind flatten of the whole page
+    never lets a time-of-day mention buried in the audio/SOT column (e.g.
+    "airs at 8:50PM on GMA Prime") get misread as a scene-selection video
+    timecode purely because it happened to land early in the extracted
+    text stream.
+
+    The right column is audio/SOT/dialogue text, full stop -- confirmed
+    directly by the person providing this feature's own real source
+    documents: a material tag (M1/M2) appearing THERE marks which audio
+    take that dialogue line was recorded against, not a video
+    scene-selection point. It is correctly excluded even when it carries
+    its own material label and its own parseable timecode, exactly like
+    any other right-column text -- there is no "but this one looks like a
+    real cue" exception, because from this column it never is one.
+
+    Returns (None, False) -- a clean "doesn't apply here", not an error --
+    when pdfplumber isn't installed, the PDF can't be opened, or NO page in
+    the whole document shows a confident two-column layout at all: an
+    ordinary single-column script must be read exactly as it always was,
+    via the existing pypdf path in extract_script_text, completely
+    unaffected by this function's existence. A page within an otherwise
+    two-column document that doesn't itself show a split (e.g. a cover
+    page) keeps all of its own words rather than being blanked out."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return None, False
+    try:
+        any_split_found = False
+        page_rows = []
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(keep_blank_chars=False)
+                rows = _group_words_into_rows(words)
+                if not rows:
+                    page_rows.append([])
+                    continue
+                split_x = _detect_two_column_split(rows, page.width)
+                if split_x is None:
+                    page_rows.append(rows)
+                else:
+                    any_split_found = True
+                    page_rows.append([_split_row_at_column_gap(row, split_x, page.width) for row in rows])
+        if not any_split_found:
+            return None, False
+        lines = []
+        for rows in page_rows:
+            for row in rows:
+                if row:
+                    lines.append(' '.join(w['text'] for w in row))
+        text = '\n'.join(lines)
+        return (text, True) if text.strip() else (None, False)
+    except Exception:
+        return None, False
+
+def manual_cues_to_script_text(manual_cues_json):
+    """Converts Timecode Priority's "Manual Entry" rows -- each a
+    {material, start, end} triplet typed directly into the UI, no script
+    file at all -- into synthetic script-line text, one line per row, so
+    they can be run through the exact same parse_script_cues() a real
+    uploaded script goes through. Reuses all of that function's own
+    existing, already-tested parsing and material-availability logic
+    rather than duplicating any of it in a second, parallel code path.
+
+    Returns (text, error). error is a short, specific message naming the
+    first row that failed and why (a real form-validation UX belongs in
+    the frontend before submission; this is the last-resort backend check
+    for a request that got here some other way, e.g. a stale/tampered
+    form)."""
+    try:
+        rows = json.loads(manual_cues_json or '[]')
+    except (ValueError, TypeError):
+        return None, 'Manual timecode entries were not in a readable format.'
+    if not isinstance(rows, list) or not rows:
+        return None, 'No manual timecode entries were provided.'
+    lines = []
+    for i, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            return None, f'Manual entry #{i} is not valid.'
+        try:
+            material = int(row.get('material'))
+        except (TypeError, ValueError):
+            return None, f'Manual entry #{i} needs a material selected.'
+        if material < 1:
+            return None, f'Manual entry #{i} has an invalid material number.'
+        start = str(row.get('start') or '').strip()
+        if not start:
+            return None, f'Manual entry #{i} needs a start timecode.'
+        end = str(row.get('end') or '').strip()
+        line = f'M{material} {start} {end}'.strip()
+        if not _parse_timecode_line(line):
+            return None, (f'Manual entry #{i}\'s start timecode ("{start}") was not '
+                          'recognisable. Use a format like 00:01:30:12, 00:01:30, or 1:30.')
+        lines.append(line)
+    return '\n'.join(lines), None
+
+def extract_script_text(file_storage):
+    """Plain text from an uploaded script. Returns (text, error).
+
+    PDFs are read via pypdf's text layer first; if that comes back empty the
+    PDF is image-only (a scan or an exported still), so it falls through to
+    OCR the same way an uploaded image would. Images always go to OCR.
+    Both optional dependencies degrade to a clear message rather than a
+    crash, since a deployment that never uploads scripts doesn't need
+    either installed."""
+    name = secure_filename(file_storage.filename or '')
+    ext = os.path.splitext(name)[1].lower()
+    raw = file_storage.read()
+    if not raw:
+        return None, 'That file is empty.'
+
+    def _ocr(image_bytes):
+        try:
+            import pytesseract
+            from PIL import Image
+        except ImportError:
+            return None, ('Reading a scanned/image script needs the "pytesseract" and "Pillow" '
+                          'packages plus the tesseract binary on the server. A text-based PDF '
+                          'works without them.')
+        try:
+            return pytesseract.image_to_string(Image.open(io.BytesIO(image_bytes))), None
+        except Exception as e:
+            return None, f'Could not read text from that image: {e}'
+
+    if ext == '.pdf':
+        # Tried first, and only actually used when a real two-column layout
+        # is confidently detected somewhere in the document -- a genuine
+        # single-column script (the common case) never triggers this at
+        # all and falls straight through to the existing pypdf extraction
+        # below, completely unchanged from before this existed.
+        column_text, used_columns = _extract_pdf_video_column_only(raw)
+        if used_columns and column_text:
+            return column_text, None
+        try:
+            import pypdf
+        except ImportError:
+            return None, ('Reading a PDF script needs the "pypdf" package on the server '
+                          '(pip install pypdf), which is not installed here.')
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(raw))
+            if reader.is_encrypted:
+                return None, 'That PDF is password-protected.'
+            text = '\n'.join((p.extract_text() or '') for p in reader.pages)
+        except Exception as e:
+            return None, f'Could not read that PDF: {e}'
+        if text.strip():
+            return text, None
+        # No text layer -- render each page to an image and OCR it. Needs
+        # pdf2image/poppler on top of the OCR deps, so this is a best-effort
+        # extra step with its own clear message rather than a hard
+        # requirement.
+        try:
+            from pdf2image import convert_from_bytes
+        except ImportError:
+            return None, ('That PDF has no text layer (it looks like a scan). Reading it needs '
+                          'the "pdf2image" package and poppler on the server, or you can upload '
+                          'the pages as images instead.')
+        try:
+            pages = convert_from_bytes(raw)
+        except Exception as e:
+            return None, f'Could not rasterise that scanned PDF: {e}'
+        chunks = []
+        for pg in pages:
+            buf = io.BytesIO()
+            pg.save(buf, format='PNG')
+            t, err = _ocr(buf.getvalue())
+            if err:
+                return None, err
+            chunks.append(t or '')
+        return '\n'.join(chunks), None
+
+    if ext in {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}:
+        return _ocr(raw)
+
+    if ext in {'.txt', '.md', '.csv', '.rtf', ''}:
+        try:
+            return raw.decode('utf-8'), None
+        except UnicodeDecodeError:
+            return raw.decode('utf-8', errors='replace'), None
+
+    return None, (f'Unsupported script file type "{ext}". Use a PDF, an image (PNG/JPG), '
+                  'or a plain text file.')
+
+def apply_script_priority(scenes_data, cues, window=2.5, boost=8.0):
+    """Boosts scenes that line up with a script cue's timecode.
+
+    When a cue carries `material` (M1/M2/…), only scenes from that same
+    material are considered — times are local to each source, not a
+    combined timeline. Unlabeled cues match any scene (single-source jobs).
+
+    `boost` is deliberately large relative to the scoring components it
+    competes with (quality 1-3, vision 1-5, speech 1-2, so ~10 combined at
+    the absolute maximum): if a script explicitly calls for a moment, that
+    intent should generally win over the automatic scoring rather than merely
+    nudge it. 8.0 at full strength is enough for a cue-matched scene with a
+    poor automatic score to outrank an unmatched scene with a good one, which
+    is the whole point of supplying a script -- an earlier 4.0 left the
+    scripted moment still losing to a high-scoring unscripted one in testing.
+    Falls off linearly with distance from the cue so a scene that merely
+    brushes the window doesn't get the same weight as one centred on it, and
+    each cue only boosts the single best-matching scene -- otherwise one cue
+    near a cluster of short scenes would promote all of them.
+
+    Returns how many cues actually matched a scene, so the caller can tell
+    the user when a script parsed fine but its timecodes didn't line up with
+    the video at all (usually means the script is for a different cut)."""
+    matched = 0
+    for c in cues:
+        best, best_dist = None, None
+        cue_mat = c.get('material')
+        for s in scenes_data:
+            if cue_mat is not None and s.get('material') is not None and s.get('material') != cue_mat:
+                continue
+            centre = s['start'] + s['duration'] / 2.0
+            if s['start'] - window <= c['time'] <= s['start'] + s['duration'] + window:
+                dist = abs(centre - c['time'])
+                if best_dist is None or dist < best_dist:
+                    best, best_dist = s, dist
+        if best is None:
+            continue
+        span = max(best['duration'] / 2.0 + window, 0.001)
+        falloff = max(0.0, 1.0 - (best_dist / span))
+        best['script_boost'] = max(best.get('script_boost', 0.0), boost * falloff)
+        best['script_desc'] = c['desc']
+        matched += 1
+    for s in scenes_data:
+        if s.get('script_boost'):
+            s['total_score'] += s['script_boost']
+    return matched
+
+def build_cue_clips(cues, materials_paths, min_seg_dur=0.8, default_cue_dur=4.0):
+    """Builds 'selected'-shaped scene dicts directly from script/manual
+    timecode cues, bypassing PySceneDetect's own detected scene boundaries
+    entirely -- a cue's own in/out span becomes the clip, in full, even
+    when it spans several of PySceneDetect's own shot changes combined
+    into one continuous cut, exactly as a rundown line like "M1 3:33—37"
+    means: use that whole 4-second span, not whichever single automatically-
+    detected scene happens to overlap its start.
+
+    User-requested and confirmed: when timecode cues exist at all, the
+    final promo uses ONLY those cues -- no unrelated, automatically-scored
+    scenes added -- but each cue's own in/out CAN be adjusted (stretched or
+    shrunk) afterward to fill the target duration, rather than staying
+    fixed at exactly what was typed. This function only builds the initial
+    clips; _rebalance_selected_durations (already used for exactly this
+    kind of proportional stretch/shrink elsewhere) does the actual
+    adjusting, using each clip's own 'duration' field here as its stretch
+    ceiling.
+
+    That ceiling is the real remaining footage in that material from the
+    cue's own start -- up to the NEXT cue in the same material, if there is
+    one (so stretching one cue's out-point can never eat into footage
+    another cue in the same material already claims), or the material's own
+    actual file length otherwise (via probe_duration, so a cue can never be
+    stretched past the end of its own source file). A cue's initial
+    selected_dur is its own out-minus-in span when an out was given, or
+    default_cue_dur when only a single in-point was written -- clamped to
+    that same ceiling either way.
+
+    Cues naming a material outside materials_paths' own range, or with no
+    material at all, are skipped -- parse_script_cues already guarantees
+    every cue it returns has a real, loaded material when available_materials
+    was supplied, so this is a defensive floor, not the primary filter."""
+    by_material = {}
+    for c in cues:
+        mat = c.get('material')
+        if mat is None or mat < 1 or mat > len(materials_paths):
+            continue
+        by_material.setdefault(mat, []).append(c)
+    for mat_cues in by_material.values():
+        mat_cues.sort(key=lambda c: c['time'])
+
+    clips = []
+    for mat, mat_cues in by_material.items():
+        src_path = materials_paths[mat - 1]
+        file_dur = probe_duration(src_path)
+        for i, c in enumerate(mat_cues):
+            start = float(c['time'])
+            out = c.get('out')
+            init_dur = max(min_seg_dur, (out - start) if out else default_cue_dur)
+            next_start = mat_cues[i + 1]['time'] if i + 1 < len(mat_cues) else None
+            candidates = [v for v in (next_start, file_dur) if v is not None and v > start]
+            ceiling = min(candidates) if candidates else start + init_dur
+            avail = max(min_seg_dur, ceiling - start)
+            clips.append({
+                'start': start,
+                'end': start + avail,
+                'duration': avail,
+                'selected_dur': min(init_dur, avail),
+                'trim_start': start,
+                'material': mat,
+                'source_path': src_path,
+                'total_score': 10.0,
+                'script_boost': 10.0,
+                'script_desc': c.get('desc') or f'M{mat}',
+                'has_face': False,
+            })
+    clips.sort(key=lambda s: (s.get('material') or 0, s['start']))
+    return clips
+
+def librosa_load(path, sr=22050, mono=True, duration=None, offset=0.0):
+    """librosa.load, but never via the deprecated audioread fallback.
+
+    soundfile cannot open compressed/container formats (.mov, .m4a, .mp4), so
+    librosa silently falls back to audioread -- which emits a deprecation warning,
+    is removed in librosa 1.0, and is markedly slower. Decoding to a temporary
+    PCM WAV with ffmpeg first keeps everything on the soundfile path.
+
+    offset: seconds into the source to start reading from (e.g. a one-shot
+    SFX's own user-set IN point). Applied via ffmpeg's own -ss for a
+    converted file (fast, accurate input-side seeking, not the slower
+    decode-then-discard output-side seeking -ss after -i would do), or
+    passed straight through to librosa's own load() for an already-native
+    format that skips the ffmpeg conversion step entirely."""
+    import librosa as _lb
+    ext = os.path.splitext(path)[1].lower()
+    tmp = None
+    try:
+        if ext not in ('.wav', '.flac', '.ogg', '.aiff', '.aif'):
+            tmp = os.path.join(app.config['UPLOAD_FOLDER'], f'lb_{uuid.uuid4().hex}.wav')
+            cmd = [FFMPEG, '-y']
+            if offset:
+                cmd += ['-ss', str(offset)]
+            cmd += ['-i', path, '-vn', '-ac', '1' if mono else '2',
+                    '-ar', str(int(sr)), '-c:a', 'pcm_s16le']
+            if duration:
+                cmd += ['-t', str(duration)]
+            cmd.append(tmp)
+            try:
+                run_ffmpeg(cmd, timeout=180, label='librosa decode')
+            except MediaToolTimeout:
+                tmp = None
+            if tmp and not (os.path.exists(tmp) and os.path.getsize(tmp) > 0):
+                tmp = None
+            # The ffmpeg pass above already seeked to `offset` (or the temp
+            # decode failed and this reads the original file from its own
+            # start instead) -- pass offset again to librosa's own load()
+            # only in the fallback case, never double-applying it against
+            # the temp file, which is already positioned at 0 = offset.
+            return _lb.load(tmp or path, sr=sr, mono=mono, duration=duration,
+                             offset=0.0 if tmp else offset)
+        return _lb.load(path, sr=sr, mono=mono, duration=duration, offset=offset)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+def tc_seconds(tc):
+    """Seconds from a PySceneDetect FrameTimecode.
+
+    .get_seconds() is deprecated in favour of the .seconds property, but the
+    property does not exist on older releases -- so prefer it and fall back."""
+    v = getattr(tc, 'seconds', None)
+    return v if v is not None else tc_seconds(tc)
+
+def tc_frames(tc):
+    """Frame number from a PySceneDetect FrameTimecode (see tc_seconds)."""
+    v = getattr(tc, 'frame_num', None)
+    return v if v is not None else tc_frames(tc)
+
+def detect_scenes(path, threshold=30.0, min_scene_len_sec=0.5, downscale=2,
+                   detector='content', adaptive_threshold=3.0, min_content_val=15.0):
+    """Run PySceneDetect over `path` and return the raw scene list
+    [(start_timecode, end_timecode), ...].
+
+    threshold, min_scene_len_sec, downscale, detector, and adaptive_threshold
+    are all parameters (not hardcoded) so every caller -- the live preview
+    endpoint, the vision-analyze endpoint, and the actual trailer-generation
+    job -- can agree on the same detection settings. That agreement used to
+    be incomplete: downscale defaulted to None here but the real job always
+    passed downscale=2, so "the same threshold" in the preview didn't
+    guarantee the same cuts, since downscaling changes the frame-to-frame
+    content-difference PySceneDetect measures, not just the coordinate scale.
+    downscale now defaults to 2 everywhere so preview, vision-analyze, and
+    the real job detect identically unless a caller deliberately overrides it.
+
+    min_scene_len_sec filters out sub-fragment "scenes" (whip-pans, motion
+    blur, flash cuts) that PySceneDetect's frame-count default would otherwise
+    let through; it's converted to frames using the source's actual frame rate.
+
+    detector picks the underlying algorithm:
+      - 'content' (default): PySceneDetect's ContentDetector, a per-frame
+        hue/saturation/luma difference against a fixed threshold. Good for
+        clean hard cuts; prone to false positives on fast pans, handheld
+        motion, or zooms, since rapid camera movement produces a large
+        frame-to-frame difference that looks like a cut.
+      - 'adaptive': AdaptiveDetector, which compares each frame's content
+        score against a rolling local average (window_width frames either
+        side) rather than a fixed threshold, so a sustained change from
+        panning/motion doesn't trip it the way a genuine cut does.
+        adaptive_threshold is a ratio (current score vs. local average, not
+        the 0-100 scale 'threshold' uses) -- PySceneDetect's own default of
+        3.0 is a reasonable starting point. min_content_val is a floor below
+        which a frame is never flagged as a cut regardless of the ratio,
+        which keeps near-static footage (e.g. a held shot) from tripping on
+        noise alone.
+      Neither detector reliably catches cross-dissolves between two live
+      scenes (a gradual blend has no single frame with a large difference to
+      key on) -- that's a fundamentally different detection problem neither
+      PySceneDetect algorithm targets. AdaptiveDetector's lower effective
+      noise floor tends to catch *more* of a dissolve's ramp than
+      ContentDetector does, but it is not a dedicated fix.
+    """
+    video = open_video(path)
+    fps = video.frame_rate or 30.0
+    min_scene_len = max(1, int(round(min_scene_len_sec * fps)))
+    sm = SceneManager()
+    if downscale:
+        # video.set_downscale_factor() doesn't exist on the installed
+        # PySceneDetect/backend combo -- it silently no-opped through the
+        # try/except that used to wrap this, so `downscale` was never
+        # actually being applied. Downscale lives on SceneManager in this
+        # version, and SceneManager also defaults to auto-picking its own
+        # factor (auto_downscale=True) which overrides an explicit one
+        # unless it's turned off first -- so both parts are needed, not
+        # just swapping which object the call is made on.
+        sm.auto_downscale = False
+        sm.downscale = downscale
+    if detector == 'adaptive':
+        sm.add_detector(AdaptiveDetector(adaptive_threshold=adaptive_threshold,
+                                          min_scene_len=min_scene_len,
+                                          min_content_val=min_content_val))
+    else:
+        sm.add_detector(ContentDetector(threshold=threshold, min_scene_len=min_scene_len))
+    sm.detect_scenes(video)
+    return sm.get_scene_list()
+
+def _scene_detector_params(form):
+    """Parses+clamps the shared scene-detection form fields (threshold,
+    min_scene_len, detector, adaptive_threshold) the same way everywhere
+    they're accepted -- preview, vision-analyze, and the real job -- so the
+    three can't quietly drift out of sync the way preview/job downscale
+    once did. Returns a kwargs dict ready to splat into detect_scenes()."""
+    try:
+        threshold = max(1.0, min(100.0, float(form.get('scene_threshold', form.get('threshold', 30.0)))))
+    except (TypeError, ValueError):
+        threshold = 30.0
+    try:
+        min_scene_len_sec = max(0.1, min(5.0, float(form.get('min_scene_len', 0.5))))
+    except (TypeError, ValueError):
+        min_scene_len_sec = 0.5
+    detector = form.get('detector', 'content')
+    if detector not in ('content', 'adaptive'):
+        detector = 'content'
+    try:
+        adaptive_threshold = max(1.0, min(10.0, float(form.get('adaptive_threshold', 3.0))))
+    except (TypeError, ValueError):
+        adaptive_threshold = 3.0
+    return dict(threshold=threshold, min_scene_len_sec=min_scene_len_sec,
+                detector=detector, adaptive_threshold=adaptive_threshold)
+
+def get_video_info(path):
+    cap = cv2.VideoCapture(path)
+    info = {
+        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        'fps': round(cap.get(cv2.CAP_PROP_FPS), 2),
+        'total_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+    }
+    info['duration_sec'] = round(info['total_frames'] / info['fps'], 2) if info['fps'] > 0 else 0
+    cap.release()
+    return info
+
+# ---- API ----
+
+@app.route('/api/opencv/info', methods=['POST'])
+def api_info():
+    path, err = load_video(request)
+    if not path:
+        return jsonify(error=err), 400
+    return jsonify(video_info=get_video_info(path))
+
+@app.route('/api/opencv/analyze', methods=['POST'])
+def api_analyze():
+    path, err = load_video(request)
+    if not path:
+        return jsonify(error=err), 400
+    n = min(int(request.form.get('num_frames', 10)), 100)
+    cap = cv2.VideoCapture(path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(total // n, 1)
+    frames = []
+    for i in range(0, total, step):
+        if len(frames) >= n:
+            break
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, f = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        corners = cv2.goodFeaturesToTrack(gray, maxCorners=20, qualityLevel=0.01, minDistance=10)
+        frames.append({'idx': i, 'shape': list(f.shape),
+                       'mean_bgr': [round(float(c), 1) for c in cv2.mean(f)[:3]],
+                       'brightness': round(float(np.mean(gray)), 1),
+                       'edge_pixels': int(np.sum(edges > 0)),
+                       'corners': len(corners) if corners is not None else 0})
+    cap.release()
+    return jsonify(frames=frames)
+
+@app.route('/api/scenedetect/detect', methods=['POST'])
+@require_permission('scene_detection')
+def api_sd():
+    path, err = load_video(request)
+    if not path:
+        return jsonify(error=err), 400
+    # Shared parser + the same downscale=2 the real job uses (detect_scenes'
+    # default) -- this is what makes "Preview scene cuts" an honest preview
+    # of what generation will actually do, rather than a full-res detection
+    # that can disagree with the (downscaled) real run at the margins.
+    scene_list = detect_scenes(path, **_scene_detector_params(request.form))
+    scenes = [{'scene': i+1, 'start': s.get_timecode(), 'end': e.get_timecode(),
+               'start_sec': round(tc_seconds(s), 2), 'end_sec': round(tc_seconds(e), 2),
+               'duration': round(tc_seconds(e) - tc_seconds(s), 2)}
+              for i, (s, e) in enumerate(scene_list)]
+    return jsonify(scenes=scenes)
+
+def _ensure_readable(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.mov', '.mkv', '.flv', '.wmv', '.webm'):
+        cap = cv2.VideoCapture(path)
+        ret, _ = cap.read()
+        cap.release()
+        if not ret:
+            # In UPLOAD_FOLDER, whatever the source is: one read in place sits on the share, which gets nothing written to it.
+            mp4_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.splitext(os.path.basename(path))[0] + '_converted.mp4')
+            r = run_ffmpeg([FFMPEG, '-y', '-i', path, '-c:v', 'libx264', '-preset', 'ultrafast',
+                                '-crf', '28', '-pix_fmt', 'yuv420p', '-an', mp4_path],
+                           timeout=FFMPEG_LONG_TIMEOUT, label='preview transcode')
+            if r.returncode == 0 and os.path.exists(mp4_path):
+                return mp4_path
+    return path
+
+@app.route('/api/media/playable', methods=['POST'])
+def api_media_playable():
+    """Re-encodes a staged file to H.264/AAC MP4 for the browser Player.
+
+    Distinct from _ensure_readable(): that one strips audio and only checks
+    whether *OpenCV* can decode a frame, which is the wrong question here --
+    OpenCV (via its ffmpeg backend) opens ProRes/DNxHD/MXF just fine, but no
+    browser decodes them natively, so a HIRES mat in one of those often loads
+    with duration/controls but a black frame, or an outright media error. Rather
+    than guess server-side which containers a given browser supports, the Player
+    calls this reactively -- only once its <video> element actually reports an
+    error -- and gets back a guaranteed-playable copy with audio intact."""
+    name = secure_filename(request.form.get('filename', ''))
+    if not name or name != request.form.get('filename', ''):
+        return jsonify(ok=False, error='Invalid filename.'), 400
+    src = staged_path(name)
+    if not os.path.isfile(src):
+        return jsonify(ok=False, error='That file is no longer staged -- pick it again.'), 404
+
+    out_name = f'playable_{os.path.splitext(name)[0]}.mp4'
+    out_path = os.path.join(app.config['UPLOAD_FOLDER'], out_name)
+    if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+        try:
+            r = run_ffmpeg([FFMPEG, '-y', '-i', src,
+                            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+                            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
+                            '-movflags', '+faststart', out_path],
+                           timeout=FFMPEG_LONG_TIMEOUT, label='player playback transcode')
+        except MediaToolTimeout as e:
+            return jsonify(ok=False, error=f'Conversion took too long: {e}'), 504
+        if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+            return jsonify(ok=False, error='This file could not be converted for browser playback. '
+                                           f'ffmpeg error: {r.stderr[-400:]}'), 502
+    return jsonify(ok=True, url=f'/uploads/{out_name}')
+
+@app.route('/api/scene/clip', methods=['POST'])
+def api_scene_clip():
+    """Extracts a short clip from a staged source video for the preview
+    modal's play button, instead of pointing the browser at the full episode
+    and seeking client-side (the previous approach). Two real problems that
+    fixes, not just one: (1) a multi-GB HIRES source is either a slow
+    download over a bad link or, if the codec isn't browser-native
+    (ProRes/DNxHD/MXF), needs a FULL transcode -- see api_media_playable
+    above -- before a single frame can show, just to watch a 3-second scene;
+    (2) -ss placed BEFORE -i (not after) seeks to the nearest keyframe
+    without decoding anything before it, so extraction is sub-second
+    regardless of source length or codec, and the output (a small 640px-wide
+    H.264/AAC proxy) plays instantly in any browser once it's ready.
+
+    Trade-off worth knowing: -ss-before-i seeking is keyframe-accurate, not
+    frame-accurate -- the extracted clip can start up to one GOP early/late
+    (commonly under a second for typical broadcast encodes). Irrelevant for
+    what this is actually for (sanity-checking which scene this is before
+    committing to it), and a vastly better trade than the alternative this
+    replaces. A final render still uses the precise, slower path.
+
+    Cached by (filename, start, end) so replaying the same handful of clips
+    while deciding between alternates -- a real, common part of the preview
+    workflow -- doesn't re-extract every time."""
+    name = secure_filename(request.form.get('filename', ''))
+    if not name or name != request.form.get('filename', ''):
+        return jsonify(ok=False, error='Invalid filename.'), 400
+    src = staged_path(name)
+    if not os.path.isfile(src):
+        return jsonify(ok=False, error='That file is no longer staged -- pick it again.'), 404
+    try:
+        start = max(0.0, float(request.form.get('start', 0)))
+        end = float(request.form.get('end', start + 3))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error='Invalid start/end time.'), 400
+    if end <= start:
+        return jsonify(ok=False, error='End time must be after start time.'), 400
+    dur = min(30.0, max(0.1, end - start))  # 30s cap -- this is a preview clip, not a full render
+
+    # Not keyed on the source file's mtime the way api_media_playable's
+    # whole-file cache is: a preview's staged upload is never rewritten in
+    # place once it exists, so there's nothing to invalidate against here.
+    key = f'{name}_{start:.2f}_{dur:.2f}'
+    out_name = 'clip_' + hashlib.sha1(key.encode()).hexdigest()[:16] + '.mp4'
+    out_path = os.path.join(app.config['UPLOAD_FOLDER'], out_name)
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return jsonify(ok=True, url=f'/uploads/{out_name}')
+
+    try:
+        r = run_ffmpeg([FFMPEG, '-y', '-ss', f'{start:.3f}', '-i', src,
+                        '-t', f'{dur:.3f}',
+                        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                        '-vf', "scale='min(640,iw)':-2", '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+                        '-movflags', '+faststart', out_path],
+                       timeout=FFMPEG_TIMEOUT, label='scene preview clip')
+    except MediaToolTimeout as e:
+        return jsonify(ok=False, error=f'Clip extraction took too long: {e}'), 504
+    if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+        return jsonify(ok=False, error=f'Could not extract that clip. ffmpeg error: {r.stderr[-400:]}'), 502
+    return jsonify(ok=True, url=f'/uploads/{out_name}')
+
+@app.route('/api/media/probe', methods=['POST'])
+def api_media_probe():
+    """Duration/resolution plus a single still-frame thumbnail for a staged
+    file, WITHOUT needing the browser to decode it at all.
+
+    This is specifically why the HIRES picker's preview used to hang on
+    "reading video info..." forever with a permanently black frame: it
+    pointed a real <video> element straight at the staged file and waited on
+    onloadedmetadata, which never fires for a codec the browser itself can't
+    decode (ProRes/DNxHD/MXF -- exactly what real broadcast HIRES masters
+    usually are). get_video_info() already goes through OpenCV's own ffmpeg
+    backend rather than the browser, which the comment on api_media_playable
+    above already established opens these formats just fine -- reused
+    directly rather than duplicating a second video-info path.
+
+    Deliberately NOT api_media_playable's full transcode: that rewrites the
+    entire file (this one might be 1-2GB+) just to get a still image and two
+    numbers. -ss before -i (matching api_scene_clip's existing pattern)
+    seeks to the nearest keyframe without decoding anything before it, so a
+    thumbnail comes back in well under a second regardless of file size.
+    Cached by filename so reopening the same preview doesn't redo the work."""
+    name = secure_filename(request.form.get('filename', ''))
+    if not name or name != request.form.get('filename', ''):
+        return jsonify(ok=False, error='Invalid filename.'), 400
+    src = staged_path(name)
+    if not os.path.isfile(src):
+        return jsonify(ok=False, error='That file is no longer staged -- pick it again.'), 404
+
+    try:
+        info = get_video_info(src)
+    except Exception as e:
+        return jsonify(ok=False, error=f'Could not read this file as video: {e}'), 502
+    if not info.get('duration_sec'):
+        return jsonify(ok=False, error='Could not read duration/resolution from this file -- '
+                       'it may not be a valid video, or the format is unsupported.'), 502
+
+    thumb_name = 'thumb_' + hashlib.sha1(name.encode()).hexdigest()[:16] + '.jpg'
+    thumb_path = os.path.join(app.config['UPLOAD_FOLDER'], thumb_name)
+    if not (os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0):
+        # A couple of seconds in, not frame 0 -- broadcast masters commonly
+        # open on black/bars/a countdown, which would make every thumbnail
+        # look identically blank regardless of what's actually in the file.
+        seek = min(2.0, max(0.0, info['duration_sec'] / 2))
+        try:
+            r = run_ffmpeg([FFMPEG, '-y', '-ss', f'{seek:.3f}', '-i', src,
+                            '-frames:v', '1', '-vf', "scale='min(480,iw)':-2",
+                            '-q:v', '4', thumb_path],
+                           timeout=FFMPEG_TIMEOUT, label='media probe thumbnail')
+        except MediaToolTimeout as e:
+            return jsonify(ok=False, error=f'Thumbnail extraction took too long: {e}'), 504
+        if not (os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0):
+            return jsonify(ok=False, error=f'Could not extract a thumbnail. ffmpeg error: {r.stderr[-400:]}'), 502
+
+    return jsonify(ok=True, duration=info['duration_sec'], width=info['width'], height=info['height'],
+                   thumbnail_url=f'/uploads/{thumb_name}')
+
+# ---- Ollama Vision ----
+
+OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
+
+def unload_ollama_model(model):
+    """Asks Ollama to unload `model` from VRAM right now, rather than
+    waiting out its normal keep-alive window (a few minutes by default).
+
+    Exists specifically for a shared-GPU deployment: if Ollama (vision
+    scoring) and a separate faster-whisper server sit on the same card,
+    Ollama holding the vision model warm after scoring finishes can leave
+    too little free VRAM for whisper to load its own model right after --
+    manifesting as whisper hanging shortly after vision scoring completes,
+    not as a clean out-of-memory error.
+
+    Deliberately NOT applied per scoring call -- a job scores dozens of
+    frames via concurrent /api/generate calls, and unloading between each
+    one would force a full model reload before every single frame, turning
+    a few seconds of inference into minutes of pure reload overhead. This
+    is called exactly once, after a job's ENTIRE scoring pass is done and
+    before whatever needs the freed VRAM next (transcription) begins --
+    the model stays warm and fast for the whole batch, then explicitly
+    steps aside right when it's actually finished being needed.
+
+    Ollama's documented way to trigger this: a normal /api/generate call
+    with keep_alive=0 and no prompt unloads the model without running any
+    inference. Best-effort -- a failure here shouldn't fail the render;
+    Ollama's own keep-alive timeout is still the fallback if this doesn't
+    get through."""
+    if not model:
+        return
+    try:
+        requests.post(f'{OLLAMA_URL}/api/generate', json={'model': model, 'keep_alive': 0}, timeout=15)
+    except Exception as e:
+        print(f'Could not ask Ollama to unload {model} early (non-fatal, keep-alive timeout still applies): {e}')
+
+@app.route('/api/vision/analyze', methods=['POST'])
+@require_permission('scene_detection')
+def api_vision():
+    """Scene search: detect every cut in a hires video, describe each one
+    with the AI Vision model and align it with Whisper dialogue, then rank
+    (and optionally exclude) results against a typed prompt / negative
+    prompt -- a "find me the scene with X" tool.
+
+    Deliberately stops at the two raw-material stages (vision description +
+    dialogue text) rather than running the full rating pipeline: no OpenCV
+    sharpness/brightness/face heuristics, no combined score, no scene
+    selection. That scoring formula answers "how good is this clip for a
+    promo"; this tool answers "which of these clips shows what I described",
+    which is a plain keyword match against text, not a quality judgment.
+    """
+    path, err = load_video(request)
+    if not path:
+        return jsonify(error=err), 400
+    search_prompt = (request.form.get('prompt') or '').strip()
+    negative_prompt = (request.form.get('negative_prompt') or '').strip()
+    model = request.form.get('model', 'llama3.2-vision:11b')
+
+    path = _ensure_readable(path)
+    # Basename under UPLOAD_FOLDER, handed back so the frontend can play any
+    # result straight from /uploads/<name> via the shared clip player.
+    video_filename = os.path.basename(path)
+
+    # Was hardcoded to threshold=30.0 regardless of what the generator form
+    # (or this tab) was set to, so this tab silently stopped matching what
+    # generation would actually do the moment anyone tuned the threshold.
+    # Same shared parser + default downscale as the preview and real job now.
+    scene_list = detect_scenes(path, **_scene_detector_params(request.form))
+    scenes = [{'scene': i+1, 'start': tc_seconds(s), 'end': tc_seconds(e),
+               'start_tc': s.get_timecode(), 'end_tc': e.get_timecode(),
+               'duration': round(tc_seconds(e) - tc_seconds(s), 2)}
+              for i, (s, e) in enumerate(scene_list)]
+    if not scenes:
+        return jsonify(error='No scene cuts were detected in this video -- try lowering the '
+                             'scene cut sensitivity.'), 400
+
+    # Dialogue, best-effort: an unreachable Whisper service just means no
+    # dialogue text to search against, not a failed request.
+    _, segments = transcribe_video(path)
+
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    batch_id = uuid.uuid4().hex[:10]
+    results = []
+    for sc in scenes:
+        mid_sec = (sc['start'] + sc['end']) / 2
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(mid_sec * fps))
+        ret, frame = cap.read()
+        description, thumb_url = '', None
+        if ret:
+            tw = 320
+            h, w = frame.shape[:2]
+            small = cv2.resize(frame, (tw, max(1, int(h * tw / max(w, 1)))))
+            tname = f'vsearch_{batch_id}_{sc["scene"]}.jpg'
+            cv2.imwrite(os.path.join(app.config['UPLOAD_FOLDER'], tname), small,
+                        [cv2.IMWRITE_JPEG_QUALITY, 80])
+            thumb_url = f'/uploads/{tname}'
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            b64 = base64.b64encode(buf.tobytes()).decode()
+            try:
+                r = requests.post(f'{OLLAMA_URL}/api/generate', json={
+                    'model': model,
+                    'prompt': 'Describe what is happening in this video frame in 1-2 sentences: '
+                              'who or what is visible, the action, and the setting.',
+                    'stream': False, 'images': [b64],
+                }, timeout=300)
+                description = (r.json().get('response') or '').strip()
+            except Exception as e:
+                description = f'(vision analysis failed: {e})'
+
+        dialogue = ' '.join(
+            seg['text'] for seg in segments
+            if seg['start'] < sc['end'] and seg['end'] > sc['start']
+        ).strip()
+
+        results.append({
+            'scene': sc['scene'], 'start_tc': sc['start_tc'], 'end_tc': sc['end_tc'],
+            'start_sec': sc['start'], 'end_sec': sc['end'], 'duration': sc['duration'],
+            'thumb': thumb_url, 'description': description, 'dialogue': dialogue,
+        })
+    cap.release()
+    # Same reasoning as the main render pipeline's equivalent call: this tool
+    # is a plausible thing to run right before someone tries Speech to Text
+    # on the same video, so it gets the same "free the GPU the moment this
+    # analysis pass is actually done" treatment for consistency.
+    if load_production_defaults().get('unload_vision_after_scoring', True):
+        unload_ollama_model(model)
+
+    def _words(q):
+        return [w for w in re.split(r'\s+', (q or '').lower().strip()) if w]
+
+    pos_words, neg_words = _words(search_prompt), _words(negative_prompt)
+    for r in results:
+        text = (r['description'] + ' ' + r['dialogue']).lower()
+        r['match_hits'] = sum(1 for w in pos_words if w in text)
+        r['excluded'] = bool(neg_words) and any(w in text for w in neg_words)
+    excluded_count = sum(1 for r in results if r['excluded'])
+    if pos_words or neg_words:
+        results = [r for r in results if not r['excluded']]
+        results.sort(key=lambda r: (-r['match_hits'], r['scene']))
+    return jsonify(total_scenes=len(scenes), results=results, video_filename=video_filename,
+                    searched=bool(pos_words or neg_words), excluded_count=excluded_count)
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify(error='File too large (max 2GB).'), 413
+
+def _model_supports_vision(name):
+    # /api/tags does not include per-model capabilities, so we have to ask
+    # /api/show for each model individually to find out if it's a vision model.
+    try:
+        r = requests.post(f'{OLLAMA_URL}/api/show', json={'model': name}, timeout=10)
+        data = r.json()
+        caps = data.get('capabilities', [])
+        if caps:
+            return 'vision' in caps
+        # Older Ollama versions don't return `capabilities` at all - fall back
+        # to checking the projector/family info that vision models expose.
+        details = data.get('details', {}) or {}
+        families = (details.get('families') or []) + [details.get('family', '')]
+        if any('clip' in f.lower() or 'mllama' in f.lower() or 'vision' in f.lower() for f in families if f):
+            return True
+        return 'vision' in name.lower() or 'vl' in name.lower()
+    except Exception:
+        # If we can't introspect the model, guess from its name rather than
+        # silently dropping it from the list.
+        return 'vision' in name.lower() or 'vl' in name.lower()
+
+@app.route('/api/vision/models')
+@require_permission('scene_detection')
+def api_vision_models():
+    try:
+        r = requests.get(f'{OLLAMA_URL}/api/tags', timeout=10)
+        names = [m['name'] for m in r.json().get('models', [])]
+    except Exception:
+        return jsonify(models=[])
+    if not names:
+        return jsonify(models=[])
+    with ThreadPoolExecutor(max_workers=min(8, len(names))) as ex:
+        flags = list(ex.map(_model_supports_vision, names))
+    models = [n for n, ok in zip(names, flags) if ok]
+    return jsonify(models=models)
+
+# ---- AI Chat ----
+# A general-purpose chat panel over whatever models Ollama has installed --
+# separate from the vision/rating pipeline, for testing a model's behavior,
+# drafting text, or just asking it something directly.
+CHAT_TIMEOUT = int(os.environ.get('CHAT_TIMEOUT', 180))
+CHAT_MAX_HISTORY = int(os.environ.get('CHAT_MAX_HISTORY', 60))  # messages, not turns
+
+# ---- Per-user chat memory (SQLite) ----
+# The chat used to live only in the page -- reloading or coming back later
+# started completely fresh. This persists each account's conversation
+# server-side, scoped strictly to that account: deliberately no admin
+# bypass the way job/library ownership has one elsewhere in this app, since
+# a chat history is closer to a personal scratchpad than operational data
+# an admin would legitimately need to see across accounts.
+CHAT_MEMORY_DB_PATH = os.path.join(LIBRARY_DIR, 'chat_memory.db')
+
+def _chat_memory_db():
+    return _sqlite_connect(CHAT_MEMORY_DB_PATH)
+
+def chat_memory_db_init():
+    conn = _chat_memory_db()
+    conn.execute('CREATE TABLE IF NOT EXISTS chat_messages ('
+                 'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+                 'user_id INTEGER NOT NULL,'
+                 'role TEXT NOT NULL,'
+                 'content TEXT NOT NULL,'
+                 'images TEXT,'
+                 'created_at REAL NOT NULL)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_messages_user ON chat_messages(user_id, id)')
+    conn.commit()
+    conn.close()
+
+def chat_memory_append(user_id, role, content, images=None):
+    """Records one message and prunes that user's history back down to
+    CHAT_MAX_HISTORY afterward -- storage is capped the same way the
+    per-request resend already is, so a heavy chat user's history can't
+    grow unbounded. Runs the prune every append rather than periodically:
+    simpler, and the cost is one indexed DELETE against a table that's
+    never more than CHAT_MAX_HISTORY+1 rows deep per user to begin with."""
+    conn = _chat_memory_db()
+    conn.execute('INSERT INTO chat_messages (user_id, role, content, images, created_at) VALUES (?,?,?,?,?)',
+                 (user_id, role, content, json.dumps(images) if images else None, time.time()))
+    conn.execute('DELETE FROM chat_messages WHERE user_id=? AND id NOT IN '
+                 '(SELECT id FROM chat_messages WHERE user_id=? ORDER BY id DESC LIMIT ?)',
+                 (user_id, user_id, CHAT_MAX_HISTORY))
+    conn.commit()
+    conn.close()
+
+def chat_memory_load(user_id):
+    """This user's saved conversation, oldest first, shaped exactly like the
+    {role, content, images?} entries the frontend already keeps in its own
+    chatHistory array -- so restoring on page load is just 'use this as the
+    starting array' with no reshaping needed."""
+    conn = _chat_memory_db()
+    rows = conn.execute('SELECT role, content, images FROM chat_messages WHERE user_id=? ORDER BY id ASC',
+                        (user_id,)).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        entry = {'role': r['role'], 'content': r['content']}
+        if r['images']:
+            try:
+                entry['images'] = json.loads(r['images'])
+            except (ValueError, TypeError):
+                pass
+        out.append(entry)
+    return out
+
+def chat_memory_clear(user_id):
+    conn = _chat_memory_db()
+    conn.execute('DELETE FROM chat_messages WHERE user_id=?', (user_id,))
+    conn.commit()
+    conn.close()
+
+chat_memory_db_init()
+
+# ---- Built-in app-knowledge grounding for AI Assistant ----
+# The chat tab is otherwise a fully generic Ollama front-end with no idea
+# what app it's running inside -- this gives it accurate, current
+# information to actually answer "how do I..." / "why did X happen" /
+# "what are the limits of..." questions about PRISM itself, rather than
+# guessing or (worse) confidently making something up. Kept as a single
+# server-side constant rather than embedded in the page template, so
+# there's one place to keep it accurate as the app changes, and it doesn't
+# bloat the page payload for people who never open the chat.
+#
+# Deliberately includes real limitations, not just a feature list -- a
+# support assistant that only describes what works and stays silent on
+# what doesn't is actively misleading. Concatenated with whatever the user
+# has typed in their own System prompt box (see /api/chat below), never
+# replacing it, so "be concise" or "answer in Tagalog" still work exactly
+# as before this existed.
+APP_KNOWLEDGE_PROMPT = """You are the built-in AI Assistant inside PRISM (AI-Powered Media Creation), a broadcast promo/trailer generation tool. When the user asks how the app works, why something behaved a certain way, or what its limits are, answer from the information below rather than guessing. For anything genuinely outside this scope (general knowledge, writing help, etc.) just help normally -- this context only needs to shape answers about the app itself.
+
+WHAT PRISM DOES
+Generates episodic promo plugs ("trailers") from raw broadcast footage: detects scenes, scores/selects the best ones, assembles them with transitions, and can add title/end cards, background music, sound effects, and narration (VO) -- either fully automatically or with manual control at every step.
+
+MAIN WORKFLOW (Generate Promo Plug tab)
+1. Supply source video: Browse Library (a configured network/SMB share) by default, or direct upload if the deployment has that enabled.
+2. Scene rating always combines OpenCV heuristics, AI vision scoring (Ollama), and dialogue transcription (faster-whisper) -- there's no mode to pick; this runs the same way for every job so cuts are never placed mid-word regardless of anything else selected.
+3. Scene selection is automatic based on what's supplied, not a mode to choose: a "What should this promo feature?" description and/or an attached script (timecoded cues) each pin the specific moments they call for, and best-scoring scenes fill in whatever's left over. Supply neither and it's best-scoring scenes for the whole thing.
+4. Pick a trailer length (15/30/45/60s), a Genre (a lightweight style preset: transition + crossfade duration + whether SFX-at-cuts is on) or a saved Template (a full named per-show configuration -- everything Genre sets plus title/end cards, music/SFX/VO, audio levels, and more; Genre is really a subset of what a Template stores).
+5. Configure transition style, optional title/end cards, background music, SFX, and narration.
+6. "Preview the cut first" runs only scene detection + scoring + selection (no render) and shows the chosen scenes as thumbnails with a play button -- you can untick any you don't want and swap in an alternate before committing to a full render, which reuses that same analysis instead of repeating it.
+7. Generate renders the final file.
+
+SCENE SCORING (as of the current version)
+Quality: 1-3, from OpenCV heuristics (sharpness, brightness, duration, whether a face is detected) -- the crudest signal, mainly breaks ties.
+AI Vision: 1-5, from the vision model actually judging scene content -- the strongest signal since it's the only one that understands what's happening in the frame.
+Speech/dialogue: 1-2, if faster-whisper found dialogue over that scene (2 if it's a question or exclamation).
+Script priority (if used): a large boost (up to ~8, deliberately dominant) for scenes matching an uploaded script's cue timecodes, since supplying a script means that intent should generally win over automatic scoring.
+
+VERTICAL SHORTS TAB (separate from promo generation; does not change how a plug is built)
+Cuts a long-form programme into stand-alone 9:16 shorts (1080x1920 H.264 MP4) in two steps. "Preview the cut" analyses the source: detects cuts, has the AI Vision model rate sampled frames for how dramatic they look, transcribes the dialogue, then has a story model read the transcript (with those visual notes) and propose moments that make sense on their own -- a setup, a turn, a payoff -- rather than just the loudest peaks. It returns ranked candidates and renders nothing yet. The editor then previews each one, re-times or retitles it, drops it, or adds a range by hand, and "Render" produces the shorts. "Generate without preview" does both steps as one job, rendering every moment found; the moments can still be adjusted and rendered again afterwards. Two optional notes steer the choice: what the shorts should feature (a preference) and what they should avoid (a rule: such moments are left out even if strong).
+Each candidate's score (0-100) combines the story model's rating (1-10, the largest weight), the visual drama of frames inside it (1-5), and dialogue pace. In/out points are placed so they never cut a spoken word, and land on a shot change when one is close.
+Reframing is decided per shot: "Auto" crops to follow the face(s) and, when two similar-sized faces are too far apart to fit a vertical frame, shows the whole picture over a blurred background for that shot instead of cutting one person out; "Split screen" instead gives each of those two people half the frame, stacked; "Always crop" commits to one side; "Fit" always shows the whole picture. Captions are burned in from the transcript and an .srt is saved alongside. Finished batches are kept under Saved shorts and can be downloaded (individually or as a zip) or sent to a video network destination.
+
+OTHER TABS
+Speech to Text: standalone faster-whisper transcription.
+Scene Search: detects every cut in a hires video, describes each with AI Vision, aligns Whisper dialogue, then finds scenes matching a typed prompt (with an optional negative prompt to exclude some) -- no rating/scoring, separate from a full generate.
+AI Assistant: this chat.
+Player: browses and plays saved trailers from the shared library.
+API: live health status of every connected service (Ollama, Fish Audio, faster-whisper, ACE-Step, Woosh), admin-only.
+Docs: in-app documentation of workflow and genres.
+Config (admin-only): Services (AI service URLs/keys), Network (SMB share connection + per-category folder names), Branding (name/tagline/footer/logo/favicon/color theme), Users (account and group management).
+
+KNOWN LIMITATIONS -- be upfront about these rather than implying the app can do more than it can
+- No audit trail beyond each account's last-login timestamp; actions like renders, deletes, and template edits aren't attributed to a specific user.
+- Scene preview clips use fast keyframe-based seeking, which is keyframe-accurate, not frame-accurate -- a preview clip can start up to roughly a second early or late. Fine for previewing, not used for the final render.
+- A trailer can come out slightly under the requested length if there genuinely isn't enough usable source material -- the app won't invent footage that isn't there.
+- ACE-Step "turbo"/distilled model checkpoints ignore CFG guidance by design, so the guidance-scale/CFG-type controls may have no audible effect depending on which checkpoint is actually loaded.
+- Woosh (sound effects) has no duration parameter -- generated SFX come back at whatever length the model produces, not a requested duration.
+- A hosted ACE-Step endpoint (vs. self-hosted) may use a different API contract than this app expects by default -- if music generation fails against a hosted service specifically, that's the first thing to check.
+- Vertical Shorts needs both Ollama and faster-whisper reachable and refuses to analyse without them. Its candidates are proposals, not finished edits: a local model can misjudge what stands alone, so each should be previewed before rendering. It finds single continuous stretches only (it does not assemble a short from several separate scenes), has no speaker detection (in a wide two-shot it cannot tell who is talking), and adds no music, titles or graphics.
+- Vertical Shorts face tracking uses OpenCV's built-in Haar cascades unless a YuNet model file is supplied (SHORTS_FACE_MODEL); the cascades miss many profile and tilted faces, and a shot with no detected face is centre-cropped.
+- If asked about something not covered here or that seems like it may have changed, say so rather than guessing, and suggest checking the Docs tab or the relevant Config section directly."""
+
+
+# ---- Chat attachments (images + documents) ----
+# Images ride directly in the /api/chat request body -- Ollama's own schema is
+# messages[].images, a list of base64 strings with no data-URL prefix (see
+# docs.ollama.com/capabilities/vision) -- so the browser encodes them and sends
+# them straight through with no server round trip needed. Documents are
+# different: a PDF can't be read as text in the browser, so those go through
+# the extraction endpoint below first and the resulting text is folded into the
+# message content client-side, the same as if the user had typed it.
+CHAT_MAX_IMAGES_PER_MESSAGE = int(os.environ.get('CHAT_MAX_IMAGES_PER_MESSAGE', 4))
+CHAT_MAX_IMAGE_BYTES = int(os.environ.get('CHAT_MAX_IMAGE_BYTES', 8 * 1024 * 1024))
+CHAT_ATTACH_MAX_BYTES = int(os.environ.get('CHAT_ATTACH_MAX_BYTES', 8 * 1024 * 1024))
+CHAT_ATTACH_MAX_CHARS = int(os.environ.get('CHAT_ATTACH_MAX_CHARS', 20000))
+CHAT_TEXT_EXTS = {'.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.log', '.yaml', '.yml',
+                  '.ini', '.cfg', '.conf', '.xml', '.html', '.htm', '.css', '.py', '.js', '.ts',
+                  '.jsx', '.tsx', '.java', '.c', '.h', '.cpp', '.hpp', '.go', '.rs', '.rb', '.php',
+                  '.sh', '.sql', '.srt', '.vtt'}
+
+@app.route('/api/chat/extract_file', methods=['POST'])
+@require_permission('ai_chat')
+def api_chat_extract_file():
+    """Extracts plain text from an uploaded document for a chat attachment.
+
+    PDFs need pypdf (an optional dependency -- this degrades to a clear error
+    rather than crashing the whole app if it isn't installed, since not every
+    deployment needs PDF support). Anything else with a recognised text-ish
+    extension is decoded as UTF-8 directly; everything else is rejected rather
+    than silently attaching binary garbage as "context"."""
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return jsonify(ok=False, error='No file provided.'), 400
+    name = secure_filename(f.filename)
+    if not name:
+        return jsonify(ok=False, error='Invalid filename.'), 400
+    ext = os.path.splitext(name)[1].lower()
+
+    raw = f.read(CHAT_ATTACH_MAX_BYTES + 1)
+    if len(raw) > CHAT_ATTACH_MAX_BYTES:
+        return jsonify(ok=False, error=f'That file is larger than the '
+                       f'{CHAT_ATTACH_MAX_BYTES // (1024*1024)}MB attachment limit.'), 400
+    if not raw:
+        return jsonify(ok=False, error='That file is empty.'), 400
+
+    if ext == '.pdf':
+        try:
+            import pypdf
+        except ImportError:
+            return jsonify(ok=False, error='PDF attachments need the "pypdf" package on the '
+                           'server (pip install pypdf --break-system-packages), which is not '
+                           'installed here. Plain text and code files work without it.'), 501
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(raw))
+            if reader.is_encrypted:
+                return jsonify(ok=False, error='That PDF is password-protected.'), 400
+            text = '\n\n'.join((page.extract_text() or '') for page in reader.pages)
+        except Exception as e:
+            return jsonify(ok=False, error=f'Could not read that PDF: {e}'), 400
+    elif ext in CHAT_TEXT_EXTS or ext == '':
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            text = raw.decode('utf-8', errors='replace')
+    else:
+        return jsonify(ok=False, error=f'Unsupported file type "{ext}". Supported: PDF, plain '
+                       'text, and common code/markup files. Images should be attached directly, '
+                       'not through this button.'), 400
+
+    text = text.strip()
+    if not text:
+        return jsonify(ok=False, error='No extractable text was found in that file '
+                       '(a scanned/image-only PDF has no text layer to read).'), 400
+    truncated = len(text) > CHAT_ATTACH_MAX_CHARS
+    if truncated:
+        text = text[:CHAT_ATTACH_MAX_CHARS]
+    return jsonify(ok=True, filename=name, text=text, truncated=truncated, chars=len(text))
+
+@app.route('/api/chat/models')
+@require_permission('ai_chat')
+def api_chat_models():
+    """Every model Ollama has installed, unfiltered -- unlike /api/vision/models
+    this doesn't restrict to vision-capable ones, since chat has no use for that
+    distinction and the /api/show introspection per model is pure overhead here."""
+    try:
+        r = requests.get(f'{OLLAMA_URL}/api/tags', timeout=10)
+        names = sorted(m['name'] for m in r.json().get('models', []))
+        return jsonify(ok=True, models=names)
+    except Exception as e:
+        return jsonify(ok=False, models=[], error=f'Could not reach Ollama at {OLLAMA_URL}: {e}')
+
+@app.route('/api/chat', methods=['POST'])
+@require_permission('ai_chat')
+def api_chat():
+    data = request.get_json(silent=True) or {}
+    model = (data.get('model') or '').strip()
+    if not model:
+        return jsonify(ok=False, error='Pick a model first.'), 400
+
+    messages = data.get('messages')
+    if not isinstance(messages, list) or not messages:
+        return jsonify(ok=False, error='No conversation to send.'), 400
+    # Only well-formed {role, content} pairs, and bounded -- this is a JSON body
+    # built from the page's own running chat history, but treat it the same as
+    # any other untrusted input rather than assuming the client behaved.
+    clean = []
+    for m in messages[-CHAT_MAX_HISTORY:]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get('role')
+        content = m.get('content')
+        if role not in ('user', 'assistant') or not isinstance(content, str) or not content.strip():
+            continue
+        entry = {'role': role, 'content': content}
+        # Images only make sense on a user turn, and only up to a sane cap --
+        # a single message with dozens of embedded base64 images would both
+        # balloon the request and almost certainly exceed what a vision model
+        # can usefully attend to at once.
+        imgs = m.get('images')
+        if role == 'user' and isinstance(imgs, list) and imgs:
+            clean_imgs = []
+            for img in imgs[:CHAT_MAX_IMAGES_PER_MESSAGE]:
+                if not isinstance(img, str) or not img:
+                    continue
+                # Base64 expands input size by ~4/3 -- check the encoded string
+                # length against that inflated bound rather than decoding every
+                # image just to measure it.
+                if len(img) > CHAT_MAX_IMAGE_BYTES * 4 // 3:
+                    continue
+                clean_imgs.append(img)
+            if clean_imgs:
+                entry['images'] = clean_imgs
+        clean.append(entry)
+    if not clean:
+        return jsonify(ok=False, error='No conversation to send.'), 400
+    # Captured before `system` is prepended below, so this is unambiguously
+    # the newest real turn -- what gets persisted to this user's chat memory
+    # once the reply comes back successfully, not the system prompt or any
+    # earlier turn the client re-sent for its own context-window purposes
+    # (those are already in storage from previous exchanges).
+    newest_user_turn = clean[-1]
+
+    system = (data.get('system') or '').strip()
+    # include_app_help defaults to True (opt-out, not opt-in) -- answering
+    # "how does this app work" questions correctly is the whole point of
+    # this feature, so it should work out of the box rather than requiring
+    # the user to discover and enable a checkbox first. Concatenated ABOVE
+    # the user's own custom system text (if any), not replacing it, so
+    # existing uses like "be concise" or "answer in Tagalog" keep working
+    # exactly as before -- both apply together.
+    if data.get('include_app_help', True):
+        system = f'{APP_KNOWLEDGE_PROMPT}\n\n{system}'.strip()
+    if system:
+        clean = [{'role': 'system', 'content': system}] + clean
+
+    # Reasoning models put their chain-of-thought in a separate `thinking` field
+    # (see the AI-scoring fix earlier: an empty `content` with a full `thinking`
+    # field is not a failure, it's the model reasoning silently). Chat has no
+    # token budget cap the way scene rating does, so the specific failure mode
+    # that caused there -- reasoning eating a *tight* budget -- doesn't apply,
+    # but the fallback costs nothing to keep for the rare model that only ever
+    # populates `thinking`.
+    think = bool(data.get('think'))
+    payload = {'model': model, 'messages': clean, 'stream': False, 'think': think}
+    try:
+        r = requests.post(f'{OLLAMA_URL}/api/chat', json=payload, timeout=CHAT_TIMEOUT)
+        resp = r.json()
+    except requests.exceptions.Timeout:
+        return jsonify(ok=False, error=f'Ollama did not respond within {CHAT_TIMEOUT}s.'), 504
+    except Exception as e:
+        return jsonify(ok=False, error=f'Could not reach Ollama at {OLLAMA_URL}: {e}'), 502
+    if resp.get('error'):
+        return jsonify(ok=False, error=resp['error']), 502
+
+    msg = resp.get('message') or {}
+    content = (msg.get('content') or '').strip()
+    thinking = (msg.get('thinking') or '').strip()
+    if not content and thinking:
+        content = thinking
+    if not content:
+        return jsonify(ok=False, error='The model returned an empty response.'), 502
+    # Persisted only now that the exchange has genuinely succeeded -- a
+    # failed/timed-out request (handled by the returns above) never writes
+    # anything, so this user's chat memory can't end up with a stored user
+    # turn that has no reply, or drift from what they actually saw on screen.
+    try:
+        chat_memory_append(session['user_id'], newest_user_turn['role'], newest_user_turn['content'],
+                           images=newest_user_turn.get('images'))
+        chat_memory_append(session['user_id'], 'assistant', content)
+    except Exception as e:
+        print(f'Chat memory save failed (reply still succeeded): {e}')
+    return jsonify(ok=True, content=content, thinking=thinking or None, model=resp.get('model') or model)
+
+@app.route('/api/chat/history', methods=['GET'])
+@require_permission('ai_chat')
+def api_chat_history():
+    """This account's saved conversation, for the AI Assistant tab to
+    restore on load instead of always starting empty. Strictly own-account
+    only -- see the chat-memory module docstring for why there's no admin
+    bypass here unlike job/library ownership elsewhere."""
+    return jsonify(ok=True, messages=chat_memory_load(session['user_id']))
+
+@app.route('/api/chat/clear', methods=['POST'])
+@require_permission('ai_chat')
+def api_chat_clear():
+    """Wipes this account's saved conversation server-side -- pairs with the
+    existing client-side 'Clear chat' button, which used to only reset the
+    page's own in-memory array and left the (previously nonexistent)
+    server copy untouched."""
+    chat_memory_clear(session['user_id'])
+    return jsonify(ok=True)
+
+# ---- Trailer Generator (ffmpeg) ----
+
+@app.route('/api/trailer/validate_script', methods=['POST'])
+@require_permission('promo_generation')
+def api_validate_script():
+    """Parse an uploaded script/rundown and return what the app can use.
+
+    Called as soon as the user attaches a file (before any full job runs) so
+    they can see extracted timecodes, optional material labels, and clear
+    warnings when nothing usable was found -- without waiting for scene
+    detection.
+    """
+    script_file, src_err = _script_file_from_request()
+    manual_cues_json = (request.form.get('manual_cues') or '').strip()
+    if not script_file and manual_cues_json:
+        text, err = manual_cues_to_script_text(manual_cues_json)
+        if err:
+            return jsonify(ok=False, error=err), 400
+    elif src_err:
+        return jsonify(ok=False, error=src_err), 400
+    else:
+        text = None  # set below, after script_file is confirmed present
+
+    # Discrete materials (preferred): JSON list of staged names, order = M1, M2, …
+    # Legacy combine: file_segment_durations still offsets onto one timeline.
+    materials_count = 0
+    try:
+        mat_list = json.loads(request.form.get('materials_network') or '[]')
+        if isinstance(mat_list, list):
+            materials_count = len([x for x in mat_list if x])
+    except (ValueError, TypeError):
+        materials_count = 0
+    try:
+        materials_count = max(materials_count, int(request.form.get('materials_count') or 0))
+    except (ValueError, TypeError):
+        pass
+    segment_offsets = {}
+    try:
+        durations = json.loads(request.form.get('file_segment_durations') or '[]')
+        cumulative = 0.0
+        for i, d in enumerate(durations):
+            segment_offsets[i + 1] = cumulative
+            cumulative += float(d)
+    except (ValueError, TypeError):
+        segment_offsets = {}
+
+    available = set(range(1, materials_count + 1)) if materials_count >= 1 else None
+    # If only combine durations were posted (legacy), available stays None so
+    # parse_script_cues uses the offset path.
+
+    raw_script = None
+    if text is None:
+        raw_script = script_file.read()
+        script_name = script_file.filename
+        text, err = extract_script_text(_MemScript(script_name, raw_script))
+        if err:
+            return jsonify(ok=False, error=err), 400
+    if not (text or '').strip():
+        return jsonify(ok=False, error='That file has no readable text.'), 400
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    # Per-line diagnostics so the UI can show what was kept vs skipped.
+    # A single timecode is enough to select a scene; in/out pairs use the in-point.
+    kept = []
+    skipped = []
+    for line in lines:
+        parsed = _parse_timecode_line(line)
+        if not parsed:
+            # Only report lines that look like they *tried* to be cues
+            # (contain digits + a colon or period separator) so we don't spam
+            # prose. This also catches the leading-dot shorthand some scripts
+            # use ("Mat 3 .26 - .30", minute implied from a previous cue) --
+            # not currently recognised since the minute digit is missing
+            # entirely, which is genuinely ambiguous rather than a different
+            # separator style.
+            if re.search(r'\d[:.]\d', line) or re.search(r'(?<!\d)\.\d{2}\b', line):
+                skipped.append({
+                    'line': line[:160],
+                    'reason': 'No recognisable timecode (use 00:01:30:12, 00:01:30, 1:30, or the '
+                              'period-separated 00.01.30.12 / 1.30). A single time is enough — '
+                              'in/out pairs are not required.',
+                })
+            continue
+        secs, desc, meta = parsed
+        seg_match = _SEGMENT_PREFIX_RE.search(line)
+        material = None
+        status = 'usable'
+        note_parts = []
+        if meta.get('out') is not None:
+            # "noted only" would be stale, misleading wording now: this out
+            # point genuinely sets the clip's own initial length (out minus
+            # in) via build_cue_clips, not just a display-only annotation
+            # the way it was before cues drove selection directly -- it can
+            # still be stretched or shrunk afterward to help fill the
+            # target duration, so it's not a hard, fixed length either.
+            note_parts.append(
+                f'In/out pair → using {_seconds_to_tc(secs)}\u2013{_seconds_to_tc(meta["out"])} as the '
+                f'clip (may be stretched or shrunk to help fill the target length)'
+            )
+        else:
+            note_parts.append('Single timecode → will select the scene at this moment')
+        if seg_match:
+            seg_num = int(seg_match.group(1))
+            material = seg_match.group(0)
+            if available is not None:
+                if seg_num not in available:
+                    status = 'skipped'
+                    skipped.append({
+                        'line': line[:160],
+                        'reason': 'Referenced a source that was not loaded — cue ignored',
+                    })
+                    continue
+            elif seg_num == 1:
+                pass
+            elif seg_num in segment_offsets:
+                pass  # legacy combine still offsets inside parse_script_cues
+            else:
+                status = 'skipped'
+                skipped.append({
+                    'line': line[:160],
+                    'reason': 'Referenced a source that was not loaded — cue ignored',
+                })
+                continue
+        # Legacy combine: a render shifts a segment's cue onto the combined
+        # timeline (parse_script_cues), so the preview shows the shifted time.
+        shifted = secs
+        if seg_match and available is None:
+            shifted = secs + (segment_offsets.get(int(seg_match.group(1))) or 0.0)
+        kept.append({
+            'time': round(shifted, 3),
+            'timecode': _seconds_to_tc(shifted),
+            'raw_time': round(secs, 3),
+            'raw_timecode': _seconds_to_tc(secs),
+            'out_timecode': _seconds_to_tc(meta['out']) if meta.get('out') is not None else None,
+            'desc': (desc or '')[:160],
+            'material': material,
+            'status': status,
+            'note': ' · '.join(note_parts),
+            'line': line[:160],
+        })
+
+    warnings = []
+    if not kept:
+        warnings.append(
+            'No usable timecodes found. Each cue line needs at least one timecode like '
+            '00:01:30:12, 00:01:30, or 1:30. A single time is enough to select a scene — '
+            'an in/out pair is optional. Lines without any timecode are ignored.'
+        )
+    if skipped:
+        warnings.append(f'{len(skipped)} line(s) looked like cues but could not be used.')
+    if available is not None and materials_count > 1:
+        warnings.append(
+            f'{materials_count} sources loaded. Timecodes are matched to each source separately.'
+        )
+    elif segment_offsets and len(segment_offsets) > 1 and available is None:
+        warnings.append(
+            f'{len(segment_offsets)} sources were combined into one timeline for this job.'
+        )
+    elif any(c.get('material') for c in kept) and (materials_count or 0) <= 1 and not segment_offsets:
+        warnings.append(
+            'Some cues reference additional sources that were not loaded and will be ignored.'
+        )
+
+    summary = (
+        f'Extracted {len(kept)} scene-selection cue(s) from {len(lines)} non-empty line(s). '
+        f'Each cue picks that clip (in/out pair) or moment (single timecode) exclusively.'
+        if kept else
+        f'No usable cues from {len(lines)} non-empty line(s).'
+    )
+
+    return jsonify(
+        ok=bool(kept),
+        summary=summary,
+        cues_count=len(kept),
+        lines_scanned=len(lines),
+        skipped_count=len(skipped),
+        cues=kept[:60],
+        skipped=skipped[:30],
+        warnings=warnings,
+        has_segment_offsets=bool(segment_offsets),
+        segment_count=len(segment_offsets) or 0,
+        text_preview=(text[:500] + ('…' if len(text) > 500 else '')),
+        script_brief=(read_script_brief(raw_script, script_name, text,
+                                        parse_script_cues(text, available_materials=available)) if raw_script else None),
+    )
+
+
+_vo_ranges_limiter = _RateLimiter(limit=int(os.environ.get('VO_RANGES_RATE_LIMIT', 60)), window=300)
+
+
+def _narration_range_from_brief(brief, path):
+    """Where the script's voice-over lines are in the narration recording: {'in', 'out', 'lines': [...]} or None.
+    in/out span the first to the last line found, with a little room each side."""
+    vo = (brief or {}).get('vo') or []
+    texts = [v['text'] for v in vo if v.get('text')]
+    if not texts or not path or not os.path.exists(path):
+        return None
+    words, segments = _transcribe_vo_cached(path, 0.0, None)
+    words = words or cutcraft.words_from_segments(segments)
+    if not words:
+        return None
+    al = cutcraft.align_script([{'text': t} for t in texts], words)
+    hit = [{'text': texts[i], 'in': round(words[a['w0']]['start'], 2), 'out': round(words[a['w1']]['end'], 2), 'score': a['score']}
+           for i, a in enumerate(al) if a['w0'] is not None]
+    if not hit:
+        return None
+    # One In/Out pair per line, in recording order, so each line is its own selection (a little room each side,
+    # never reaching into the neighbouring line).
+    srt = sorted(hit, key=lambda h: h['in'])
+    parts = []
+    for k, h in enumerate(srt):
+        lo = max(0.0, h['in'] - 0.25)
+        hi = h['out'] + 0.35
+        if k:
+            lo = max(lo, (srt[k - 1]['out'] + h['in']) / 2)
+        if k + 1 < len(srt):
+            hi = min(hi, (h['out'] + srt[k + 1]['in']) / 2)
+        parts.append({'in': round(lo, 2), 'out': round(max(hi, lo + 0.1), 2), 'text': h['text']})
+    return {'in': parts[0]['in'], 'out': parts[0]['out'], 'parts': parts,
+            'lines': hit, 'missing': len(texts) - len(hit)}
+
+
+@app.route('/api/trailer/script_vo_ranges', methods=['POST'])
+@require_permission('promo_generation')
+def api_script_vo_ranges():
+    """The In/Out of the narration (and of the title and end card narration) the script calls for, read from the
+    recordings, so the selectors can show them as soon as both the script and the recording are chosen."""
+    if not _vo_ranges_limiter.allow(_client_ip()):
+        return jsonify(ok=False, error='Too many requests. Wait a minute and try again.'), 429
+    try:
+        brief = json.loads(request.form.get('script_brief') or 'null')
+    except ValueError:
+        brief = None
+    if not isinstance(brief, dict) or not (brief.get('vo') or brief.get('tcard')):
+        return jsonify(ok=False, error='The script has no voice-over lines.')
+    out, temp = {}, []
+    try:
+        paths = {}
+        for key in ('vo_upload', 'title_card_vo', 'end_card_vo'):
+            p = _resolve_upload(key, AUDIO_EXTENSIONS)
+            if p:
+                paths[key] = p
+                if key in request.files and request.files[key].filename:
+                    temp.append(p)
+        if paths.get('vo_upload'):
+            r = _narration_range_from_brief(brief, paths['vo_upload'])
+            if r:
+                out['narration'] = r
+        card = _suggest_card_vo_ranges({'title_card_vo_path': paths.get('title_card_vo'),
+                                        'end_card_vo_path': paths.get('end_card_vo')}, brief)
+        out.update({k: v for k, v in card.items()})
+    except Exception as e:
+        print(f'Script narration ranges failed: {e}')
+        return jsonify(ok=False, error='The recording could not be read against the script.')
+    finally:
+        for p in temp:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return jsonify(ok=True, **out)
+
+
+@app.route('/api/trailer/generate', methods=['POST'])
+@require_permission('promo_generation')
+def api_trailer():
+    # Checked before load_video() so a rate-limited request doesn't first
+    # write the uploaded/staged file to disk and then get rejected -- that
+    # would leave the expensive part (I/O, disk consumption) unthrottled while
+    # only the cheap part was limited. Keyed per-client, so one runaway script
+    # or stolen session can't queue unbounded ffmpeg work for everyone else.
+    if not _job_submit_limiter.allow(_client_ip()):
+        return jsonify(error='Too many render requests. Wait a few minutes and try again.'), 429
+    path, orig_name = load_video(request)
+    if not path:
+        return jsonify(error=orig_name), 400
+
+    # Rating mode is no longer user-selectable -- scene selection always uses
+    # OpenCV heuristics + AI Vision + faster-whisper dialogue scoring. The old
+    # VISION-only option existed mainly from before transcription was reliable,
+    # and picking it only ever made selection worse (it threw away the dialogue
+    # signal entirely) while also, until recently, silently disabling
+    # speech-safe cut placement as a side effect. `mode` is still accepted from
+    # the form rather than rejected outright so saved templates carrying an old
+    # 'ai'/'ai_stt' value keep loading without error -- both now resolve to the
+    # same behavior.
+    mode = 'ai'
+    mode_includes_stt = True
+    genre = request.form.get('genre', '').strip()
+    scoring_mode = request.form.get('scoring_mode', 'generate')
+    delivery_format = resolve_delivery_format(request.form.get('delivery_format', 'mp4_high'))
+    trailer_length = int(request.form.get('trailer_length', 15))
+    if trailer_length not in (15, 30, 45, 60):
+        trailer_length = 30
+    try:
+        max_scene_dur = float(request.form.get('max_scene_dur', '') or 0)
+        max_scene_dur = max_scene_dur if max_scene_dur > 0 else None
+    except ValueError:
+        max_scene_dur = None
+    # Deployment-wide production standards (Config > Production) supply the
+    # fallback for every setting below that used to have a constant hardcoded
+    # here -- an explicit form field still wins, so saved templates carrying
+    # these values and deliberate API overrides both keep working, but the
+    # generator form no longer has to ask about any of them on every job. See
+    # PRODUCTION_DEFAULT_SPEC for why these belong at deployment level rather
+    # than per-promo.
+    _prod = load_production_defaults()
+    try:
+        scene_threshold = max(1.0, min(100.0, float(request.form.get('scene_threshold') or _prod['scene_threshold'])))
+    except ValueError:
+        scene_threshold = float(_prod['scene_threshold'])
+    try:
+        min_scene_len_sec = max(0.1, min(5.0, float(request.form.get('min_scene_len') or _prod['min_scene_len'])))
+    except ValueError:
+        min_scene_len_sec = float(_prod['min_scene_len'])
+    detector = request.form.get('detector') or _prod['detector']
+    if detector not in ('content', 'adaptive'):
+        detector = 'content'
+    try:
+        adaptive_threshold = max(1.0, min(10.0, float(request.form.get('adaptive_threshold') or _prod['adaptive_threshold'])))
+    except ValueError:
+        adaptive_threshold = float(_prod['adaptive_threshold'])
+
+    # Scene priority guidance -- both optional and INDEPENDENT of each other,
+    # no mode to pick first:
+    #   * priority_prompt: free-text description of what this promo should
+    #     feature, folded into the AI vision scoring prompt so it steers which
+    #     scenes win.
+    #   * script_file: a rundown with timecodes, parsed into cues that strongly
+    #     boost whichever detected scene each cue falls inside.
+    # Supply neither and selection is purely automatic (top score wins), which
+    # is the behaviour that existed before any of this. Supply both and they
+    # compose rather than conflict: script cues pin the specific moments that
+    # were explicitly called for, and the prompt influences which of the
+    # REMAINING scenes fill the rest of the promo. This replaced a three-way
+    # dropdown where the options were mutually exclusive -- there was never a
+    # real reason a script and a description couldn't both apply, and making
+    # the user declare a mode first was an extra decision that bought nothing.
+    #
+    # Parsed here (in the request, where the upload exists) rather than in the
+    # job thread, which has no access to request.files.
+    priority_prompt = (request.form.get('priority_prompt') or '').strip()
+    negative_prompt = (request.form.get('negative_prompt') or '').strip()
+    # Set by the frontend after combining multiple HIRES files via Browse
+    # Library's multi-select -- each segment's own duration, in combine
+    # order, as a JSON list. Turned into {segment_number: cumulative_offset}.
+    # Only used when a script cue optionally names a material (mats1, M2,
+    # material 1, etc.); plain timecode scripts ignore this entirely.
+    segment_offsets = {}
+    try:
+        durations = json.loads(request.form.get('file_segment_durations') or '[]')
+        cumulative = 0.0
+        for i, d in enumerate(durations):
+            segment_offsets[i + 1] = cumulative
+            cumulative += float(d)
+    except (ValueError, TypeError):
+        segment_offsets = {}
+
+    # Discrete materials (M1, M2, …): staged network filenames in order.
+    # Prefer this over combine+offset when the form posts materials_network.
+    materials_paths = []
+    try:
+        raw_mats = json.loads(request.form.get('materials_network') or '[]')
+        if isinstance(raw_mats, list):
+            for name in raw_mats:
+                safe = secure_filename(str(name or ''))
+                if not safe or not safe.startswith('net_'):
+                    continue
+                p = staged_path(safe)
+                if os.path.isfile(p):
+                    materials_paths.append(p)
+    except (ValueError, TypeError):
+        materials_paths = []
+
+    available_materials = set(range(1, len(materials_paths) + 1)) if materials_paths else None
+
+    script_cues = []
+    script_file, _script_src_err = _script_file_from_request()
+    manual_cues_json = (request.form.get('manual_cues') or '').strip()
+    # Missing script/manual entries is fine (optional); only error when
+    # something was provided but unreadable / invalid. Script upload takes
+    # priority over manual entries if a request somehow carries both (the
+    # UI's own radio only ever sends one at a time).
+    script_brief = None
+    if script_file:
+        raw_script = script_file.read()
+        text, err = extract_script_text(_MemScript(script_file.filename, raw_script))
+        if err:
+            return jsonify(error=err), 400
+        script_cues = parse_script_cues(
+            text,
+            segment_offsets=(None if available_materials is not None else segment_offsets),
+            available_materials=available_materials,
+        )
+        script_brief = read_script_brief(raw_script, script_file.filename, text, script_cues)
+        if not script_cues:
+            return jsonify(error='No timecodes were found in that script. Each cue line needs at '
+                                 'least one timecode like 00:01:30:12, 00:01:30, or 1:30. A single '
+                                 'time is enough to select a scene — in/out pairs are optional. '
+                                 'Lines without any timecode are ignored.'), 400
+    elif (request.form.get('script_file_network') or '').strip():
+        return jsonify(error=_script_src_err or 'Could not load the library script.'), 400
+    elif manual_cues_json:
+        text, err = manual_cues_to_script_text(manual_cues_json)
+        if err:
+            return jsonify(error=err), 400
+        script_cues = parse_script_cues(
+            text,
+            segment_offsets=(None if available_materials is not None else segment_offsets),
+            available_materials=available_materials,
+        )
+        if not script_cues:
+            return jsonify(error='Those manual timecodes did not resolve to any usable scene '
+                                 'selections — check that each entry\'s material is one that was '
+                                 'actually loaded.'), 400
+
+    transition = request.form.get('transition', 'fade')
+    transition_matte_path = None
+    if genre in GENRE_PRESETS:
+        preset = GENRE_PRESETS[genre]
+        transition = preset['transition']
+        xfade_dur = preset['xfade_dur']
+        if scoring_mode not in ('upload', 'generate'):
+            scoring_mode = 'generate'
+    else:
+        if transition not in VALID_TRANSITIONS:
+            transition = 'fade'
+        xfade_dur = float(request.form.get('xfade_dur', 0.3))
+        xfade_dur = max(0.1, min(2.0, xfade_dur))
+        if transition == 'custom_matte':
+            # Same media-upload policy as everywhere else -- a matte is a video
+            # file handed to ffmpeg like any other. See ALLOW_LOCAL_MEDIA_UPLOAD.
+            if (ALLOW_LOCAL_MEDIA_UPLOAD and 'transition_matte' in request.files
+                    and request.files['transition_matte'].filename):
+                f = request.files['transition_matte']
+                fn = secure_filename(f.filename)
+                if fn:
+                    transition_matte_path = os.path.join(
+                        app.config['UPLOAD_FOLDER'], f'transmatte_{int(time.time())}{os.path.splitext(fn)[1]}')
+                    f.save(transition_matte_path)
+            if not transition_matte_path:
+                # Selected "Custom" but didn't upload anything — fall back rather
+                # than fail the whole job over a missing optional asset.
+                transition = 'fade'
+    def _prod_float(field):
+        raw = request.form.get(field)
+        if raw is None or raw == '':
+            return float(_prod[field])
+        try:
+            return float(raw)
+        except ValueError:
+            return float(_prod[field])
+    target_loudness = _prod_float('target_loudness')
+    true_peak = _prod_float('true_peak')
+    music_duck_db = _prod_float('music_duck_db')
+    duck_depth_db = _prod_float('duck_depth_db')
+    duck_release_hold = _prod_float('duck_release_hold')
+    beat_match = request.form.get('beat_match') == 'on'
+    # A checkbox that isn't rendered at all sends nothing, which is
+    # indistinguishable from "rendered and unticked" -- so this can't use the
+    # usual == 'on' check alone without silently forcing the configured
+    # default off for every job the moment the field left the form. Presence
+    # of the companion hidden marker tells the two apart.
+    if request.form.get('broadcast_stereo_present') == '1':
+        broadcast_stereo = request.form.get('broadcast_stereo') == 'on'
+    else:
+        broadcast_stereo = bool(_prod['broadcast_stereo'])
+    model = request.form.get('model') or _prod['vision_model']
+
+    # SFX source selection: 'genre' (AI-generate/synth from the genre preset),
+    # 'upload' (stamp a user-supplied one-shot at every cut), or 'none'.
+    default_sfx_mode = 'genre' if (genre in GENRE_PRESETS and GENRE_PRESETS[genre].get('sfx')) else 'none'
+    sfx_mode = request.form.get('sfx_mode', default_sfx_mode)
+    if sfx_mode not in ('genre', 'upload', 'none'):
+        sfx_mode = 'none'
+    sfx_upload_path = None
+    if sfx_mode == 'upload':
+        sfx_upload_path = _resolve_upload('sfx_upload', AUDIO_EXTENSIONS)
+    if sfx_mode == 'upload' and not sfx_upload_path:
+        sfx_mode = 'none'  # nothing usable was uploaded, don't silently fall back to genre SFX
+    # Same in/out parsing as the title/end card VO fields (_parse_card_vo,
+    # defined further down) -- inlined here rather than sharing that helper
+    # since it also re-resolves its own file upload, which sfx_upload_path
+    # already did just above.
+    try:
+        sfx_upload_trim_start = max(0.0, float(request.form.get('sfx_upload_trim_start', 0) or 0))
+    except ValueError:
+        sfx_upload_trim_start = 0.0
+    _sfx_trim_end_raw = request.form.get('sfx_upload_trim_end', '').strip()
+    try:
+        sfx_upload_trim_end = float(_sfx_trim_end_raw) if _sfx_trim_end_raw else None
+    except ValueError:
+        sfx_upload_trim_end = None
+    if sfx_upload_trim_end is not None and sfx_upload_trim_end <= sfx_upload_trim_start:
+        sfx_upload_trim_end = None
+
+
+    # Voiceover: 'none' (skip), 'upload' (use a supplied VO track as-is), or
+    # 'tts' (generate from typed text via a local TTS engine). Whichever
+    # source, music/SFX/original audio get ducked underneath it, same as
+    # scoring audio ducks under the original dialogue.
+    vo_mode = request.form.get('vo_mode', 'none')
+    if vo_mode not in ('none', 'upload', 'tts'):
+        vo_mode = 'none'
+    vo_upload_path = None
+    vo_upload_orig_name = None
+    if vo_mode == 'upload':
+        vo_upload_path = _resolve_upload('vo_upload', AUDIO_EXTENSIONS)
+        if vo_upload_path:
+            vo_upload_orig_name = _upload_orig_name('vo_upload')
+    if vo_mode == 'upload' and not vo_upload_path:
+        vo_mode = 'none'
+    vo_text = request.form.get('vo_text', '').strip()
+    if vo_mode == 'tts' and not vo_text:
+        vo_mode = 'none'
+    vo_voice = request.form.get('vo_voice', '').strip() or None
+    vo_language = request.form.get('vo_language', '').strip() or None
+    vo_engine = request.form.get('vo_engine', 'fish_audio').strip()
+    if vo_engine != 'fish_audio':
+        vo_engine = 'fish_audio'
+    vo_ref_upload_path = None
+    # A voice-clone reference is audio handed to ffmpeg/Fish Audio -- same
+    # policy as every other media upload. See ALLOW_LOCAL_MEDIA_UPLOAD.
+    if (ALLOW_LOCAL_MEDIA_UPLOAD and vo_mode == 'tts'
+            and 'vo_ref_upload' in request.files and request.files['vo_ref_upload'].filename):
+        f = request.files['vo_ref_upload']
+        fn = secure_filename(f.filename)
+        if fn:
+            vo_ref_upload_path = os.path.join(app.config['UPLOAD_FOLDER'], f'vorefsrc_{int(time.time())}{os.path.splitext(fn)[1]}')
+            f.save(vo_ref_upload_path)
+            vo_voice = None  # an uploaded reference clone takes priority over a picked registered voice
+    try:
+        vo_rate = int(request.form.get('vo_rate', 175))
+    except ValueError:
+        vo_rate = 175
+    try:
+        vo_start = max(0.0, float(request.form.get('vo_start', 0)))
+    except ValueError:
+        vo_start = 0.0
+    try:
+        vo_volume = max(0.3, min(3.0, float(request.form.get('vo_volume', 1.15))))
+    except ValueError:
+        vo_volume = 1.15
+    # Trim points *within the uploaded VO file itself* (which portion of that
+    # source clip to use) — distinct from vo_start above, which places the
+    # (already-trimmed) narration on the trailer's own timeline.
+    try:
+        vo_trim_start = max(0.0, float(request.form.get('vo_trim_start', 0) or 0))
+    except ValueError:
+        vo_trim_start = 0.0
+    vo_trim_end_raw = request.form.get('vo_trim_end', '').strip()
+    try:
+        vo_trim_end = float(vo_trim_end_raw) if vo_trim_end_raw else None
+    except ValueError:
+        vo_trim_end = None
+    if vo_trim_end is not None and vo_trim_end <= vo_trim_start:
+        vo_trim_end = None
+    # More than one part of the recording: the in/out above plus the extra ranges, joined into one file.
+    if vo_mode == 'upload' and vo_upload_path:
+        vo_upload_path, vo_trim_start, vo_trim_end = _apply_extra_ranges(
+            vo_upload_path, vo_trim_start, vo_trim_end, request.form.get('vo_extra_ranges', ''), tag='vo')
+    # Cleaner edits (all on by default, each can be switched off):
+    #   cut_clean  settle every clip's in/out so it never lands inside a word
+    #   card_fit   fit the title/end cards to the plug length
+    #   vo_smart   cut and place the uploaded narration at the script's own points
+    cut_clean = request.form.get('cut_clean', 'on') != 'off'
+    card_fit = 'off' if request.form.get('card_fit', 'fit') == 'off' else 'fit'
+    vo_smart = request.form.get('vo_smart', 'on') != 'off'
+    try:
+        vo_jcut = min(1.5, max(0.0, float(request.form.get('vo_jcut', 0) or 0)))     # J-cut: a line may lead its picture
+    except ValueError:
+        vo_jcut = 0.0
+
+    # Same idea, for the uploaded background music track: which portion of
+    # that source file to actually use, rather than always starting from
+    # its own beginning (the only option before this).
+    try:
+        scoring_audio_trim_start = max(0.0, float(request.form.get('scoring_audio_trim_start', 0) or 0))
+    except ValueError:
+        scoring_audio_trim_start = 0.0
+    scoring_audio_trim_end_raw = request.form.get('scoring_audio_trim_end', '').strip()
+    try:
+        scoring_audio_trim_end = float(scoring_audio_trim_end_raw) if scoring_audio_trim_end_raw else None
+    except ValueError:
+        scoring_audio_trim_end = None
+    if scoring_audio_trim_end is not None and scoring_audio_trim_end <= scoring_audio_trim_start:
+        scoring_audio_trim_end = None
+
+    # Sync cuts to the beat of the background music (only meaningful when a
+    # music track is actually used). Requires prepping the BGM before scene
+    # selection instead of after, so cut points can be nudged onto beats.
+    sync_beats = request.form.get('sync_beats') == 'on' and scoring_mode != 'none'
+    selection_driver = (request.form.get('selection_driver') or 'score').strip().lower()
+    if selection_driver not in ('score', 'vo'):
+        selection_driver = 'score'
+    # VO-led needs a script; falls back gracefully later in the job if there isn't one.
+    whisper_enhance = mode_includes_stt
+
+    end_card_path = None
+    schedule_card_path = None
+    scoring_audio_path = None
+    scoring_audio_orig_name = None
+    if scoring_mode == 'upload':
+        scoring_audio_path = _resolve_upload('scoring_audio', AUDIO_EXTENSIONS)
+        if scoring_audio_path:
+            scoring_audio_orig_name = _upload_orig_name('scoring_audio')
+    if scoring_mode == 'generate':
+        scoring_audio_path = 'GENERATE'  # flag to generate ambient
+    end_card_path = _resolve_upload('end_card_video', ALLOWED_EXTENSIONS)
+    end_card_orig_name = _upload_orig_name('end_card_video') if end_card_path else None
+    schedule_card_path = _resolve_upload('schedule_video', ALLOWED_EXTENSIONS)
+    schedule_card_orig_name = _upload_orig_name('schedule_video') if schedule_card_path else None
+
+    # Optional VO tracks for the title card ("end_card_video" field, despite the
+    # name) and end card ("schedule_video" field) — each can have its own
+    # uploaded narration audio, muxed on in place of whatever audio the card
+    # video already has, trimmed to a chosen [start, end) window of the source file.
+    def _parse_trim_pair(start_key, end_key):
+        try:
+            start = max(0.0, float(request.form.get(start_key, 0) or 0))
+        except ValueError:
+            start = 0.0
+        end_raw = request.form.get(end_key, '').strip()
+        try:
+            end = float(end_raw) if end_raw else None
+        except ValueError:
+            end = None
+        if end is not None and end <= start:
+            end = None
+        return start, end
+
+    def _parse_card_vo(file_key, start_key, end_key):
+        path = _resolve_upload(file_key, AUDIO_EXTENSIONS)
+        start, end = _parse_trim_pair(start_key, end_key)
+        return path, start, end
+
+    title_card_vo_path, title_card_vo_start, title_card_vo_end = _parse_card_vo(
+        'title_card_vo', 'title_card_vo_start', 'title_card_vo_end')
+    end_card_vo_path, end_card_vo_start, end_card_vo_end = _parse_card_vo(
+        'end_card_vo', 'end_card_vo_start', 'end_card_vo_end')
+    title_card_vo_path, title_card_vo_start, title_card_vo_end = _apply_extra_ranges(
+        title_card_vo_path, title_card_vo_start, title_card_vo_end, request.form.get('title_card_vo_extra_ranges', ''), tag='tcvo')
+    end_card_vo_path, end_card_vo_start, end_card_vo_end = _apply_extra_ranges(
+        end_card_vo_path, end_card_vo_start, end_card_vo_end, request.form.get('end_card_vo_extra_ranges', ''), tag='ecvo')
+    # The card VIDEO files' own in/out (as opposed to their VO's, just above)
+    # -- end_card_path/schedule_card_path are already resolved further up,
+    # so this only needs the trim pair, not another file resolution.
+    end_card_video_start, end_card_video_end = _parse_trim_pair(
+        'end_card_video_trim_start', 'end_card_video_trim_end')
+    schedule_video_start, schedule_video_end = _parse_trim_pair(
+        'schedule_video_trim_start', 'schedule_video_trim_end')
+
+    # ---- Show template fill-in ----
+    # A template IS the configuration for a programme: its genre, transition,
+    # lengths, audio targets and voice choice, plus its music bed, SFX, VO and
+    # cards. It is NOT an alternative to picking a genre -- genre is one of the
+    # fields a template carries. Selecting a show therefore fills in everything
+    # the request didn't specify, and nothing is mutually exclusive.
+    #
+    # Anything explicitly sent always wins: a template is a set of defaults, so a
+    # one-off replacement bed or a different transition for a single episode works
+    # without editing the show.
+    #
+    # In the browser the form is populated client-side the moment a show is
+    # picked, so the request already carries these values and this block mostly
+    # no-ops. It matters for API callers that just name a template.
+    template_applied = None
+    _tpl_pending = {}
+    _tid_raw = (request.form.get('template_id') or '').strip()
+    if _tid_raw.isdigit():
+        tpl = template_get(int(_tid_raw))
+        if tpl:
+            filled = []
+            tpl_settings = template_settings(tpl)
+
+            def _tpl_number(current, key, default):
+                """Uses the template's stored value only where the form left the
+                field at its default -- an explicit form value always wins."""
+                stored = tpl.get(key)
+                return stored if (stored is not None and current == default) else current
+
+            # Genre: only from the template if the request didn't name one. When it
+            # does supply one, the genre preset block above has already applied that
+            # genre's transition and xfade.
+            if not genre:
+                tpl_genre = tpl.get('genre') or tpl_settings.get('genre')
+                if tpl_genre in GENRE_PRESETS:
+                    genre = tpl_genre
+                    preset = GENRE_PRESETS[genre]
+                    if 'transition' not in request.form:
+                        transition = preset['transition']
+                    if 'xfade_dur' not in request.form:
+                        xfade_dur = preset['xfade_dur']
+                    filled.append('genre')
+
+            # Transition/crossfade stored on the template win over a genre preset
+            # only when the request named neither -- an explicit choice always wins.
+            if 'transition' not in request.form and 'genre' not in request.form:
+                if tpl.get('transition') in VALID_TRANSITIONS and tpl['transition'] != 'custom_matte':
+                    transition = tpl['transition']
+                    filled.append('transition')
+                if tpl.get('xfade_dur') and 'xfade_dur' not in request.form:
+                    xfade_dur = max(0.1, min(2.0, float(tpl['xfade_dur'])))
+
+            # For the three mode-driven slots, an explicitly chosen mode is always
+            # respected -- picking "None" for music means none, even if the show's
+            # template has a bed. A slot is only filled when the mode field was
+            # absent entirely (a bare API call that just names a template) or when
+            # it says "upload" but no file actually came with it (the UI's state
+            # after selecting a template).
+            def _wants_template(mode_field, current_mode, have_file):
+                # A real file always wins, full stop -- this used to be checked
+                # only in the second branch below, so a bare API call that
+                # attached a genuine file but omitted the mode field (a browser
+                # form always sends it; a script easily might not) hit the first
+                # branch instead and had its upload silently overwritten by the
+                # template's asset.
+                if have_file:
+                    return False
+                # Mode field absent entirely -> nothing was actually chosen (the
+                # value in hand is just this function's own default), so the
+                # template decides. This is what makes a bare API call that only
+                # names a template work.
+                if mode_field not in request.form:
+                    return True
+                # Otherwise only an explicit "upload" with nothing attached
+                # defers -- which is exactly the state the UI is in after picking
+                # a template, and is also how a deliberate None/Generate/TTS
+                # choice gets respected.
+                return current_mode == 'upload'
+
+            def _skip_tpl(field):
+                # Set by the UI when the user clicks the X on a template-sourced
+                # chip, or touches that upload control at all -- an explicit
+                # opt-out for this one job, distinct from the field simply being
+                # empty (which still defers to the template).
+                return request.form.get(f'{field}_skip_template') == '1'
+
+            # Background music. Note scoring_audio_path is the sentinel 'GENERATE'
+            # (not a path) when synthesis was selected, hence the explicit compare.
+            if not _skip_tpl('scoring_audio') and _wants_template(
+                    'scoring_mode', scoring_mode, scoring_audio_path not in (None, 'GENERATE')):
+                staged = template_stage_asset(tpl, 'bgm')
+                if staged:
+                    scoring_audio_path, scoring_mode = staged, 'upload'
+                    filled.append('bgm')
+
+            # SFX one-shot ('genre' mode is an explicit choice; leave it alone).
+            if not _skip_tpl('sfx_upload') and sfx_mode != 'genre' and _wants_template(
+                    'sfx_mode', sfx_mode, bool(sfx_upload_path)):
+                staged = template_stage_asset(tpl, 'sfx')
+                if staged:
+                    sfx_upload_path, sfx_mode = staged, 'upload'
+                    filled.append('sfx')
+
+            # Voiceover ('tts' is an explicit choice; leave it alone).
+            if not _skip_tpl('vo_upload') and vo_mode != 'tts' and _wants_template(
+                    'vo_mode', vo_mode, bool(vo_upload_path)):
+                staged = template_stage_asset(tpl, 'vo')
+                if staged:
+                    vo_upload_path, vo_mode = staged, 'upload'
+                    filled.append('vo')
+                    vo_start = _tpl_number(vo_start, 'vo_start', 0.0)
+                    vo_volume = _tpl_number(vo_volume, 'vo_volume', 1.15)
+                    vo_trim_start = _tpl_number(vo_trim_start, 'vo_trim_start', 0.0)
+                    vo_trim_end = _tpl_number(vo_trim_end, 'vo_trim_end', None)
+                    if vo_trim_end is not None and vo_trim_end <= vo_trim_start:
+                        vo_trim_end = None
+
+            if not end_card_path and not _skip_tpl('end_card_video'):
+                staged = template_stage_asset(tpl, 'title_card')
+                if staged:
+                    end_card_path = staged
+                    filled.append('title_card')
+            if not schedule_card_path and not _skip_tpl('schedule_video'):
+                staged = template_stage_asset(tpl, 'end_card')
+                if staged:
+                    schedule_card_path = staged
+                    filled.append('end_card')
+
+            if not title_card_vo_path and not _skip_tpl('title_card_vo'):
+                staged = template_stage_asset(tpl, 'title_card_vo')
+                if staged:
+                    title_card_vo_path = staged
+                    filled.append('title_card_vo')
+                    title_card_vo_start = _tpl_number(title_card_vo_start, 'title_card_vo_start', 0.0)
+                    title_card_vo_end = _tpl_number(title_card_vo_end, 'title_card_vo_end', None)
+                    if title_card_vo_end is not None and title_card_vo_end <= title_card_vo_start:
+                        title_card_vo_end = None
+            if not end_card_vo_path and not _skip_tpl('end_card_vo'):
+                staged = template_stage_asset(tpl, 'end_card_vo')
+                if staged:
+                    end_card_vo_path = staged
+                    filled.append('end_card_vo')
+                    end_card_vo_start = _tpl_number(end_card_vo_start, 'end_card_vo_start', 0.0)
+                    end_card_vo_end = _tpl_number(end_card_vo_end, 'end_card_vo_end', None)
+                    if end_card_vo_end is not None and end_card_vo_end <= end_card_vo_start:
+                        end_card_vo_end = None
+
+            # Remaining scalar settings (lengths, thresholds, loudness targets,
+            # voice choice...) are applied to the params dict below, once it
+            # exists -- only for keys the request didn't send at all. A browser
+            # POST carries every form field, so this is a no-op there; it matters
+            # for an API call that just names a template.
+            _tpl_pending = {k: v for k, v in tpl_settings.items()
+                            if k not in request.form
+                            and k not in ('genre', 'transition', 'xfade_dur')}
+
+            template_applied = {'id': tpl['id'], 'name': tpl['name'], 'filled': filled}
+
+    prompt = request.form.get('prompt',
+        'Rate this frame 1-5 as a shot for a promo trailer, and describe what is '
+        'actually visible in one short sentence (8-14 words): who or what is in '
+        'shot, what they are doing, and where. Be concrete and literal. Do not use '
+        'vague words like "cinematic", "dramatic" or "engaging".\n'
+        'Answer with a single JSON object and nothing else: '
+        '{"score": <1-5>, "desc": "<sentence>"}')
+
+    jid = job_new(user_id=session.get('user_id'), username=session.get('username'))
+    job_set_orig_name(jid, orig_name)
+    # If discrete materials were staged, use the first as primary path for
+    # display / legacy single-source helpers; all materials go on the job.
+    if materials_paths:
+        path = materials_paths[0]
+        if not orig_name:
+            orig_name = os.path.basename(path)
+    params = dict(path=path, orig_name=orig_name, mode=mode, genre=genre, scoring_mode=scoring_mode,
+                  materials_paths=materials_paths or None,
+                  # Captured here (inside the request, where `session` exists) rather
+                  # than inside the background thread that actually renders --
+                  # threads don't have a Flask session/request context at all, so
+                  # this is the only place ownership can be read from the login.
+                  user_id=session.get('user_id'), username=session.get('username'),
+                  trailer_length=trailer_length, max_scene_dur=max_scene_dur,
+                  delivery_format=delivery_format,
+                  scene_threshold=scene_threshold, min_scene_len_sec=min_scene_len_sec,
+                  detector=detector, adaptive_threshold=adaptive_threshold,
+                  priority_prompt=priority_prompt,
+                  negative_prompt=negative_prompt,
+                  script_cues=script_cues, script_brief=script_brief,
+                  transition=transition, xfade_dur=xfade_dur, transition_matte_path=transition_matte_path,
+                  target_loudness=target_loudness, true_peak=true_peak, music_duck_db=music_duck_db, duck_depth_db=duck_depth_db, duck_release_hold=duck_release_hold, beat_match=beat_match, broadcast_stereo=broadcast_stereo, model=model,
+                  sfx_mode=sfx_mode, sfx_upload_path=sfx_upload_path,
+                  sfx_upload_trim_start=sfx_upload_trim_start, sfx_upload_trim_end=sfx_upload_trim_end,
+                  vo_mode=vo_mode, vo_upload_path=vo_upload_path, vo_upload_orig_name=vo_upload_orig_name,
+                  vo_text=vo_text, vo_voice=vo_voice,
+                  vo_language=vo_language, vo_engine=vo_engine, vo_ref_upload_path=vo_ref_upload_path,
+                  vo_rate=vo_rate, vo_start=vo_start, vo_volume=vo_volume, sync_beats=sync_beats, whisper_enhance=whisper_enhance,
+                  selection_driver=selection_driver,
+                  vo_trim_start=vo_trim_start, vo_trim_end=vo_trim_end,
+                  cut_clean=cut_clean, card_fit=card_fit, vo_smart=vo_smart, vo_jcut=vo_jcut,
+                  scoring_audio_trim_start=scoring_audio_trim_start, scoring_audio_trim_end=scoring_audio_trim_end,
+                  end_card_path=end_card_path, end_card_orig_name=end_card_orig_name,
+                  end_card_video_start=end_card_video_start, end_card_video_end=end_card_video_end,
+                  schedule_card_path=schedule_card_path, schedule_card_orig_name=schedule_card_orig_name,
+                  schedule_video_start=schedule_video_start, schedule_video_end=schedule_video_end,
+                  title_card_vo_path=title_card_vo_path, title_card_vo_start=title_card_vo_start, title_card_vo_end=title_card_vo_end,
+                  end_card_vo_path=end_card_vo_path, end_card_vo_start=end_card_vo_start, end_card_vo_end=end_card_vo_end,
+                  card_vo_tighten=(request.form.get('card_vo_tighten', '1').strip().lower() not in ('0', 'false', 'off', 'no')),
+                  scoring_audio_path=scoring_audio_path, scoring_audio_orig_name=scoring_audio_orig_name,
+                  prompt=prompt,
+                  template_applied=template_applied,
+                  # Stop after scene selection and hand back a reviewable cut
+                  # instead of rendering. See the preview block in _run_trailer_job.
+                  preview_only=request.form.get('preview_only') in ('1', 'true', 'on'))
+
+    # Overlay the template's saved configuration for anything the request left
+    # out, coercing each stored string back to the type the param already holds.
+    if _tpl_pending:
+        for _k, _raw in _tpl_pending.items():
+            if _k not in params:
+                continue
+            _cur = params[_k]
+            try:
+                if isinstance(_cur, bool):
+                    _val = str(_raw).lower() in ('1', 'true', 'on', 'yes')
+                elif isinstance(_cur, int) and not isinstance(_cur, bool):
+                    _val = int(float(_raw))
+                elif isinstance(_cur, float):
+                    _val = float(_raw)
+                else:
+                    _val = _raw
+            except (TypeError, ValueError):
+                continue
+            params[_k] = _val
+            if template_applied:
+                template_applied['filled'].append(_k)
+
+    threading.Thread(target=run_trailer_job_gated, args=(jid, params), daemon=True).start()
+    return jsonify(job_id=jid)
+
+@app.route('/api/trailer/progress/<job_id>')
+@require_permission('promo_generation')
+def api_trailer_progress(job_id):
+    j = job_get(job_id)
+    if not j:
+        return jsonify(error='Unknown job id'), 404
+    if not _owns_or_admin(j.get('user_id')):
+        return jsonify(error='That job belongs to a different account.'), 403
+    created = j.pop('created', None)
+    # Elapsed lets the UI show a running clock; the old response had no notion of
+    # time at all, so a slow stage was indistinguishable from a hung one.
+    if created:
+        j['elapsed'] = round(time.time() - created, 1)
+    j['stages'] = [{'percent': p, 'label': lbl} for p, lbl in PIPELINE_STAGES]
+    return jsonify(**j)
+
+@app.route('/api/trailer/preview/<preview_id>')
+@require_permission('promo_generation')
+def api_trailer_preview_get(preview_id):
+    """Re-read a stored preview (thumbnails + chosen cut) without re-analysing."""
+    p = preview_get(preview_id)
+    if not p:
+        return jsonify(ok=False, error='That preview has expired. Run the analysis again.'), 404
+    if not _owns_or_admin(p.get('params', {}).get('user_id')):
+        return jsonify(ok=False, error='That preview belongs to a different account.'), 403
+    def _why(s):
+        reasons = []
+        if s.get('vo_beat'):
+            beat_txt = (s.get('vo_beat') or '')[:80]
+            match_txt = (f" (match {s.get('vo_match'):.0%})" if s.get('vo_match') is not None else '')
+            reasons.append(f'VO beat: "{beat_txt}"{match_txt}')
+        if s.get('script_boost'):
+            desc_txt = (s.get('script_desc') or 'matched timecode')[:80]
+            reasons.append(f'Script cue (+{float(s.get("script_boost") or 0):.1f}): "{desc_txt}"')
+        if s.get('vision_score'):
+            reasons.append(f"AI vision {s.get('vision_score')}")
+        if s.get('has_face'):
+            reasons.append('face present')
+        if not reasons:
+            reasons.append(f"score {s.get('total_score', 0):.1f}")
+        return reasons
+
+    return jsonify(ok=True, preview_id=preview_id, total_scenes=p['total_scenes'],
+                   video_filename=os.path.basename(p['params']['path']),
+                   selection=p.get('selection'),
+                   scenes=[{'scene': i + 1, 'start': round(s['start'], 1),
+                            'end': round(s['end'], 1), 'quality': s['total_score'],
+                            'duration': round(s['selected_dur'], 1),
+                            'vo_beat': s.get('vo_beat'), 'vo_match': s.get('vo_match'),
+                            'script_boost': round(s.get('script_boost') or 0, 2) or None,
+                            'script_desc': s.get('script_desc') or None,
+                            'material': s.get('material'),
+                            'why': _why(s),
+                            'description': _scene_desc(s), 'thumb': p['thumbs'][i]}
+                           for i, s in enumerate(p['selected'])],
+                   alternates=[{'alt': i + 1, 'start': round(s['start'], 1),
+                                'end': round(s['end'], 1), 'quality': s['total_score'],
+                                'duration': round(s['selected_dur'], 1),
+                                'script_boost': round(s.get('script_boost') or 0, 2) or None,
+                                'script_desc': s.get('script_desc') or None,
+                                'material': s.get('material'),
+                                'description': _scene_desc(s), 'thumb': (p.get('alt_thumbs') or [None]*99)[i]}
+                               for i, s in enumerate(p.get('alternates') or [])])
+
+def _rebalance_selected_durations(selected, target_duration, min_seg_dur=0.8):
+    """Redistributes each scene's selected_dur (in place, on copies) so the
+    total again matches target_duration, after the preview's original
+    selection has been edited (scenes dropped and/or alternates added).
+
+    Real, reported bug this fixes: dropping or adding a clip in "Preview the
+    cut" left every remaining scene's selected_dur exactly as the original
+    preview computed it -- correct for THAT selection, but wrong the moment
+    it changed, since removing a 3s clip leaves the total 3s short of the
+    target with nothing making up the difference, and adding an alternate
+    (sized independently, for a different remaining-budget context than the
+    one it's now landing in) can just as easily push the total over.
+
+    Scales every scene's selected_dur by the same factor first (proportional,
+    not "dump the whole gap on the last clip"), then clamps each to what
+    that scene can actually supply: at least min_seg_dur, at most the real
+    footage remaining from its own trim_start to its own end
+    (start + duration). Clamped scenes stop absorbing more than one pass
+    can fix in a single shot -- e.g. a short clip already near its floor
+    can't shrink much further even if the target needs it to -- so this
+    repeats a few times, redistributing only the leftover gap across
+    scenes that still have room, rather than assuming one linear scale
+    gets every scene to a valid value in one step.
+
+    Returns a new list (the input is not mutated) with the same scenes in
+    the same order, only selected_dur changed. If selected is empty, or the
+    current total is already within half a second of target_duration (the
+    same tolerance the original selection pass itself uses for "close
+    enough"), the scenes are returned unchanged."""
+    if not selected:
+        return selected
+    scenes = [dict(s) for s in selected]
+    current_total = sum(s['selected_dur'] for s in scenes)
+    if current_total <= 0 or abs(current_total - target_duration) <= 0.5:
+        return scenes
+
+    bounds = []
+    for s in scenes:
+        max_avail = max(min_seg_dur, (s['start'] + s['duration']) - s.get('trim_start', s['start']))
+        bounds.append((min_seg_dur, max_avail))
+
+    for _ in range(6):
+        current_total = sum(s['selected_dur'] for s in scenes)
+        gap = target_duration - current_total
+        if abs(gap) <= 0.15:
+            break
+        # Only scenes with real room to move (not already sitting on the
+        # bound we'd be pushing them toward) absorb this pass's share of
+        # the gap -- otherwise a clip already at its floor/ceiling would
+        # get asked for more room it doesn't have, over and over, without
+        # the remaining gap ever reaching a scene that could actually supply it.
+        movable = [
+            i for i, s in enumerate(scenes)
+            if (gap > 0 and s['selected_dur'] < bounds[i][1] - 1e-6)
+            or (gap < 0 and s['selected_dur'] > bounds[i][0] + 1e-6)
+        ]
+        if not movable:
+            break
+        movable_total = sum(scenes[i]['selected_dur'] for i in movable)
+        if movable_total <= 0:
+            break
+        for i in movable:
+            share = scenes[i]['selected_dur'] / movable_total
+            lo, hi = bounds[i]
+            scenes[i]['selected_dur'] = max(lo, min(hi, scenes[i]['selected_dur'] + gap * share))
+    return scenes
+
+def _autofill_short_selection_from_alternates(selected, alternates, already_used_alt_numbers, target_duration, min_gap=1.0):
+    """When rebalancing alone still leaves the total meaningfully short of
+    target_duration -- the case _rebalance_selected_durations can't fully
+    fix on its own, because every remaining scene is already using all the
+    footage it actually has (a short, fully-used scene has no slack to
+    stretch into) -- pulls in additional, not-already-used alternates from
+    the same preview's own runner-up pool to make up the difference,
+    highest-scoring first, the same ordering the original selection itself
+    would have preferred them in.
+
+    A candidate is skipped if it overlaps or sits too close (min_gap) to
+    any already-selected scene's own start time in the source timeline --
+    the same kind of spacing the original selection enforces, so this
+    doesn't reintroduce a near-duplicate clip right next to one already
+    picked. Returns a new list (rebalancing afterward, to fit the newly
+    added scene(s) precisely, is the caller's job -- this only decides
+    which scenes to add)."""
+    current_total = sum(s['selected_dur'] for s in selected)
+    shortfall = target_duration - current_total
+    if shortfall <= 1.0:
+        return list(selected)
+    candidates = [
+        (i, alt) for i, alt in enumerate(alternates, start=1)
+        if i not in already_used_alt_numbers
+    ]
+    candidates.sort(key=lambda pair: pair[1].get('total_score', 0), reverse=True)
+    result = list(selected)
+    for _, alt in candidates:
+        if shortfall <= 0.5:
+            break
+        # Scoped to the same material only -- see the identical fix and its
+        # full explanation at the main selection loop's own min_gap check
+        # in _run_trailer_job for why an unscoped comparison across
+        # different materials' own local timelines is wrong.
+        if any(abs(alt['start'] - s['start']) < min_gap and alt.get('material') == s.get('material')
+               for s in result):
+            continue
+        result.append(alt)
+        shortfall -= alt['selected_dur']
+    # Sorted by (material, start), not start alone -- the same fix, for the
+    # same reason, as every other cross-material comparison in this file:
+    # two different materials' own local timelines can share numerically
+    # close or identical start times without being anywhere near each
+    # other in the actual source video.
+    result.sort(key=lambda s: (s.get('material') or 0, s['start']))
+    return result
+
+@app.route('/api/trailer/render', methods=['POST'])
+@require_permission('promo_generation')
+def api_trailer_render():
+    """Render an approved preview cut. Reuses the preview's stored selection, so
+    detection / quality scoring / AI vision scoring are not repeated.
+
+    Optional `drop` is a JSON array of 1-based scene numbers (as shown in the
+    preview) to leave out — the cheap way to fix a cut without re-running
+    anything."""
+    pid = (request.form.get('preview_id') or '').strip()
+    p = preview_get(pid)
+    if not p:
+        return jsonify(error='That preview has expired or was never created. Run the analysis again.'), 404
+    if not _owns_or_admin(p.get('params', {}).get('user_id')):
+        return jsonify(error='That preview belongs to a different account.'), 403
+
+    selected = p['selected']
+    raw_drop = (request.form.get('drop') or '').strip()
+    drop = set()
+    if raw_drop:
+        try:
+            drop = {int(x) for x in json.loads(raw_drop)}
+        except (ValueError, TypeError):
+            return jsonify(error='`drop` must be a JSON array of scene numbers, e.g. [2,5].'), 400
+        selected = [s for i, s in enumerate(selected) if (i + 1) not in drop]
+
+    # `add` pulls in runner-up scenes the preview offered but didn't pick. Merged
+    # back in timeline order so a swapped-in clip lands where it belongs rather
+    # than at the end of the trailer.
+    raw_add = (request.form.get('add') or '').strip()
+    added = set()
+    if raw_add:
+        try:
+            added = {int(x) for x in json.loads(raw_add)}
+        except (ValueError, TypeError):
+            return jsonify(error='`add` must be a JSON array of alternate numbers, e.g. [1,3].'), 400
+        alts = p.get('alternates') or []
+        bad = [n for n in added if not (1 <= n <= len(alts))]
+        if bad:
+            return jsonify(error=f'No alternate numbered {bad[0]} in this preview.'), 400
+        selected = selected + [alts[n - 1] for n in sorted(added)]
+        # (material, start), not start alone -- see the identical fix and
+        # its full explanation elsewhere in this file for cross-material
+        # ordering.
+        selected.sort(key=lambda s: (s.get('material') or 0, s['start']))
+
+    if not selected:
+        return jsonify(error='You dropped every scene — keep at least one, or add an alternate.'), 400
+
+    # Dropping and/or adding scenes above changes the total duration away
+    # from what the original preview analysis computed -- rebalance so the
+    # render still lands on the target length instead of silently drifting
+    # over or under it by however much the edited clip(s) were worth. Only
+    # actually adjusts anything when drop/add were used at all AND the
+    # resulting total has drifted (see the function's own tolerance) --
+    # an unedited "render exactly what I previewed" still renders exactly
+    # that, unchanged.
+    if drop or added:
+        target = p['params'].get('trailer_length', 15)
+        selected = _rebalance_selected_durations(selected, target)
+        # Rebalancing alone can't close every gap: a short scene that's
+        # already using all the footage it has simply has nothing left to
+        # stretch into. When that leaves a real shortfall, pull in more of
+        # the same preview's own runner-up alternates (not already used)
+        # rather than shipping a render that's still short -- then
+        # rebalance once more so the newly-added scene(s) fit precisely
+        # rather than just being appended at their own original length.
+        selected = _autofill_short_selection_from_alternates(
+            selected, p.get('alternates') or [], added, target)
+        selected = _rebalance_selected_durations(selected, target)
+
+    params = dict(p['params'])
+    if drop or added:
+        params.pop('vo_plan', None)          # lines were placed by the clips as previewed: place them again
+    params['preview_only'] = False
+    params['preselected'] = selected
+    params['preview_total_scenes'] = p['total_scenes']
+    # Re-stamped to the current session rather than left as whoever ran the
+    # original preview -- normally the same person, but this is what actually
+    # governs the resulting library entry's ownership, so it should reflect
+    # who is triggering this render right now.
+    params['user_id'] = session.get('user_id')
+    params['username'] = session.get('username')
+    if not (params.get('path') and os.path.exists(params['path'])):
+        return jsonify(error='The source video for this preview is no longer on disk '
+                             '(it may have been cleaned up). Re-upload and analyse again.'), 410
+
+    jid = job_new(user_id=session.get('user_id'), username=session.get('username'))
+    threading.Thread(target=run_trailer_job_gated, args=(jid, params), daemon=True).start()
+    return jsonify(job_id=jid, dropped=sorted(drop), added=sorted(added), scenes=len(selected))
+
+@app.route('/api/trailer/preview/<preview_id>/send-to-destination', methods=['POST'])
+@require_permission('promo_generation')
+def api_trailer_preview_send_to_destination(preview_id):
+    """Send to destination straight from the Proposed cut (preview) screen,
+    before Lock cut & render even runs. A csv/csv_video destination's whole
+    point is the ORIGINAL source video plus a CSV describing the reviewed
+    cut -- both already fully known right after Preview -- so requiring a
+    full render first (as the library-row-based /library/<tid>/send-to-
+    destination route does) just makes someone wait on a render whose own
+    output isn't even what gets sent. A plain "video" destination genuinely
+    does need the generated promo and is intentionally rejected here (see
+    the delivery_kind check below); it's still only offered from
+    renderTrailerResult once that promo actually exists.
+
+    Mirrors api_trailer_render's own drop/add handling against the same
+    stored preview selection, minus the target-length rebalancing (which
+    only matters for an actual render's pacing, not for a CSV listing
+    exactly the scenes a person chose to keep)."""
+    p = preview_get(preview_id)
+    if not p:
+        return jsonify(ok=False, error='That preview has expired. Run the analysis again.'), 404
+    if not _owns_or_admin(p.get('params', {}).get('user_id')):
+        return jsonify(ok=False, error='That preview belongs to a different account.'), 403
+
+    data = request.get_json(silent=True) or {}
+    destination_id = data.get('destination_id')
+    destination = network_destination_get(destination_id) if destination_id else None
+    if not destination:
+        return jsonify(ok=False, error='That destination no longer exists -- pick another.'), 400
+    if destination['delivery_kind'] not in ('csv', 'csv_video', 'fcpxml'):
+        return jsonify(ok=False, error="That destination sends the generated video, which isn't "
+                       "ready until after Lock cut & render."), 400
+
+    selected = p['selected']
+    try:
+        drop = {int(x) for x in (data.get('drop') or [])}
+        added = [int(x) for x in (data.get('add') or [])]
+    except (ValueError, TypeError):
+        return jsonify(ok=False, error='`drop`/`add` must be arrays of scene numbers.'), 400
+    if drop:
+        selected = [s for i, s in enumerate(selected) if (i + 1) not in drop]
+    if added:
+        alts = p.get('alternates') or []
+        bad = [n for n in added if not (1 <= n <= len(alts))]
+        if bad:
+            return jsonify(ok=False, error=f'No alternate numbered {bad[0]} in this preview.'), 400
+        selected = selected + [alts[n - 1] for n in sorted(added)]
+        selected.sort(key=lambda s: (s.get('material') or 0, s['start']))
+    if not selected:
+        return jsonify(ok=False, error='You dropped every scene -- keep at least one, or add an alternate.'), 400
+
+    scenes_payload = [{
+        'scene': i + 1, 'start': round(s['start'], 1), 'end': round(s['end'], 1),
+        'quality': s.get('total_score'),
+        'duration': round(s.get('selected_dur', s['end'] - s['start']), 1),
+        'description': _scene_desc(s),
+    } for i, s in enumerate(selected)]
+    # source_video_path/production_summary/fcpxml_materials are included so
+    # build_fcpxml_package works from this same fake row below (for an
+    # 'fcpxml' destination) -- best-effort from the preview's own params,
+    # the same fields _run_trailer_job persists onto a real result.
+    fake_result = {
+        'scenes': scenes_payload,
+        'orig_name': p['params'].get('orig_name'),
+        'source_video_path': p['params'].get('path'),
+        'production_summary': {'transition': p['params'].get('transition'), 'xfade_dur': p['params'].get('xfade_dur')},
+        'fcpxml_materials': dict(
+            music=(dict(path=p['params'].get('scoring_audio_path'),
+                        orig_name=p['params'].get('scoring_audio_orig_name'))
+                   if p['params'].get('scoring_audio_path') not in (None, 'GENERATE') else None),
+            vo=(dict(path=p['params'].get('vo_upload_path'), orig_name=p['params'].get('vo_upload_orig_name'))
+                if p['params'].get('vo_mode') == 'upload' and p['params'].get('vo_upload_path') else None),
+            card_title=(dict(path=p['params'].get('end_card_path'), orig_name=p['params'].get('end_card_orig_name'))
+                        if p['params'].get('end_card_path') else None),
+            card_end=(dict(path=p['params'].get('schedule_card_path'), orig_name=p['params'].get('schedule_card_orig_name'))
+                      if p['params'].get('schedule_card_path') else None),
+        ),
+    }
+    fake_row = {'filename': p['params'].get('orig_name') or 'source', 'orig_name': p['params'].get('orig_name'),
+                'result_json': json.dumps(fake_result)}
+
+    orig_name = p['params'].get('orig_name') or os.path.basename(p['params'].get('path') or 'source')
+    base_name = (data.get('filename') or '').strip() or os.path.splitext(orig_name)[0]
+    base_name = secure_filename(base_name) or 'source'
+    sent = []
+
+    if destination['delivery_kind'] in ('csv_video', 'fcpxml'):
+        source_path = p['params'].get('path')
+        if not source_path or not os.path.exists(source_path):
+            return jsonify(ok=False, error='The source video for this preview is no longer on disk '
+                           '(it may have been cleaned up) -- re-upload and analyse again, or use a '
+                           'CSV-only destination instead.'), 410
+        source_ext = os.path.splitext(source_path)[1].lstrip('.') or 'mp4'
+        remote_filename = f'{base_name}.{source_ext}'
+        try:
+            send_file_to_network_destination(source_path, remote_filename, destination)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 502
+        sent.append(remote_filename)
+
+    if destination['delivery_kind'] == 'fcpxml':
+        # "XML + media only": alongside the source video sent just above,
+        # also send physical copies of whichever music/VO/title-card/end-
+        # card assets actually survived to this point (see fake_result's
+        # own fcpxml_materials below), so the XML's references aren't
+        # pointing at files that only exist on this app's own upload
+        # folder. A csv/csv_video destination has no use for these, so
+        # this only runs for the dedicated XML+media kind.
+        for mat in (fake_result.get('fcpxml_materials') or {}).values():
+            if not mat or not mat.get('path') or not os.path.exists(mat['path']):
+                continue
+            mat_remote = mat.get('orig_name') or os.path.basename(mat['path'])
+            try:
+                send_file_to_network_destination(mat['path'], mat_remote, destination)
+            except ValueError as e:
+                return jsonify(ok=False, error=str(e)), 502
+            sent.append(mat_remote)
+
+    if destination['delivery_kind'] in ('csv', 'csv_video'):
+        csv_text = build_scene_list_csv(fake_row)
+        csv_filename = f'{base_name}_scenes.csv'
+        try:
+            send_bytes_to_network_destination(csv_text.encode('utf-8'), csv_filename, destination)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 502
+        sent.append(csv_filename)
+
+    if destination['delivery_kind'] == 'fcpxml':
+        try:
+            xml_text = build_fcpxml_package(fake_row, include_audio_tracks=bool(destination.get('fcpxml_audio_tracks')))
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+        xml_filename = f'{base_name}_cut.xml'
+        try:
+            send_bytes_to_network_destination(xml_text.encode('utf-8'), xml_filename, destination)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 502
+        sent.append(xml_filename)
+
+    audit_log('trailer_preview_send_to_destination', target=f'{destination["name"]}: {", ".join(sent)}',
+              user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True, filename=sent[0] if len(sent) == 1 else sent, sent=sent, destination=destination['name'])
+
+ACE_STEP_MAX_SAMPLES = int(os.environ.get('ACE_STEP_MAX_SAMPLES', 4))
+# Where audio2audio reference files are written. ACE-Step's ref_audio_input is a
+# path read by the ACE-Step process, not an upload, so both processes must be able
+# to see the same file. Same machine: the default (UPLOAD_FOLDER) is fine. ACE-Step
+# on another host: point this at a shared/NFS/SMB mount that resolves to the same
+# path on both sides.
+ACE_STEP_REF_DIR = os.environ.get('ACE_STEP_REF_DIR', '')
+
+# Where trained LoRA checkpoints (.safetensors/.pt/.ckpt/.bin) live, for the
+# Music Generation tool's LoRA picker. Same same-machine-vs-shared-mount
+# caveat as ACE_STEP_REF_DIR above: ACE-Step's own pipeline takes lora_path
+# as a filesystem path its own process reads directly, not an upload, so if
+# ACE-Step runs on a different host this needs to point at a mount that
+# resolves to the same file on both sides. Defaults to a folder inside
+# UPLOAD_FOLDER's parent so a fresh install has somewhere to drop LoRA files
+# without any config -- admin can point this elsewhere (e.g. wherever LoRA
+# training already writes its output) via the env var.
+ACE_STEP_LORA_DIR = os.environ.get('ACE_STEP_LORA_DIR') or os.path.join(
+    os.path.dirname(os.environ.get('LIBRARY_DIR', '/tmp')) or '/tmp', 'ace_step_loras')
+_LORA_EXTENSIONS = ('.safetensors', '.pt', '.ckpt', '.bin')
+
+# Demucs (pip install demucs) does source separation for the "stems" download
+# option -- a genuinely separate model/dependency from ACE-Step itself, run
+# as a local subprocess like ffmpeg rather than a remote service, since
+# that's how the demucs CLI ships. Not installed by default; the export
+# endpoint below fails loudly with an actionable message rather than
+# pretending stems are available when they aren't.
+DEMUCS_BIN = os.environ.get('DEMUCS_BIN', 'demucs')
+DEMUCS_TIMEOUT = int(os.environ.get('DEMUCS_TIMEOUT', 900))
+
+# --- LoRA training (dataset management + kicking off /v1/training/start) ---
+#
+# ACE-Step-1.5's REST API documents exactly two training endpoints
+# (/v1/training/start, /v1/training/start_lokr), and both require an
+# ALREADY-PREPROCESSED tensor_dir -- turning raw audio+lyrics into those
+# tensors (loading, auto-captioning, review, "Generate Tensors") is a
+# Gradio-UI-only workflow upstream with no documented REST or CLI
+# equivalent. So this app can genuinely own dataset ORGANIZATION (writing
+# files in the exact format ACE-Step's own dataset scanner recognizes) and
+# TRAINING KICKOFF + coarse progress-watching, but NOT the tensor-generation
+# step itself -- that one real gap is surfaced to the operator as an
+# explicit manual instruction rather than faked.
+#
+# Dataset file convention below is verbatim from ACE-Step-1.5's own LoRA
+# training tutorial (docs/en/LoRA_Training_Tutorial.md), not guessed:
+#   {name}.<audio ext>       the audio itself (mp3/wav/flac/ogg/opus)
+#   {name}.lyrics.txt        lyrics ("[inst]" convention isn't documented
+#                            for this file the way it is for /release_task,
+#                            so an instrumental track simply gets an empty
+#                            or omitted lyrics file)
+#   {name}.caption.txt       style/caption description
+#   {name}.json              optional structured fields: caption/bpm/
+#                            keyscale/timesignature/language
+ACE_STEP_TRAINING_DATA_DIR = os.environ.get('ACE_STEP_TRAINING_DATA_DIR') or os.path.join(
+    os.path.dirname(os.environ.get('LIBRARY_DIR', '/tmp')) or '/tmp', 'ace_step_training_data')
+# Where ACE-Step's own Gradio "Generate Tensors" step is expected to write
+# each dataset's preprocessed tensors -- PRISM only ever SUGGESTS a path
+# here (dataset_name subfolder) for the operator to paste into Gradio; nothing
+# writes to this directory from PRISM's own code.
+ACE_STEP_TENSOR_DIR = os.environ.get('ACE_STEP_TENSOR_DIR') or os.path.join(
+    os.path.dirname(os.environ.get('LIBRARY_DIR', '/tmp')) or '/tmp', 'ace_step_tensors')
+# Where a training run's own checkpoints land (this app's suggested default
+# for the lora_output_dir/output_dir field sent to /v1/training/start) --
+# distinct from ACE_STEP_LORA_DIR, which is where a checkpoint goes once
+# it's been reviewed and picked for actual generation use (see
+# api_music_lora_training_use_checkpoint below).
+ACE_STEP_LORA_TRAINING_OUTPUT_DIR = os.environ.get('ACE_STEP_LORA_TRAINING_OUTPUT_DIR') or os.path.join(
+    os.path.dirname(os.environ.get('LIBRARY_DIR', '/tmp')) or '/tmp', 'ace_step_lora_training_output')
+_TRAINING_AUDIO_EXTS = {'mp3', 'wav', 'flac', 'ogg', 'opus'}
+# How long a training output directory's newest checkpoint has to sit
+# unchanged before the status endpoint calls it "likely finished" rather
+# than "still training" -- there's no real completion signal from the API
+# (see module docstring above), so this is a heuristic, not a fact, and the
+# UI is worded accordingly. Training also saves a checkpoint every
+# save_every_n_epochs, so this must comfortably exceed the gap between two
+# checkpoint saves or every mid-training save would misreport as "done".
+TRAINING_STALE_AFTER = int(os.environ.get('TRAINING_STALE_AFTER', 900))
+
+def _training_dataset_dir(name):
+    """Resolves a dataset name to its directory under
+    ACE_STEP_TRAINING_DATA_DIR, or None if the name is empty/unsafe. Always
+    goes through secure_filename so a dataset "name" can never walk out of
+    that one parent directory."""
+    safe = secure_filename((name or '').strip())
+    return os.path.join(ACE_STEP_TRAINING_DATA_DIR, safe) if safe else None
+
+def _training_track_files(dataset_dir, base):
+    """The up-to-4 files (audio, lyrics, caption, json) that make up one
+    track, keyed by the audio extension actually present on disk (there can
+    only be one, since `base` is the shared filename stem)."""
+    files = {}
+    for ext in _TRAINING_AUDIO_EXTS:
+        p = os.path.join(dataset_dir, f'{base}.{ext}')
+        if os.path.exists(p):
+            files['audio'] = p
+            break
+    for label, suffix in (('lyrics', '.lyrics.txt'), ('caption', '.caption.txt'), ('json', '.json')):
+        p = os.path.join(dataset_dir, f'{base}{suffix}')
+        if os.path.exists(p):
+            files[label] = p
+    return files
+
+@app.route('/api/music/lora_training/datasets')
+@require_permission('music_generation')
+def api_music_lora_training_datasets():
+    """Every training dataset (a folder of tracks) currently organized under
+    ACE_STEP_TRAINING_DATA_DIR, with a track count each -- for the Train
+    LoRA sub-tab's dataset list."""
+    try:
+        os.makedirs(ACE_STEP_TRAINING_DATA_DIR, exist_ok=True)
+        names = sorted(d for d in os.listdir(ACE_STEP_TRAINING_DATA_DIR)
+                       if os.path.isdir(os.path.join(ACE_STEP_TRAINING_DATA_DIR, d)))
+    except OSError as e:
+        return jsonify(ok=True, datasets=[], error=f'Could not read {ACE_STEP_TRAINING_DATA_DIR}: {e}')
+    datasets = []
+    for name in names:
+        d = os.path.join(ACE_STEP_TRAINING_DATA_DIR, name)
+        audio_count = sum(1 for f in os.listdir(d)
+                           if os.path.splitext(f)[1].lstrip('.').lower() in _TRAINING_AUDIO_EXTS)
+        datasets.append({'name': name, 'tracks': audio_count})
+    return jsonify(ok=True, datasets=datasets, dir=ACE_STEP_TRAINING_DATA_DIR)
+
+@app.route('/api/music/lora_training/datasets', methods=['POST'])
+@require_permission('music_generation')
+def api_music_lora_training_create_dataset():
+    """Creates an empty dataset folder (tracks are added separately via
+    api_music_lora_training_add_track). A blank/unsafe name, or one that
+    already exists, is rejected rather than silently reused -- a caller
+    expecting a fresh dataset should never end up appending to someone
+    else's."""
+    name = (request.form.get('name') or '').strip()
+    d = _training_dataset_dir(name)
+    if not d:
+        return jsonify(ok=False, error='Enter a dataset name.'), 400
+    if os.path.exists(d):
+        return jsonify(ok=False, error=f'A dataset named "{os.path.basename(d)}" already exists.'), 400
+    try:
+        os.makedirs(d)
+    except OSError as e:
+        return jsonify(ok=False, error=f'Could not create dataset folder: {e}'), 500
+    return jsonify(ok=True, name=os.path.basename(d))
+
+@app.route('/api/music/lora_training/datasets/<dataset>', methods=['DELETE'])
+@require_permission('music_generation')
+def api_music_lora_training_delete_dataset(dataset):
+    d = _training_dataset_dir(dataset)
+    if not d or not os.path.isdir(d):
+        return jsonify(ok=False, error='Dataset not found.'), 404
+    try:
+        shutil.rmtree(d)
+    except OSError as e:
+        return jsonify(ok=False, error=f'Could not delete dataset: {e}'), 500
+    return jsonify(ok=True)
+
+@app.route('/api/music/lora_training/datasets/<dataset>/tracks')
+@require_permission('music_generation')
+def api_music_lora_training_list_tracks(dataset):
+    d = _training_dataset_dir(dataset)
+    if not d or not os.path.isdir(d):
+        return jsonify(ok=False, error='Dataset not found.'), 404
+    bases = sorted({os.path.splitext(f)[0] for f in os.listdir(d)
+                    if os.path.splitext(f)[1].lstrip('.').lower() in _TRAINING_AUDIO_EXTS})
+    tracks = []
+    for base in bases:
+        files = _training_track_files(d, base)
+        caption = ''
+        if 'caption' in files:
+            try:
+                caption = open(files['caption'], encoding='utf-8', errors='replace').read().strip()
+            except OSError:
+                pass
+        tracks.append({
+            'name': base,
+            'has_lyrics': 'lyrics' in files,
+            'has_caption': 'caption' in files,
+            'has_metadata': 'json' in files,
+            'caption_preview': caption[:120],
+            'duration': round(probe_duration(files['audio']) or 0, 1) if 'audio' in files else None,
+        })
+    return jsonify(ok=True, dataset=os.path.basename(d), tracks=tracks,
+                   tensor_dir_suggestion=os.path.join(ACE_STEP_TENSOR_DIR, os.path.basename(d)))
+
+@app.route('/api/music/lora_training/datasets/<dataset>/tracks', methods=['POST'])
+@require_permission('music_generation')
+def api_music_lora_training_add_track(dataset):
+    """Adds one track to a dataset: an audio file plus optional lyrics/
+    caption text and bpm/keyscale/timesignature/language, written in the
+    exact filename convention ACE-Step's own dataset scanner recognizes
+    (see the module comment above _training_dataset_dir for the source).
+
+    Gated by ALLOW_LOCAL_MEDIA_UPLOAD like every other raw-media upload in
+    this app -- these files don't go through ffmpeg here, but they're still
+    arbitrary browser-supplied binary data landing on disk, and consistency
+    with the rest of the app's upload policy matters more than this one
+    endpoint's slightly different risk profile."""
+    if 'audio' not in request.files or not request.files['audio'].filename:
+        return jsonify(ok=False, error='Choose an audio file.'), 400
+    if not ALLOW_LOCAL_MEDIA_UPLOAD:
+        return jsonify(ok=False, error='Direct file upload is disabled on this deployment.'), 403
+    d = _training_dataset_dir(dataset)
+    if not d or not os.path.isdir(d):
+        return jsonify(ok=False, error='Dataset not found.'), 404
+    f = request.files['audio']
+    if not allowed_file(f.filename, _TRAINING_AUDIO_EXTS):
+        return jsonify(ok=False, error=f'Audio must be one of: {", ".join(sorted(_TRAINING_AUDIO_EXTS))}'), 400
+    requested_name = (request.form.get('name') or '').strip()
+    base = secure_filename(os.path.splitext(requested_name)[0]) if requested_name else \
+        secure_filename(os.path.splitext(f.filename)[0])
+    if not base:
+        return jsonify(ok=False, error='Could not derive a valid track name from that filename.'), 400
+    ext = f.filename.rsplit('.', 1)[1].lower()
+    # Check every recognized audio extension for this base name, not just
+    # the one being uploaded now -- otherwise re-uploading "a" as a .wav
+    # after it already exists as .mp3 would silently create a second audio
+    # file sharing one base name, and which one the scanner actually picks
+    # up would be undefined.
+    if _training_track_files(d, base).get('audio'):
+        return jsonify(ok=False, error=f'A track named "{base}" already exists in this dataset.'), 400
+    audio_path = os.path.join(d, f'{base}.{ext}')
+    f.save(audio_path)
+
+    lyrics = (request.form.get('lyrics') or '').strip()
+    if lyrics:
+        with open(os.path.join(d, f'{base}.lyrics.txt'), 'w', encoding='utf-8') as fh:
+            fh.write(lyrics)
+    caption = (request.form.get('caption') or '').strip()
+    if caption:
+        with open(os.path.join(d, f'{base}.caption.txt'), 'w', encoding='utf-8') as fh:
+            fh.write(caption)
+    meta = {}
+    for key, cast in (('bpm', int), ('keyscale', str), ('timesignature', str), ('language', str)):
+        raw = (request.form.get(key) or '').strip()
+        if raw:
+            try:
+                meta[key] = cast(raw)
+            except (TypeError, ValueError):
+                pass
+    if caption:
+        meta.setdefault('caption', caption)
+    if meta:
+        with open(os.path.join(d, f'{base}.json'), 'w', encoding='utf-8') as fh:
+            json.dump(meta, fh)
+    return jsonify(ok=True, name=base)
+
+@app.route('/api/music/lora_training/datasets/<dataset>/tracks/<track>', methods=['DELETE'])
+@require_permission('music_generation')
+def api_music_lora_training_delete_track(dataset, track):
+    d = _training_dataset_dir(dataset)
+    if not d or not os.path.isdir(d):
+        return jsonify(ok=False, error='Dataset not found.'), 404
+    base = secure_filename((track or '').strip())
+    if not base:
+        return jsonify(ok=False, error='Invalid track name.'), 400
+    files = _training_track_files(d, base)
+    if not files:
+        return jsonify(ok=False, error='Track not found.'), 404
+    for path in files.values():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return jsonify(ok=True)
+
+@app.route('/api/music/lora_training/start', methods=['POST'])
+@require_permission('music_generation')
+def api_music_lora_training_start():
+    """Kicks off a LoRA (or LoKr) training run against an already-
+    preprocessed tensor_dir by POSTing to ACE-Step's own /v1/training/start
+    (or /v1/training/start_lokr). Field names match the request models
+    documented in ACE-Step-1.5's own acestep/api/train_api_models.py.
+
+    This does NOT create the tensors themselves -- see the module comment
+    above ACE_STEP_TRAINING_DATA_DIR for why that step has no REST/CLI path
+    and stays a manual Gradio step. tensor_dir here must already exist and
+    contain that step's output; this endpoint doesn't verify its contents
+    (it can't know what a valid tensor file looks like), only that the path
+    was provided.
+
+    No job id or status comes back from ACE-Step for this call (undocumented
+    in the upstream API) -- the response is passed through mostly as-is, and
+    progress after this point is tracked by watching lora_output_dir for
+    checkpoint files to appear (see api_music_lora_training_status)."""
+    tensor_dir = (request.form.get('tensor_dir') or '').strip()
+    if not tensor_dir:
+        return jsonify(ok=False, error='tensor_dir is required -- the folder where ACE-Step\'s own '
+                                       '"Generate Tensors" step (Gradio) wrote this dataset\'s '
+                                       'preprocessed tensors.'), 400
+    lokr = (request.form.get('lokr') or '').strip().lower() in ('1', 'true', 'on', 'yes')
+    # A caller-named SUBFOLDER, not a raw path -- output_dir is always kept
+    # under ACE_STEP_LORA_TRAINING_OUTPUT_DIR so api_music_lora_training_
+    # use_checkpoint's containment check (below) can trust every checkpoint
+    # this training feature ever produces lives somewhere under that one
+    # root, rather than having to trust an arbitrary path a caller supplied.
+    output_subdir = secure_filename((request.form.get('output_name') or '').strip()) or f'run{int(time.time())}'
+    output_dir = os.path.join(ACE_STEP_LORA_TRAINING_OUTPUT_DIR, output_subdir)
+
+    def _num(key, default, cast=float):
+        raw = (request.form.get(key) or '').strip()
+        if raw == '':
+            return default
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            return default
+
+    payload = {
+        'tensor_dir': tensor_dir,
+        'learning_rate': _num('learning_rate', 0.03 if lokr else 1e-4),
+        'train_epochs': _num('train_epochs', 500 if lokr else 10, int),
+        'train_batch_size': _num('train_batch_size', 1, int),
+        'gradient_accumulation': _num('gradient_accumulation', 4, int),
+        'training_seed': _num('training_seed', 42, int),
+        'training_shift': _num('training_shift', 3.0),
+        'save_every_n_epochs': _num('save_every_n_epochs', 5, int),
+        'gradient_checkpointing': (request.form.get('gradient_checkpointing') or '').strip().lower() in ('1', 'true', 'on', 'yes'),
+    }
+    if lokr:
+        payload['output_dir'] = output_dir
+        payload['lokr_linear_dim'] = _num('lora_rank', 64, int)
+        payload['lokr_linear_alpha'] = _num('lora_alpha', 128, int)
+        endpoint = '/v1/training/start_lokr'
+    else:
+        payload['lora_output_dir'] = output_dir
+        payload['lora_rank'] = _num('lora_rank', 64, int)
+        payload['lora_alpha'] = _num('lora_alpha', 128, int)
+        payload['lora_dropout'] = _num('lora_dropout', 0.1)
+        payload['use_fp8'] = (request.form.get('use_fp8') or '').strip().lower() in ('1', 'true', 'on', 'yes')
+        endpoint = '/v1/training/start'
+
+    try:
+        r = requests.post(f'{ACE_STEP_URL}{endpoint}', json=payload, headers=_ace_step_headers(), timeout=30)
+    except requests.exceptions.RequestException as e:
+        return jsonify(ok=False, error=f'Could not reach ACE-Step at {ACE_STEP_URL}: {e}'), 502
+    try:
+        data = r.json()
+    except ValueError:
+        data = {'raw': (r.text or '')[:500]}
+    if not r.ok:
+        return jsonify(ok=False, error=f'ACE-Step rejected the training request (HTTP {r.status_code}): '
+                                       f'{json.dumps(data)[:500]}'), 502
+    return jsonify(ok=True, response=data, output_dir=output_dir, tensor_dir=tensor_dir, lokr=lokr)
+
+@app.route('/api/music/lora_training/status')
+@require_permission('music_generation')
+def api_music_lora_training_status():
+    """Coarse, honest progress signal for a training run: the newest
+    checkpoint file (by mtime) found directly inside ?dir=, how long ago it
+    was last modified, and a `likely_done` guess based on TRAINING_STALE_AFTER
+    -- NOT a real status from ACE-Step, which doesn't expose one over REST
+    for training (see the module comment above). Every checkpoint file found
+    is also listed, since save_every_n_epochs can produce several over a run
+    and the operator may want to pick an earlier one."""
+    out_dir = (request.args.get('dir') or '').strip()
+    if not out_dir:
+        return jsonify(ok=False, error='dir is required.'), 400
+    allowed_root = os.path.abspath(ACE_STEP_LORA_TRAINING_OUTPUT_DIR)
+    if os.path.commonpath([allowed_root, os.path.abspath(out_dir)]) != allowed_root:
+        return jsonify(ok=False, error='dir must be a training output folder this app created '
+                                       f'(under {ACE_STEP_LORA_TRAINING_OUTPUT_DIR}).'), 400
+    if not os.path.isdir(out_dir):
+        return jsonify(ok=True, exists=False, checkpoints=[], newest=None, likely_done=False,
+                       note='Output directory does not exist yet -- training may not have started '
+                            'writing a checkpoint yet, or the path is wrong.')
+    checkpoints = []
+    for root, _dirs, files in os.walk(out_dir):
+        for fn in files:
+            if fn.lower().endswith(_LORA_EXTENSIONS):
+                p = os.path.join(root, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                checkpoints.append({'path': p, 'name': os.path.relpath(p, out_dir),
+                                    'size': st.st_size, 'mtime': st.st_mtime})
+    checkpoints.sort(key=lambda c: c['mtime'], reverse=True)
+    newest = checkpoints[0] if checkpoints else None
+    age = (time.time() - newest['mtime']) if newest else None
+    likely_done = bool(newest and age is not None and age > TRAINING_STALE_AFTER)
+    return jsonify(ok=True, exists=True, checkpoints=checkpoints, newest=newest,
+                   newest_age_seconds=round(age, 0) if age is not None else None,
+                   likely_done=likely_done,
+                   note=('No checkpoint file has appeared here yet.' if not checkpoints else
+                         ('Newest checkpoint hasn\'t changed in a while -- training has likely '
+                          'finished (or stalled). Verify on the ACE-Step host if unsure.' if likely_done else
+                          'A checkpoint was written recently -- training appears to still be running.')))
+
+@app.route('/api/music/lora_training/use_checkpoint', methods=['POST'])
+@require_permission('music_generation')
+def api_music_lora_training_use_checkpoint():
+    """Copies a chosen training-output checkpoint into ACE_STEP_LORA_DIR so
+    it immediately shows up in the Music Generation tab's LoRA picker --
+    the bridge between "training produced a file" and "generation can use
+    it". `path` must be a file this app's own status endpoint just reported
+    (inside ACE_STEP_LORA_TRAINING_OUTPUT_DIR by default, or wherever the
+    caller pointed output_dir when starting training) -- never an arbitrary
+    filesystem path, so this is restricted to files under one of the
+    directories this app itself manages for training output."""
+    src = (request.form.get('path') or '').strip()
+    new_name = secure_filename((request.form.get('name') or '').strip())
+    if not src or not os.path.isfile(src):
+        return jsonify(ok=False, error='Checkpoint file not found.'), 404
+    allowed_root = os.path.abspath(ACE_STEP_LORA_TRAINING_OUTPUT_DIR)
+    src_abs = os.path.abspath(src)
+    if os.path.commonpath([allowed_root, src_abs]) != allowed_root:
+        return jsonify(ok=False, error='That path is outside the managed training-output directory.'), 400
+    if not new_name:
+        new_name = secure_filename(os.path.basename(src))
+    if not os.path.splitext(new_name)[1]:
+        new_name += os.path.splitext(src)[1]
+    try:
+        os.makedirs(ACE_STEP_LORA_DIR, exist_ok=True)
+        dest = os.path.join(ACE_STEP_LORA_DIR, new_name)
+        shutil.copy2(src, dest)
+    except OSError as e:
+        return jsonify(ok=False, error=f'Could not copy checkpoint into the LoRA folder: {e}'), 500
+    return jsonify(ok=True, name=new_name)
+
+def acestep_generate(prompt, duration=None, lyrics=None, bpm=None, samples=1,
+                     steps=None, seed=None, base_ts=None,
+                     ref_audio_path=None, ref_strength=0.5,
+                     keyscale=None, timesignature=None, thinking=False,
+                     negative_prompt=None, model=None,
+                     guidance_scale=None, scheduler_type=None, cfg_type=None,
+                     omega_scale=None, use_erg_tag=None, use_erg_lyric=None,
+                     use_erg_diffusion=None, lora_path=None, lora_weight=None):
+    """Generate music with ACE-Step directly. Returns (paths, error).
+
+    Unlike prepare_bgm_track (which is shaped around the trailer pipeline: one
+    track, faded, trimmed, transcoded to .m4a, with a synth fallback), this is the
+    raw generator behind the Tools tab: N samples, optional sung lyrics, optional
+    audio2audio reference, no fallback — if the service is down the caller should
+    say so rather than hand back a sine drone the user didn't ask for.
+
+    `bpm`, `keyscale`, and `timesignature` are all folded into the prompt as
+    tags rather than sent as separate structured fields. Newer ACE-Step builds
+    do accept dedicated bpm/keyscale/timesignature JSON fields, but this
+    server's /release_task endpoint was tested against tempo specifically and
+    only responds to it as a prompt tag ("124 bpm") — a plain field is
+    silently ignored. Rather than send fields with unverified effect against
+    this specific install, key and time signature follow the same
+    known-working convention.
+
+    `thinking` enables ACE-Step's LM planning pass: given the caption/lyrics,
+    it auto-infers any of bpm/key/time-signature/etc you left unset. Slower
+    (an extra LM inference before the DiT pass), often better when you don't
+    have strong opinions on those specifics. This *is* sent as a real field
+    (`thinking` in the payload below) — unlike tempo, this one's confirmed
+    against this server since the payload already sent it, just hardcoded to
+    False everywhere until now.
+
+    `negative_prompt` is a real, already-used field (see ACE_STEP_NEGATIVE_PROMPT
+    below) — this parameter just makes it caller-editable instead of only ever
+    being the fixed default text auto-applied for instrumental generations.
+
+    `ref_audio_path` enables audio2audio: the output follows the reference's
+    structure, with `ref_strength` (0-1) controlling how closely. NOTE: ACE-Step's
+    ref_audio_input takes a FILE PATH that the ACE-Step process must be able to
+    read. That works when ACE-Step runs on this machine (the default
+    localhost:8001), but on a separate host the path won't resolve there — see
+    ACE_STEP_REF_DIR for pointing both sides at a shared mount.
+
+    `model` selects between multiple DiT checkpoints on servers that expose
+    more than one (ACE-Step 1.5's multi-model routing, or a wrapper's own
+    aliases -- see api_music_models() for how the picker discovers what's
+    available). Omitted from the payload entirely when blank, so a
+    single-model server that doesn't recognize the field at all is
+    unaffected either way.
+
+    `guidance_scale`/`scheduler_type`/`cfg_type`/`omega_scale`/`use_erg_*`:
+    the actual quality/style knobs ACE-Step's own pipeline exposes (see
+    pipeline_ace_step.py upstream) that this app never sent before -- every
+    generation went out with whatever this server's own internal defaults
+    happen to be, which is a real, likely explanation for a self-hosted
+    instance sounding different from a tuned hosted service running the same
+    checkpoint. All are None by default and OMITTED from the payload when
+    None, same principle as `model` above: a caller (or the UI) that doesn't
+    ask for a specific value gets today's unchanged behavior, not a newly
+    invented default silently imposed on them. Field names verified against
+    the upstream pipeline signature and multiple real working request bodies
+    (both a direct-pipeline caller's actual logged request and a separate
+    from-scratch FastAPI wrapper's schema agree on these exact names), unlike
+    `inference_steps` above which is left untouched precisely because it
+    ISN'T independently confirmed against this specific server and already
+    works without erroring -- changing it speculatively risks turning a
+    working-but-maybe-ineffective control into a broken one.
+
+    A turbo/distilled checkpoint (per ACE-Step 1.5's docs) ignores CFG
+    guidance entirely by design -- if the configured model is a turbo
+    variant, guidance_scale/cfg_type/omega_scale may have no audible effect
+    regardless of value, which is itself useful to know when comparing
+    against a hosted service that might be running the same checkpoint with
+    settings actually tuned for it.
+
+    `lora_path`/`lora_weight`: a fine-tuned LoRA adapter to apply on top of
+    the base checkpoint (see api_lora_list()/ACE_STEP_LORA_DIR for how the
+    picker resolves a filename to this absolute path). Field names follow
+    ACE-Step's own pipeline attributes (`self.lora_path` / `self.lora_weight`
+    in pipeline_ace_step.py upstream, default lora_path="none"/weight=1) --
+    unlike guidance_scale etc. above, these are NOT independently confirmed
+    against a live server's actual /release_task schema (no public REST
+    field-name reference exists for this), so if your specific ACE-Step
+    build names these differently, a LoRA pick may silently have no effect
+    the same way an unrecognized field elsewhere would. Worth confirming
+    once against a known LoRA the first time this is wired up. Omitted from
+    the payload entirely when no LoRA is selected, same principle as every
+    other optional field here -- ordinary generation is unaffected.
+
+    `duration` in seconds, or None/blank for automatic -- when omitted,
+    `audio_duration` is left out of the payload entirely so the ACE-Step
+    server picks its own length rather than this app silently imposing a
+    fixed default (previously always 30s even when the caller never asked
+    for one)."""
+    tags = (prompt or '').strip() or 'cinematic, instrumental'
+    if bpm:
+        # Don't double up if the user already typed a bpm into the prompt.
+        if not re.search(r'\b\d{2,3}\s*bpm\b', tags, re.I):
+            tags = f'{tags}, {int(bpm)} bpm'
+    keyscale = (keyscale or '').strip()
+    if keyscale:
+        tags = f'{tags}, {keyscale} key'
+    timesignature = (timesignature or '').strip()
+    if timesignature:
+        # UI sends the beats-per-bar number (2/3/4/6); spelled out as "N/4"
+        # or "6/8" matches how these are conventionally written as prompt tags
+        # (and how ACE-Step's own docs describe them) far better than a bare
+        # digit, which reads ambiguously next to a bpm tag right next to it.
+        sig_label = '6/8' if timesignature == '6' else f'{timesignature}/4'
+        tags = f'{tags}, {sig_label} time signature'
+    lyrics = (lyrics or '').strip()
+    instrumental = not lyrics
+    samples = max(1, min(ACE_STEP_MAX_SAMPLES, int(samples or 1)))
+
+    payload = {
+        'prompt': tags,
+        'thinking': bool(thinking),
+        'inference_steps': int(steps or ACE_STEP_STEPS),
+        'batch_size': samples,
+        # '[inst]' is ACE-Step's explicit instrumental marker. When the user has
+        # supplied real lyrics we must send those instead AND drop the
+        # vocal-suppressing negative prompt, which would otherwise fight them.
+        'lyrics': '[inst]' if instrumental else lyrics,
+    }
+    if duration not in (None, ''):
+        try:
+            payload['audio_duration'] = float(duration)
+        except (TypeError, ValueError):
+            pass
+    if seed not in (None, ''):
+        try:
+            payload['manual_seeds'] = str(int(seed))
+        except (TypeError, ValueError):
+            pass
+    # An explicit negative_prompt from the caller always wins. Otherwise fall
+    # back to the vocal-suppressing default, but only for instrumental takes —
+    # applying it to a lyric take would fight the vocals the user just asked for.
+    negative_prompt = (negative_prompt or '').strip()
+    if negative_prompt:
+        payload['negative_prompt'] = negative_prompt
+    elif instrumental and ACE_STEP_NEGATIVE_PROMPT:
+        payload['negative_prompt'] = ACE_STEP_NEGATIVE_PROMPT
+    if ref_audio_path and os.path.exists(ref_audio_path):
+        payload['audio2audio_enable'] = True
+        payload['ref_audio_input'] = os.path.abspath(ref_audio_path)
+        payload['ref_audio_strength'] = max(0.0, min(1.0, float(ref_strength)))
+    model = (model or '').strip()
+    if model:
+        payload['model'] = model
+    if guidance_scale is not None:
+        payload['guidance_scale'] = float(guidance_scale)
+    if scheduler_type:
+        payload['scheduler_type'] = scheduler_type
+    if cfg_type:
+        payload['cfg_type'] = cfg_type
+    if omega_scale is not None:
+        payload['omega_scale'] = float(omega_scale)
+    if use_erg_tag is not None:
+        payload['use_erg_tag'] = bool(use_erg_tag)
+    if use_erg_lyric is not None:
+        payload['use_erg_lyric'] = bool(use_erg_lyric)
+    if use_erg_diffusion is not None:
+        payload['use_erg_diffusion'] = bool(use_erg_diffusion)
+    if lora_path and os.path.exists(lora_path):
+        payload['lora_path'] = os.path.abspath(lora_path)
+        payload['lora_weight'] = float(lora_weight) if lora_weight is not None else 1.0
+
+    base_ts = base_ts or f'tool{int(time.time()*1000)}'
+    try:
+        r = requests.post(f'{ACE_STEP_URL}/release_task', json=payload, headers=_ace_step_headers(), timeout=15)
+    except requests.exceptions.RequestException as e:
+        # Genuinely couldn't connect (DNS, refused, timeout) -- no response to
+        # show, so this is the one case where the generic message is the
+        # whole story.
+        return [], f'Could not reach ACE-Step at {ACE_STEP_URL}: {e}'
+    try:
+        release_data = r.json()
+    except ValueError:
+        # The request DID reach a server and got a response back -- it just
+        # wasn't JSON. Previously this fell through to the same generic
+        # "Could not reach ACE-Step" message as an actual connection
+        # failure, discarding the one thing that would explain it: the
+        # real HTTP status and body. A non-JSON body here usually means
+        # either a wrong path (an HTML 404 page instead of the API
+        # response -- worth double-checking the base URL against whatever
+        # base path the specific hosted account actually uses, which can
+        # differ from the self-hosted convention) or a plain-text/HTML
+        # auth-rejection page rather than a JSON error (worth checking
+        # that the API key is actually being accepted).
+        return [], (f'ACE-Step at {ACE_STEP_URL} responded, but not with JSON '
+                    f'(HTTP {r.status_code}). This usually means the URL path or '
+                    f'authentication is wrong for this server, not that it\'s '
+                    f'unreachable. Response started with: {(r.text or "(empty body)")[:300]!r}')
+    task_id = (release_data.get('data') or {}).get('task_id')
+    if not task_id:
+        return [], f'ACE-Step did not accept the request (no task id). Response: {r.text[:200]}'
+    try:
+        for _ in range(90):
+            time.sleep(2)
+            q = requests.post(f'{ACE_STEP_URL}/query_result',
+                              json={'task_id_list': [task_id]}, headers=_ace_step_headers(), timeout=10)
+            try:
+                query_data = q.json()
+            except ValueError:
+                return [], (f'ACE-Step\'s status check responded without JSON '
+                            f'(HTTP {q.status_code}): {(q.text or "(empty body)")[:300]!r}')
+            items = query_data.get('data') or []
+            if not items:
+                continue
+            status = items[0].get('status')
+            if status == 2:
+                return [], 'ACE-Step reported the generation task failed.'
+            if status != 1:
+                continue
+            result = json.loads(items[0]['result'])
+            entries = result if isinstance(result, list) else [result]
+            paths = []
+            for i, entry in enumerate(entries[:samples]):
+                remote = entry.get('file') if isinstance(entry, dict) else None
+                if not remote:
+                    continue
+                dest = os.path.join(app.config['UPLOAD_FOLDER'],
+                                    f'music_{base_ts}_{i}{os.path.splitext(remote)[1] or ".wav"}')
+                try:
+                    resp = requests.get(f'{ACE_STEP_URL}{remote}', headers=_ace_step_headers(), timeout=120)
+                    with open(dest, 'wb') as f:
+                        f.write(resp.content)
+                except Exception as e:
+                    print(f'ACE-Step sample {i} download failed: {e}')
+                    continue
+                if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                    paths.append(dest)
+            if not paths:
+                return [], 'ACE-Step finished but returned no usable audio.'
+            return paths, None
+        return [], 'Timed out waiting for ACE-Step (3 minutes). The service may be overloaded.'
+    except Exception as e:
+        return [], f'Could not reach ACE-Step at {ACE_STEP_URL}: {e}'
+
+@app.route('/api/music/generate', methods=['POST'])
+@require_permission('music_generation')
+def api_music_generate():
+    """Standalone ACE-Step music generation for the Tools tab.
+
+    Exposes every control ACE-Step itself takes for a text2music-style
+    generation: free-text prompt, sung lyrics (or instrumental), tempo, key,
+    time signature, negative styles, LM "thinking" planning, and how many
+    samples to generate in one go so alternatives can be auditioned side by
+    side."""
+    def _num(key, default, lo, hi, cast=float):
+        raw = (request.form.get(key) or '').strip()
+        if raw == '':
+            return default
+        try:
+            return max(lo, min(hi, cast(float(raw))))
+        except (TypeError, ValueError):
+            return default
+
+    duration = _num('duration', None, 5.0, 300.0)
+    samples = _num('samples', 1, 1, ACE_STEP_MAX_SAMPLES, int)
+    bpm = _num('bpm', None, 40, 220, int)
+    steps = _num('steps', ACE_STEP_STEPS, 8, 120, int)
+    genre = (request.form.get('genre') or '').strip()
+    prompt = (request.form.get('prompt') or '').strip() or GENRE_PROMPTS.get(genre, '')
+    lyrics = (request.form.get('lyrics') or '').strip()
+    seed = (request.form.get('seed') or '').strip()
+    keyscale = (request.form.get('keyscale') or '').strip()
+    timesignature = (request.form.get('timesignature') or '').strip()
+    if timesignature not in ('2', '3', '4', '6'):
+        timesignature = ''
+    negative_prompt = (request.form.get('negative_prompt') or '').strip()
+    thinking = (request.form.get('thinking') or '').strip().lower() in ('1', 'true', 'on', 'yes')
+    model = (request.form.get('model') or '').strip()
+
+    # Advanced quality controls -- all optional and left unsent (None) unless
+    # the form actually supplied a value, so a request that doesn't touch the
+    # new "Advanced generation settings" section behaves exactly as before
+    # this existed. See acestep_generate's docstring for what these do and
+    # why the field names are trusted.
+    guidance_scale = _num('guidance_scale', None, 1.0, 30.0)
+    omega_scale = _num('omega_scale', None, 1.0, 20.0)
+    scheduler_type = (request.form.get('scheduler_type') or '').strip()
+    if scheduler_type not in ('euler', 'heun', 'pingpong'):
+        scheduler_type = ''
+    cfg_type = (request.form.get('cfg_type') or '').strip()
+    if cfg_type not in ('apg', 'cfg'):
+        cfg_type = ''
+
+    def _bool_or_none(key):
+        raw = request.form.get(key)
+        if raw is None or raw == '':
+            return None
+        return raw.strip().lower() in ('1', 'true', 'on', 'yes')
+
+    use_erg_tag = _bool_or_none('use_erg_tag')
+    use_erg_lyric = _bool_or_none('use_erg_lyric')
+    use_erg_diffusion = _bool_or_none('use_erg_diffusion')
+
+    # LoRA: `lora` is a filename from the /api/music/loras picker, resolved
+    # against ACE_STEP_LORA_DIR here (never trust a client-supplied path
+    # directly -- secure_filename plus a fixed parent dir keeps this to
+    # exactly the files that picker actually offered). Blank/"none" means
+    # no LoRA, matching ACE-Step's own base-model default.
+    lora_name = secure_filename((request.form.get('lora') or '').strip())
+    lora_path = None
+    if lora_name and lora_name.lower() != 'none':
+        candidate = os.path.join(ACE_STEP_LORA_DIR, lora_name)
+        if os.path.exists(candidate):
+            lora_path = candidate
+        else:
+            return jsonify(ok=False, error=f'LoRA "{lora_name}" was not found in {ACE_STEP_LORA_DIR} -- '
+                                           'it may have been removed; refresh the LoRA list.'), 400
+    lora_weight = _num('lora_weight', 1.0, 0.0, 2.0)
+
+    if not prompt:
+        return jsonify(ok=False, error='Enter a prompt describing the style you want.'), 400
+
+    base_ts = f'tool{int(time.time()*1000)}'
+
+    # Optional audio2audio reference. Normalised to a plain 44.1k stereo WAV so
+    # ACE-Step gets something it can definitely decode regardless of what the user
+    # dropped in (m4a, mp3, a video's audio track, an odd sample rate).
+    ref_path = None
+    ref_strength = _num('ref_strength', 0.5, 0.0, 1.0)
+    ref_src = _resolve_upload('ref_audio', AUDIO_EXTENSIONS)
+    if ref_src:
+        ref_dir = ACE_STEP_REF_DIR or app.config['UPLOAD_FOLDER']
+        try:
+            os.makedirs(ref_dir, exist_ok=True)
+        except OSError as e:
+            return jsonify(ok=False, error=f'Could not write to the reference audio directory ({ref_dir}): {e}'), 500
+        ref_path = os.path.join(ref_dir, f'aceref_{base_ts}.wav')
+        try:
+            run_ffmpeg([FFMPEG, '-y', '-i', ref_src, '-vn', '-ac', '2', '-ar', '44100',
+                        '-c:a', 'pcm_s16le', ref_path], timeout=120, label='ACE reference convert')
+        except MediaToolTimeout:
+            ref_path = None
+        if not (ref_path and os.path.exists(ref_path) and os.path.getsize(ref_path) > 0):
+            return jsonify(ok=False, error='Could not read that reference audio file — '
+                                           'try a standard WAV or MP3.'), 400
+
+    try:
+        paths, err = acestep_generate(prompt, duration, lyrics=lyrics, bpm=bpm,
+                                      samples=samples, steps=steps, seed=seed, base_ts=base_ts,
+                                      ref_audio_path=ref_path, ref_strength=ref_strength,
+                                      keyscale=keyscale, timesignature=timesignature,
+                                      thinking=thinking, negative_prompt=negative_prompt, model=model,
+                                      guidance_scale=guidance_scale, scheduler_type=scheduler_type,
+                                      cfg_type=cfg_type, omega_scale=omega_scale,
+                                      use_erg_tag=use_erg_tag, use_erg_lyric=use_erg_lyric,
+                                      use_erg_diffusion=use_erg_diffusion,
+                                      lora_path=lora_path, lora_weight=lora_weight)
+    finally:
+        # The reference only needs to survive the generation call itself.
+        if ref_path and os.path.exists(ref_path):
+            try:
+                os.remove(ref_path)
+            except OSError:
+                pass
+    if err:
+        return jsonify(ok=False, error=err), 502
+
+    return jsonify(ok=True, samples=[{
+        'url': f'/uploads/{os.path.basename(p)}',
+        'filename': os.path.basename(p),
+        'duration': round(probe_duration(p) or duration or 0, 1),
+    } for p in paths],
+        prompt=prompt, lyrics=lyrics or None, bpm=bpm, steps=steps,
+        instrumental=not lyrics,
+        keyscale=keyscale or None, timesignature=timesignature or None, thinking=thinking,
+        negative_prompt=negative_prompt or None, model=model or None,
+        reference=bool(ref_path), ref_strength=ref_strength if ref_path else None,
+        lora=lora_name if lora_path else None, lora_weight=lora_weight if lora_path else None)
+
+@app.route('/api/music/loras')
+@require_permission('music_generation')
+def api_music_loras():
+    """LoRA checkpoints available for the Music Generation tool's LoRA
+    picker -- every file with a recognized adapter extension directly inside
+    ACE_STEP_LORA_DIR (not recursive, matching how it's set up: one flat
+    folder of trained checkpoints, not a nested library). An empty/missing
+    directory is not an error -- it just means no LoRAs have been dropped in
+    yet, same "nothing configured yet" handling as the network folders."""
+    try:
+        os.makedirs(ACE_STEP_LORA_DIR, exist_ok=True)
+        names = sorted(f for f in os.listdir(ACE_STEP_LORA_DIR)
+                        if f.lower().endswith(_LORA_EXTENSIONS)
+                        and os.path.isfile(os.path.join(ACE_STEP_LORA_DIR, f)))
+    except OSError as e:
+        return jsonify(ok=True, loras=[], error=f'Could not read {ACE_STEP_LORA_DIR}: {e}')
+    return jsonify(ok=True, loras=names, dir=ACE_STEP_LORA_DIR)
+
+@app.route('/api/music/models')
+@require_permission('music_generation')
+def api_music_models():
+    """Model/checkpoint aliases the ACE-Step server has loaded, for the Music
+    Generation tab's model picker. ACE-Step 1.5's REST API exposes these at
+    GET /v1/models (OpenAI-style listing); older/single-model servers and
+    other wrappers don't have this endpoint at all -- that's not an error,
+    it just means there's nothing to switch between, so an empty list is
+    returned rather than surfacing a failure. /api/music/generate still
+    takes a free-typed model name either way (see acestep_generate's `model`
+    param), this is purely to populate the picker's suggestions when the
+    server can tell us what's available.
+
+    A genuine connection failure (wrong host/port, server down, timeout) is
+    a DIFFERENT situation from "this server just doesn't have /models", and
+    is reported as such via `reachable`/`error` -- collapsing both into the
+    same empty-list response made a bad ACE_STEP_URL indistinguishable from
+    a working server with nothing to list."""
+    try:
+        r = requests.get(f'{ACE_STEP_URL}/v1/models', headers=_ace_step_headers(), timeout=5)
+    except requests.exceptions.RequestException as e:
+        return jsonify(ok=True, models=[], reachable=False,
+                        error=f'Could not reach ACE-Step at {ACE_STEP_URL}: {e}')
+    if not r.ok:
+        # Reached a server, it just doesn't have this endpoint (404) or
+        # rejected the request (401/403/etc) -- still "reachable", just no
+        # model list to offer.
+        return jsonify(ok=True, models=[], reachable=True,
+                        error=f'ACE-Step at {ACE_STEP_URL} responded {r.status_code} to /v1/models')
+    try:
+        data = r.json()
+    except ValueError:
+        return jsonify(ok=True, models=[], reachable=True,
+                        error=f'ACE-Step at {ACE_STEP_URL} responded to /v1/models, but not with JSON')
+    # ACE-Step 1.5's native shape is:
+    #   {"data": {"models": [{"name": "acestep-v15-turbo", "is_default": true}, ...],
+    #             "default_model": "acestep-v15-turbo"}, "code": 200, ...}
+    # OpenRouter-compat shape is OpenAI-style:
+    #   {"object": "list", "data": [{"id": "acemusic/...", "name": "ACE-Step"}, ...]}
+    # Older/simple wrappers may return a bare list or {"models": [...]}.
+    # Important: data.get('data') is often a *dict*, not a list — iterating that
+    # dict yields its keys (models, default_model, lm_models, ...) which is
+    # exactly the bogus dropdown users were seeing.
+    items = []
+    default_model = None
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        inner = data.get('data')
+        if isinstance(inner, dict):
+            raw = inner.get('models') or inner.get('aliases') or []
+            items = raw if isinstance(raw, list) else []
+            default_model = inner.get('default_model') or inner.get('default')
+        elif isinstance(inner, list):
+            items = inner
+        else:
+            raw = data.get('models') or data.get('aliases') or []
+            items = raw if isinstance(raw, list) else []
+            default_model = data.get('default_model') or data.get('default')
+    models = []
+    seen = set()
+    for it in items:
+        name = None
+        if isinstance(it, str):
+            name = it
+        elif isinstance(it, dict):
+            name = it.get('alias') or it.get('name') or it.get('id') or it.get('model')
+        if not name or not isinstance(name, str):
+            continue
+        name = name.strip()
+        if not name or name in seen:
+            continue
+        # Skip non-checkpoint status keys that some builds nest under models.
+        if name in ('models', 'default_model', 'lm_models', 'loaded_lm_model',
+                    'llm_initialized', 'code', 'error', 'timestamp', 'extra'):
+            continue
+        seen.add(name)
+        models.append(name)
+    if default_model and isinstance(default_model, str):
+        default_model = default_model.strip() or None
+        if default_model and default_model not in seen:
+            models.insert(0, default_model)
+    return jsonify(ok=True, models=models, reachable=True,
+                   default_model=default_model)
+
+@app.route('/api/music/genres')
+@require_permission('music_generation')
+def api_music_genres():
+    """Genre -> music prompt map, so the Tools tab can show and pre-fill prompts."""
+    return jsonify(ok=True, genres=[{'key': g, 'prompt': GENRE_PROMPTS.get(g, '')}
+                                    for g in GENRE_NAMES])
+
+class _FileThenCleanup:
+    """Response body that streams a file and then runs `cleanup` -- reliably.
+
+    The obvious way to do this, send_file() + response.call_on_close(), does
+    NOT work: a send_file response is handed to the server in
+    direct-passthrough mode and its close callbacks never fire (measured
+    under both waitress and Flask's own test client -- the temp file was
+    still there afterwards every time). A WSGI server does always call
+    close() on the body iterable itself, though, whether the download
+    finished, was aborted half-way, or never started, so the cleanup lives
+    there instead."""
+
+    def __init__(self, path, cleanup, chunk=1 << 20):
+        self._f = open(path, 'rb')
+        self._cleanup = cleanup
+        self._chunk = chunk
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        data = self._f.read(self._chunk)
+        if not data:
+            raise StopIteration
+        return data
+
+    def close(self):
+        try:
+            self._f.close()
+        finally:
+            cb, self._cleanup = self._cleanup, None
+            if cb:
+                try:
+                    cb()
+                except Exception as e:
+                    print(f'Download cleanup failed (non-fatal): {e}')
+
+
+def send_temp_download(path, download_name, mimetype, cleanup):
+    """Sends `path` as an attachment named `download_name`, then calls
+    cleanup() once the response is closed. For downloads built on demand
+    (a converted file, a zip) that must not outlive the request."""
+    resp = Response(_FileThenCleanup(path, cleanup), mimetype=mimetype)
+    resp.headers['Content-Length'] = str(os.path.getsize(path))
+    resp.headers.set('Content-Disposition', 'attachment', filename=download_name)
+    return resp
+
+
+def _demucs_available():
+    return shutil.which(DEMUCS_BIN) is not None
+
+# demucs' default 4-way separation model; a fixed choice rather than another
+# knob -- htdemucs is the current well-supported general-purpose default
+# upstream, and exposing a model picker here would be one more thing that
+# can be misconfigured for a feature that's already opt-in.
+_DEMUCS_MODEL = os.environ.get('DEMUCS_MODEL', 'htdemucs')
+
+def separate_stems(src_path, mode, out_dir):
+    """Run demucs on src_path, writing stems under out_dir. `mode` is
+    'vocals' (2-stem: vocals + instrumental) or '4stem' (vocals/drums/
+    bass/other). Returns (list of (label, path), None) on success, or
+    (None, error_message) on failure.
+
+    Shelled out like ffmpeg elsewhere in this file rather than imported as a
+    Python dependency of the Flask process itself -- demucs pulls in torch,
+    which every other ML capability here (Ollama, Whisper, ACE-Step, Fish
+    Audio, Woosh) deliberately keeps OUT of this process by running as a
+    separate service instead. A subprocess call keeps that same separation
+    even though demucs itself doesn't ship as a standalone server."""
+    cmd = [DEMUCS_BIN, '-n', _DEMUCS_MODEL, '-o', out_dir]
+    if mode == 'vocals':
+        cmd += ['--two-stems', 'vocals']
+    cmd.append(src_path)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=DEMUCS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, f'Stem separation timed out after {DEMUCS_TIMEOUT}s.'
+    if r.returncode != 0:
+        return None, f'Stem separation failed: {(r.stderr or r.stdout or "")[-500:]}'
+    # demucs writes to <out_dir>/<model_name>/<track_name_without_ext>/*.wav
+    track_name = os.path.splitext(os.path.basename(src_path))[0]
+    stem_dir = os.path.join(out_dir, _DEMUCS_MODEL, track_name)
+    if not os.path.isdir(stem_dir):
+        return None, 'Stem separation reported success but produced no output files.'
+    stems = []
+    for fn in sorted(os.listdir(stem_dir)):
+        label = os.path.splitext(fn)[0]  # 'vocals', 'no_vocals', 'drums', 'bass', 'other'
+        path = os.path.join(stem_dir, fn)
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            stems.append((label, path))
+    if not stems:
+        return None, 'Stem separation reported success but produced no output files.'
+    return stems, None
+
+@app.route('/api/music/export')
+@require_permission('music_generation')
+def api_music_export():
+    """Download a generated (or any uploaded-folder) audio file with a
+    caller-chosen name, optionally transcoded to WAV and/or split into
+    stems -- three separate, composable options rather than three separate
+    endpoints, since a real request is often "give me the vocals, as WAV,
+    named X" all at once.
+
+    ?filename= is the existing file's basename in UPLOAD_FOLDER (as returned
+    by /api/music/generate's `samples[].filename`) -- secure_filename'd and
+    existence-checked so this can only ever serve a file already sitting in
+    that one folder, never an arbitrary path. ?name= is the caller's desired
+    base filename for the download (extension is always decided by this
+    endpoint, never taken from what they typed, so a stray ".mp3" in the
+    name field can't produce a mismatched file). ?format=wav re-encodes if
+    the source isn't already WAV; anything else keeps the source's own
+    format untouched. ?stem=vocals|4stem runs demucs and zips the resulting
+    stem files together (a single download rather than N separate ones)."""
+    filename = secure_filename((request.args.get('filename') or '').strip())
+    if not filename:
+        return jsonify(ok=False, error='No file specified.'), 400
+    src_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    if not os.path.exists(src_path):
+        return jsonify(ok=False, error='File not found -- it may already have been cleaned up.'), 404
+
+    fmt = (request.args.get('format') or 'original').strip().lower()
+    if fmt not in ('original', 'wav'):
+        fmt = 'original'
+    stem = (request.args.get('stem') or 'none').strip().lower()
+    if stem not in ('none', 'vocals', '4stem'):
+        stem = 'none'
+    custom_name = (request.args.get('name') or '').strip()
+    # secure_filename also strips any extension-looking suffix the caller
+    # typed (e.g. pasting "mytrack.mp3" into the name field) -- the real
+    # extension is always decided below, never whatever they typed here.
+    safe = secure_filename(os.path.splitext(custom_name)[0]) if custom_name else ''
+    base_name = safe or os.path.splitext(filename)[0]
+
+    if stem != 'none':
+        if not _demucs_available():
+            return jsonify(ok=False, error=f'Stem separation requires Demucs ("{DEMUCS_BIN}") to be installed '
+                                           'on this server (pip install demucs) -- ask your admin to set it up.'), 503
+        work_dir = tempfile.mkdtemp(prefix='stems_')
+        stems, err = separate_stems(src_path, stem, work_dir)
+        if err:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return jsonify(ok=False, error=err), 500
+        zip_path = os.path.join(work_dir, f'{base_name}_stems.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for label, path in stems:
+                zf.write(path, arcname=f'{base_name}_{label}{os.path.splitext(path)[1]}')
+        return send_temp_download(zip_path, f'{base_name}_stems.zip', 'application/zip',
+                                  cleanup=lambda: shutil.rmtree(work_dir, ignore_errors=True))
+
+    src_ext = os.path.splitext(filename)[1].lower()
+    if fmt == 'wav' and src_ext != '.wav':
+        out_path = os.path.join(app.config['UPLOAD_FOLDER'], f'export_{int(time.time() * 1000)}.wav')
+        try:
+            run_ffmpeg([FFMPEG, '-y', '-i', src_path, '-c:a', 'pcm_s16le', out_path],
+                       timeout=120, label='Music WAV export')
+        except MediaToolTimeout:
+            return jsonify(ok=False, error='Conversion to WAV timed out.'), 500
+        if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+            return jsonify(ok=False, error='Conversion to WAV failed.'), 500
+        return send_temp_download(out_path, f'{base_name}.wav', 'audio/wav',
+                                  cleanup=lambda: os.path.exists(out_path) and os.remove(out_path))
+
+    out_ext = src_ext.lstrip('.') or 'wav'
+    return send_file(src_path, as_attachment=True, download_name=f'{base_name}.{out_ext}')
+
+@app.route('/api/sfx/generate', methods=['POST'])
+@require_permission('text_to_sfx')
+def api_sfx_generate():
+    """Standalone Woosh SFX generation for the Tools tab: any text description,
+    not just the fixed genre-derived prompts the trailer pipeline uses."""
+    def _num(key, default, lo, hi, cast=float):
+        raw = (request.form.get(key) or '').strip()
+        if raw == '':
+            return default
+        try:
+            return max(lo, min(hi, cast(float(raw))))
+        except (TypeError, ValueError):
+            return default
+
+    prompt = (request.form.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify(ok=False, error='Enter a description of the sound you want.'), 400
+    # No UI control for this anymore -- Woosh's own API has no duration
+    # parameter at all (see _woosh_generate's docstring); the only way
+    # "duration" ever meant anything here was trimming the output afterward
+    # with ffmpeg, which just chopped whatever natural length Woosh produced.
+    # Removed rather than kept as a hidden default trim, so the tool always
+    # returns Woosh's own take on how long the sound should be.
+    samples = _num('samples', 1, 1, WOOSH_MAX_SAMPLES, int)
+
+    paths, err = woosh_sfx_generate(prompt, duration=None, samples=samples)
+    if err:
+        return jsonify(ok=False, error=err), 502
+
+    return jsonify(ok=True, prompt=prompt, samples=[{
+        'url': f'/uploads/{os.path.basename(p)}',
+        'filename': os.path.basename(p),
+        'duration': round(probe_duration(p) or 0, 1),
+    } for p in paths])
+
+@app.route('/api/trailer/cancel/<job_id>', methods=['POST'])
+@require_permission('promo_generation')
+def api_trailer_cancel(job_id):
+    """Cancel a queued or in-flight trailer job. Queued jobs stop immediately;
+    running jobs unwind at their next progress checkpoint (best-effort)."""
+    j = job_get(job_id)
+    if not j:
+        return jsonify(error='Unknown job id'), 404
+    if not _owns_or_admin(j.get('user_id')):
+        return jsonify(error='That job belongs to a different account.'), 403
+    ok = job_cancel(job_id)
+    if not ok:
+        j = job_get(job_id)
+        if not j:
+            return jsonify(error='Unknown job id'), 404
+        return jsonify(error='Job already finished'), 409
+    return jsonify(cancelled=True, job_id=job_id)
+
+@app.route('/api/trailer/library')
+@require_permission('promo_generation')
+def api_trailer_library():
+    """Lists saved trailers (most recent first) for the History panel. A
+    regular account sees only trailers it saved; an admin sees everyone's."""
+    is_admin = session.get('role') == 'admin'
+    return jsonify(ok=True, items=library_list(user_id=session.get('user_id'), is_admin=is_admin))
+
+@app.route('/api/admin/library-stats')
+def api_admin_library_stats():
+    """Total saved-trailer count, their combined size on disk, and free space
+    remaining -- for the dashboard's admin-only Library card. Admin-only
+    since it reports on every user's saved trailers combined, not just the
+    caller's own."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    stats = library_stats()
+    free_mb = free_disk_mb(LIBRARY_DIR)
+    return jsonify(ok=True, count=stats['count'], total_bytes=stats['total_bytes'],
+                   missing_files=stats['missing_files'],
+                   free_mb=round(free_mb) if free_mb is not None else None)
+
+@app.route('/api/admin/audit-log')
+def api_admin_audit_log():
+    """The most recent audit entries for Config > Audit Log. Admin-only --
+    this is a record of every user's actions, not just the caller's own.
+    Optional ``?q=`` filters action/target/detail/username (substring)."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    q = request.args.get('q') or None
+    return jsonify(ok=True, items=audit_log_list(limit=200, q=q), q=q or '')
+
+@app.route('/api/trailer/library/<int:tid>')
+@require_permission('promo_generation')
+def api_trailer_library_get(tid):
+    """Returns one saved trailer's full result payload, ready to hand straight
+    to the same renderer used for a just-completed job."""
+    row = library_get_row(tid)
+    if not row or not row.get('result_json'):
+        return jsonify(ok=False, error='Not found'), 404
+    if not _owns_or_admin(row.get('user_id')):
+        return jsonify(ok=False, error='Not found'), 404
+    return jsonify(ok=True, result=json.loads(row['result_json']), created_at=row['created_at'])
+
+@app.route('/api/trailer/library/<int:tid>/delete', methods=['POST'])
+@require_permission('promo_generation')
+def api_trailer_library_delete(tid):
+    row = library_get_row(tid)
+    if not row:
+        return jsonify(ok=False, error='Not found'), 404
+    if not _owns_or_admin(row.get('user_id')):
+        return jsonify(ok=False, error='Not found'), 404
+    ok = library_delete(tid)
+    if not ok:
+        return jsonify(ok=False, error='Not found'), 404
+    audit_log('trailer_delete', target=row.get('orig_name') or f'trailer #{tid}',
+               user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True)
+
+@app.route('/library/<int:tid>/file')
+@require_permission('promo_generation')
+def library_file(tid):
+    row = library_get_row(tid)
+    if not row:
+        return jsonify(error='Not found'), 404
+    if not _owns_or_admin(row.get('user_id')):
+        return jsonify(error='Not found'), 404
+    return send_from_directory(LIBRARY_DIR, row['filename'], conditional=True)
+
+@app.route('/library/<int:tid>/download')
+@require_permission('promo_generation')
+def library_download(tid):
+    cache_path, base_name, ext, err, status = _resolve_export_file(tid, custom_name=request.args.get('name'))
+    if err:
+        return jsonify(error=err), status
+    resp = send_from_directory(LIBRARY_DIR, os.path.basename(cache_path))
+    resp.headers['Content-Disposition'] = f'attachment; filename="{base_name}.{ext}"'
+    return resp
+
+@app.route('/library/<int:tid>/fcpxml')
+@require_permission('promo_generation')
+def library_fcpxml(tid):
+    row = library_get_row(tid)
+    if not row or not _owns_or_admin(row.get('user_id')):
+        return jsonify(error='Not found'), 404
+    try:
+        xml_text = build_fcpxml(row)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    base_name = os.path.splitext(row['orig_name'] or row['filename'])[0]
+    resp = Response(xml_text, mimetype='application/xml')
+    resp.headers['Content-Disposition'] = f'attachment; filename="{secure_filename(base_name)}_cut.xml"'
+    return resp
+
+def _resolve_export_file(tid, fmt_key=None, custom_name=None):
+    """Resolves (generating and caching if needed) the exported delivery file
+    for a library trailer. Shared by the browser-download route and the
+    send-to-destination route below -- both need the exact same "have we
+    already exported this format, and if not, build it" logic, and having
+    two copies of an ffmpeg-invoking cache check is exactly the kind of
+    thing that quietly drifts out of sync over time.
+
+    custom_name, if given, only affects the returned DISPLAY name
+    (base_name) -- the actual cached file on disk is still keyed by trailer
+    id + format regardless of what someone names their download, so
+    renaming never creates a duplicate export or invalidates the cache for
+    anyone else pulling the same format.
+
+    Returns (cache_path, base_name, ext, error, status_code). On success,
+    error is None and status_code is unused."""
+    row = library_get_row(tid)
+    if not row:
+        return None, None, None, 'Not found', 404
+    if not _owns_or_admin(row.get('user_id')):
+        return None, None, None, 'Not found', 404
+    fmt_key = fmt_key or request.args.get('format', 'mp4_high')
+    if fmt_key not in EXPORT_FORMATS:
+        return None, None, None, f'Unknown export format: {fmt_key}', 400
+    src_path = os.path.join(LIBRARY_DIR, row['filename'])
+    if not os.path.exists(src_path):
+        return None, None, None, 'File not found', 404
+    ext = EXPORT_FORMATS[fmt_key]['ext']
+    if custom_name and custom_name.strip():
+        # secure_filename() also strips any extension-looking suffix the
+        # person typed (e.g. pasting "promo.mp4" as the name) along with
+        # anything unsafe -- the real extension is always the export
+        # format's own, appended once below, never whatever they typed.
+        safe = secure_filename(os.path.splitext(custom_name.strip())[0])
+        base_name = safe if safe else None
+    else:
+        base_name = None
+    if not base_name:
+        base_name, _ = os.path.splitext(row['orig_name'] or row['filename'])
+    cache_name = f'{os.path.splitext(row["filename"])[0]}_{fmt_key}.{ext}'
+    cache_path = os.path.join(LIBRARY_DIR, cache_name)
+    if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 0):
+        cmd = build_export_cmd(src_path, cache_path, fmt_key)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 0):
+            return None, None, None, f'Export to {fmt_key} failed: {r.stderr[-800:]}', 500
+    return cache_path, base_name, ext, None, 200
+
+def _fps_to_timebase_ntsc(fps):
+    """Maps a real, measured frame rate to the nearest FCP XML
+    timebase/ntsc pair. This distinction is the single most fragile part
+    of legacy FCP XML: <timebase>24</timebase><ntsc>FALSE</ntsc> means
+    true 24.000fps, while the same <timebase>24</timebase> with
+    <ntsc>TRUE</ntsc> means 23.976fps instead -- get this wrong and every
+    timecode in the file is silently off by a factor of 1000/1001,
+    drifting further apart the longer the sequence runs (this exact
+    confusion is a real, commonly-reported problem when NLEs round-trip
+    FCP XML with each other). Snaps to the nearest of the handful of
+    frame rates FCP XML actually has names for, rather than embedding an
+    arbitrary measured value like "29.94" that isn't a real broadcast
+    standard and that an NLE has no defined way to interpret."""
+    if fps <= 0:
+        return 25, False  # an unreadable fps (0) shouldn't happen, but guessing a common broadcast rate beats crashing
+    candidates = [
+        (23.976, 24, True), (24.0, 24, False),
+        (25.0, 25, False),
+        (29.97, 30, True), (30.0, 30, False),
+        (50.0, 50, False),
+        (59.94, 60, True), (60.0, 60, False),
+    ]
+    _, timebase, ntsc = min(candidates, key=lambda c: abs(c[0] - fps))
+    return timebase, ntsc
+
+def _path_to_file_url(path):
+    """A file:// URL an NLE on the same network/server can resolve back to
+    the real source file. Windows paths (this app's own deployment) use
+    backslashes, which the file:// scheme doesn't recognize as
+    separators, so those are converted to forward slashes; the leading
+    drive letter (C:/...) is kept as-is and just needs a single leading
+    slash before it, matching the widely-supported file://localhost/C:/...
+    convention rather than the three-slash file:///C:/... form, since
+    NLEs vary in which of the two they parse most reliably."""
+    normalized = path.replace('\\', '/')
+    if not normalized.startswith('/'):
+        normalized = '/' + normalized
+    return 'file://localhost' + normalized
+
+FCPXML_TRANSITION_STYLES = (
+    # Legacy xmeml's own transition vocabulary is far smaller than the
+    # ffmpeg xfade styles this app actually renders with (see
+    # VALID_TRANSITIONS above) -- exact style parity isn't achievable and
+    # isn't really the point for a rough-cut hand-off: what matters is
+    # WHERE a transition happens and how long it lasts, not reproducing
+    # the precise look. Everything maps to one of these three broadly-
+    # supported legacy effect names, chosen by rough family resemblance.
+    ({'wipeleft', 'wiperight', 'wipeup', 'wipedown', 'diagtl', 'diagtr', 'diagbl', 'diagbr',
+      'hlslice', 'hrslice', 'vuslice', 'vdslice', 'circlecrop', 'rectcrop', 'circleopen', 'circleclose'}, 'Wipe'),
+    ({'slideleft', 'slideright', 'slideup', 'slidedown', 'smoothleft', 'smoothright', 'smoothup',
+      'smoothdown', 'squeezev', 'squeezeh', 'horzopen', 'horzclose', 'vertopen', 'vertclose'}, 'Push'),
+)
+
+def _fcpxml_transition_name(style):
+    for styles, name in FCPXML_TRANSITION_STYLES:
+        if style in styles:
+            return name
+    return 'Cross Dissolve'  # fades, dissolves, and everything else not named above
+
+def _probe_media_duration_s(path):
+    """Real duration in seconds via ffprobe -- used only to place a
+    material's audio clipitem in build_fcpxml_package, so a rough estimate
+    (falling back to 0, which the caller treats as "skip this material")
+    beats crashing the whole export over one unreadable file."""
+    try:
+        r = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', path],
+            capture_output=True, text=True, timeout=20)
+        return max(0.0, float((r.stdout or '0').strip() or 0))
+    except Exception:
+        return 0.0
+
+def build_fcpxml_package(row, include_audio_tracks=False):
+    """Legacy "Final Cut Pro XML Interchange Format" (xmeml version 5) --
+    deliberately NOT modern FCPXML (Final Cut Pro X's own, structurally
+    different and incompatible format). Chose the older dialect on
+    purpose: Premiere Pro and DaVinci Resolve both read this one, while
+    Premiere cannot import modern FCPXML at all without a paid
+    third-party converter -- for a facility where editors may use
+    different NLEs, the old format is the one that's actually broadly
+    useful, "legacy" status notwithstanding.
+
+    The "package" here is more than the original single-track cut:
+      - Video track: one clipitem per selected scene, referencing the
+        original HIRES source file (single file, or an already-combined
+        multi-file result -- whichever source_video_path already points
+        to, matching what a csv_video Send to destination sends alongside
+        its CSV) at that scene's real in/out points, named with the
+        source's own ORIGINAL filename rather than this app's internal
+        one. (Referencing each separately-combined original HIRES file on
+        its own, rather than the single already-combined result, isn't
+        supported yet -- source_video_path only ever records the one
+        file that was actually scored/cut from, matching the rest of this
+        app's existing Send to destination/csv_video handling.)
+      - Transitions: when the render used a real crossfade style (not a
+        hard cut) and xfade_dur > 0, a <transitionitem> is inserted at
+        each cut, and the two adjoining clips are given a small amount of
+        extra handle (up to half the crossfade each side, borrowed from
+        the source footage just outside the originally detected scene
+        bounds and clamped to the source's own duration) so there's
+        actually overlapping footage for the transition to dissolve
+        between -- not just a transition marker sitting on top of a hard
+        cut with nothing underneath it.
+      - Cut points: a sequence marker at every scene's start, so an
+        editor can jump cut-to-cut without hunting through the track.
+      - Multi-material: when include_audio_tracks is True, separate audio
+        tracks are added for whichever of music / VO / title card / end
+        card actually survived to this point (see fcpxml_materials on the
+        result -- an AI-generated bed/VO or a since-cleaned-up upload
+        simply isn't included; a partial package beats none). Each is
+        referenced by its own original filename, placed at the head of
+        the sequence for a rough starting point -- exact sync against the
+        cut is left to the editor, the same way a real EDL hand-off
+        would be.
+
+    Raises ValueError (safe to show the user) if there's no recorded
+    scene selection, no recorded source path, or the source file no
+    longer exists on disk to probe its real dimensions/frame rate from
+    -- a direct upload is cleaned up after rendering and won't be
+    available here; only a network-staged source survives (see
+    fetch_network_file/library_send_to_destination's own csv_video
+    handling, which relies on the same survival)."""
+    result = json.loads(row['result_json'] or '{}')
+    scenes = result.get('scenes') or []
+    source_path = result.get('source_video_path')
+    if not scenes:
+        raise ValueError('This trailer has no recorded scene selection to export.')
+    if not source_path:
+        raise ValueError('This trailer has no recorded source video to reference.')
+    if not os.path.exists(source_path):
+        raise ValueError('The original source video is no longer available on this server '
+                          '(direct uploads are cleaned up after rendering; only a '
+                          'network-staged source is kept).')
+
+    cap = cv2.VideoCapture(source_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    real_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    src_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+    cap.release()
+    timebase, ntsc = _fps_to_timebase_ntsc(real_fps)
+    fps = timebase * (1000.0 / 1001.0) if ntsc else float(timebase)
+
+    source_name = xml_escape(result.get('orig_name') or os.path.basename(source_path))
+    file_url = xml_escape(_path_to_file_url(source_path))
+    rate_block = f'<rate><timebase>{timebase}</timebase><ntsc>{"TRUE" if ntsc else "FALSE"}</ntsc></rate>'
+
+    # A real crossfade needs overlapping footage, which a hard cut (no
+    # transition, or xfade_dur == 0) never gets -- both are treated the
+    # same way below: zero handle borrowed, no <transitionitem> emitted.
+    ps = result.get('production_summary') or {}
+    transition_style = ps.get('transition') or 'cut'
+    xfade_dur_s = float(ps.get('xfade_dur') or 0)
+    xfade_frames = round(xfade_dur_s * fps) if transition_style not in ('cut', 'none', '') else 0
+    handle = xfade_frames // 2
+
+    raw_in_out = []  # (in_frame, out_frame) at each scene's OWN detected bounds, before handle extension
+    for s in scenes:
+        start_s = float(s.get('start') or 0)
+        end_s = float(s.get('end') or 0)
+        in_frame = max(0, round(start_s * fps))
+        out_frame = max(in_frame + 1, round(end_s * fps))
+        raw_in_out.append((in_frame, out_frame))
+
+    clip_items = []
+    transition_items = []
+    marker_items = []
+    cursor = 0  # sequence-timeline position, in frames, of the next clip's nominal (pre-overlap) start
+    n = len(scenes)
+    for i, s in enumerate(scenes):
+        in_frame, out_frame = raw_in_out[i]
+        # Borrow up to `handle` extra source frames past this scene's own
+        # detected end (for a transition into the NEXT clip) and before
+        # its own detected start (for a transition from the PREVIOUS
+        # clip) -- clamped so it never reads before frame 0 or past the
+        # source's own last frame.
+        lead = handle if i > 0 else 0
+        trail = handle if i < n - 1 else 0
+        ext_in = max(0, in_frame - lead)
+        ext_out = out_frame + trail
+        if src_total_frames:
+            ext_out = min(ext_out, src_total_frames)
+        clip_len = ext_out - ext_in
+        seq_start = cursor - lead
+        seq_end = seq_start + clip_len
+        # Next clip's nominal start overlaps this one by `trail` frames --
+        # that overlap IS the transition region.
+        cursor = seq_end - trail
+
+        if i == 0:
+            file_block = (
+                f'<file id="file-1"><name>{source_name}</name>'
+                f'<pathurl>{file_url}</pathurl>{rate_block}'
+                f'<media><video><samplecharacteristics>{rate_block}'
+                f'<width>{width}</width><height>{height}</height>'
+                f'</samplecharacteristics></video>'
+                f'<audio><samplecharacteristics><depth>16</depth><samplerate>48000</samplerate>'
+                f'</samplecharacteristics><channelcount>2</channelcount></audio></media></file>'
+            )
+        else:
+            file_block = '<file id="file-1"/>'
+        desc = xml_escape(str(s.get('description') or ''))
+        clip_items.append(
+            f'<clipitem id="clipitem-{i+1}"><masterclipid>masterclip-1</masterclipid>'
+            f'<name>{source_name} - Scene {xml_escape(str(s.get("scene", i+1)))}</name>'
+            f'<enabled>TRUE</enabled><duration>{clip_len}</duration>{rate_block}'
+            f'<start>{seq_start}</start><end>{seq_end}</end>'
+            f'<in>{ext_in}</in><out>{ext_out}</out>{file_block}'
+            f'<logginginfo><description>{desc}</description></logginginfo>'
+            f'</clipitem>'
+        )
+        # Cut point marker at this scene's actual (non-extended) start.
+        marker_items.append(
+            f'<marker><name>{xml_escape("Scene " + str(s.get("scene", i + 1)))}</name>'
+            f'<in>{seq_start + lead}</in><out>-1</out><comment>{desc}</comment></marker>'
+        )
+        if trail > 0 and i < n - 1:
+            trans_name = xml_escape(_fcpxml_transition_name(transition_style))
+            trans_start, trans_end = seq_end - trail, seq_end
+            transition_items.append(
+                f'<transitionitem><name>{trans_name}</name><duration>{trail}</duration>{rate_block}'
+                f'<start>{trans_start}</start><end>{trans_end}</end><alignment>center</alignment>'
+                f'<effect><name>{trans_name}</name><effectid>{trans_name}</effectid>'
+                f'<effectcategory>Dissolve</effectcategory><effecttype>transition</effecttype>'
+                f'<mediatype>video</mediatype></effect></transitionitem>'
+            )
+
+    total_frames = cursor
+    base_name = os.path.splitext(row['orig_name'] or row['filename'])[0]
+    seq_name = xml_escape(base_name + '_cut')
+
+    # Additional audio tracks for whichever multi-material sources
+    # actually survived to this point -- see this function's own docstring.
+    # Each occupies its own <track> (not mixed onto the video's own audio
+    # track above), placed at the head of the sequence as a rough starting
+    # point rather than attempting precise sync, matching how a real EDL
+    # hand-off leaves fine placement to the editor.
+    audio_tracks = []
+    if include_audio_tracks:
+        materials = (result.get('fcpxml_materials') or {})
+        for kind, label in (('music', 'Music'), ('vo', 'VO'), ('card_title', 'Title Card'), ('card_end', 'End Card')):
+            mat = materials.get(kind)
+            if not mat or not mat.get('path') or not os.path.exists(mat['path']):
+                continue
+            dur_s = _probe_media_duration_s(mat['path'])
+            if dur_s <= 0:
+                continue
+            dur_frames = max(1, round(dur_s * fps))
+            mat_name = xml_escape(mat.get('orig_name') or os.path.basename(mat['path']))
+            mat_url = xml_escape(_path_to_file_url(mat['path']))
+            file_id = f'file-{kind}'
+            audio_tracks.append(
+                '<track>'
+                f'<clipitem id="clipitem-{kind}"><masterclipid>masterclip-{kind}</masterclipid>'
+                f'<name>{mat_name}</name><enabled>TRUE</enabled><duration>{dur_frames}</duration>{rate_block}'
+                f'<start>0</start><end>{dur_frames}</end><in>0</in><out>{dur_frames}</out>'
+                f'<file id="{file_id}"><name>{mat_name}</name><pathurl>{mat_url}</pathurl>{rate_block}'
+                f'<media><audio><samplecharacteristics><depth>16</depth><samplerate>48000</samplerate>'
+                f'</samplecharacteristics></audio></media></file>'
+                f'<logginginfo><description>{label}</description></logginginfo>'
+                '</clipitem>'
+                '</track>'
+            )
+
+    audio_block = ''
+    if audio_tracks:
+        audio_block = '<audio>' + ''.join(audio_tracks) + '</audio>'
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE xmeml>\n'
+        '<xmeml version="5">\n'
+        '<sequence>\n'
+        f'<name>{seq_name}</name>\n'
+        f'<duration>{total_frames}</duration>\n'
+        f'{rate_block}\n'
+        '<media><video><format><samplecharacteristics>\n'
+        f'{rate_block}\n'
+        f'<width>{width}</width><height>{height}</height>\n'
+        '</samplecharacteristics></format>\n'
+        '<track>\n' + '\n'.join(clip_items + transition_items) + '\n</track>\n'
+        '</video>' + audio_block + '</media>\n'
+        + '\n'.join(marker_items) + '\n'
+        '</sequence>\n'
+        '</xmeml>\n'
+    )
+
+# Kept as a thin alias -- the name existing call sites (the manual FCP XML
+# download button's route, and older tests) already use, now delegating to
+# the fuller package builder above with audio tracks off, which reproduces
+# exactly this function's original video-only-plus-markers-plus-transitions
+# output.
+def build_fcpxml(row):
+    return build_fcpxml_package(row, include_audio_tracks=False)
+
+def build_scene_list_csv(row):
+    """Same CSV shape as the client-side downloadSceneListCsv() (used for
+    the manual "Scene list CSV" button), rebuilt server-side from a saved
+    library row's own result_json -- needed here because Send to
+    destination is a server-side SMB write, with no browser involved to
+    build a Blob from data already sitting in a page's memory."""
+    result = json.loads(row['result_json'] or '{}')
+    lines = ['#,Start_s,End_s,Used_s,Score,Description']
+    for s in (result.get('scenes') or []):
+        desc = str(s.get('description', '')).replace('"', '""')
+        lines.append(f"{s.get('scene','')},{s.get('start','')},{s.get('end','')},"
+                     f"{s.get('duration','')},{s.get('quality','')},\"{desc}\"")
+    return '\n'.join(lines) + '\n'
+
+_SEND_MEDIA_EXT = re.compile(r'\.(mp4|mov|mxf|m4v|mkv|avi|webm|srt)$', re.I)
+
+
+def destination_filename(custom, original):
+    """(filename to write at the destination, error or None).
+
+    `custom` is what the editor typed, or nothing for the file's own name.
+    The extension is always the delivery file's own -- renaming must not be
+    able to make an MP4 look like a ProRes .mov -- so one typed on the end
+    is dropped, while a dot that is part of the name ("Promo v1.2") stays.
+    The rest is reduced to what is safe as a filename on a network share:
+    the same rule the promo generator applies to its custom export names."""
+    custom = ' '.join(str(custom or '').split())
+    if not custom:
+        return original, None
+    ext = os.path.splitext(original)[1]
+    # Both kinds of slash become word breaks first, so the result is the same
+    # on the Windows server as anywhere else, and is never a path.
+    stem = secure_filename(re.sub(r'[\\/]+', ' ', _SEND_MEDIA_EXT.sub('', custom)))[:120].rstrip('._-')
+    if not stem:
+        return None, ('That name has nothing in it that can be used in a filename. Use letters, numbers, '
+                      'spaces, dashes or underscores.')
+    return stem + ext, None
+
+
+def send_file_to_network_destination(local_path, remote_filename, destination):
+    """Copies an already-exported local file to `destination` (a
+    network_destinations row) -- the write-side counterpart to
+    fetch_network_file()'s read. Registers its own SMB session directly
+    from the destination's own path/username/password rather than going
+    through _network_session()/load_network_folders(), since a destination
+    is a separate, admin-managed, potentially-multiple set of credentials,
+    not one of the fixed single-value network categories those helpers
+    were built for.
+
+    Raises ValueError with a message safe to show the user (the write
+    itself failing -- most commonly a permissions or connectivity problem
+    on the destination share) rather than letting a raw smbprotocol
+    exception surface."""
+    root = _normalize_unc_path(destination['path'])
+    parts = root.split('\\')
+    host = parts[2] if len(parts) > 2 else ''
+    try:
+        smbclient.register_session(host, username=destination.get('username') or '',
+                                    password=destination.get('password') or '', connection_timeout=10)
+        remote_path = root + '\\' + remote_filename
+        with open(local_path, 'rb') as lf, smbclient.open_file(remote_path, mode='wb') as rf:
+            shutil.copyfileobj(lf, rf)
+    except Exception as e:
+        raise ValueError(f'Could not write to "{destination["name"]}": {e}')
+
+def send_bytes_to_network_destination(data, remote_filename, destination):
+    """Same as send_file_to_network_destination, but for in-memory content
+    (the generated CSV) rather than an existing local file -- avoids
+    writing the CSV to a throwaway temp file first just to immediately
+    read it back for the SMB upload."""
+    root = _normalize_unc_path(destination['path'])
+    parts = root.split('\\')
+    host = parts[2] if len(parts) > 2 else ''
+    try:
+        smbclient.register_session(host, username=destination.get('username') or '',
+                                    password=destination.get('password') or '', connection_timeout=10)
+        remote_path = root + '\\' + remote_filename
+        with smbclient.open_file(remote_path, mode='wb') as rf:
+            rf.write(data)
+    except Exception as e:
+        raise ValueError(f'Could not write to "{destination["name"]}": {e}')
+
+@app.route('/library/<int:tid>/send-to-destination', methods=['POST'])
+@require_permission('promo_generation')
+def library_send_to_destination(tid):
+    data = request.get_json(silent=True) or {}
+    destination_id = data.get('destination_id')
+    destination = network_destination_get(destination_id) if destination_id else None
+    if not destination:
+        return jsonify(ok=False, error='That destination no longer exists -- pick another.'), 400
+
+    fmt_key = data.get('format', 'mp4_high')
+    custom_name = data.get('filename')
+    sent = []
+
+    row = None
+    if destination['delivery_kind'] in ('csv', 'csv_video', 'fcpxml'):
+        row = library_get_row(tid)
+        if not row or not _owns_or_admin(row.get('user_id')):
+            return jsonify(ok=False, error='Not found'), 404
+
+    if destination['delivery_kind'] == 'video':
+        # Plain video-only destinations still get the finished, generated
+        # promo -- this branch is unchanged. Only csv_video (below) sends
+        # the original source instead, since that's specifically the case
+        # the CSV's timecodes are meaningful against.
+        cache_path, base_name, ext, err, status = _resolve_export_file(tid, fmt_key, custom_name=custom_name)
+        if err:
+            return jsonify(ok=False, error=err), status
+        remote_filename = f'{base_name}.{ext}'
+        try:
+            send_file_to_network_destination(cache_path, remote_filename, destination)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 502
+        sent.append(remote_filename)
+
+    elif destination['delivery_kind'] == 'csv_video':
+        # The CSV's timecodes describe cuts into the ORIGINAL (or
+        # already-combined multi-file) source video -- sending the
+        # generated promo alongside it here would be genuinely useless to
+        # a downstream EDL-driven workflow, since the promo's own timeline
+        # has nothing to do with those timecodes. source_video_path is the
+        # exact file that was actually scored and cut from at render time,
+        # recorded specifically for this. Not re-encoded or reformatted --
+        # sent as-is, in its own original format, since this is the raw
+        # material a destination like this needs, not a delivery master.
+        result = json.loads(row['result_json'] or '{}')
+        source_path = result.get('source_video_path')
+        if not source_path or not os.path.exists(source_path):
+            return jsonify(ok=False, error='The original source video for this render is no longer '
+                           'available locally (the working copy may have been cleaned up since the '
+                           'render finished) -- re-generate this promo to make it available again, '
+                           'or use a video-only or CSV-only destination instead.'), 410
+        source_ext = os.path.splitext(source_path)[1].lstrip('.') or 'mp4'
+        base_name = (custom_name or '').strip() or os.path.splitext(row['orig_name'] or row['filename'])[0]
+        base_name = secure_filename(base_name) or 'source'
+        remote_filename = f'{base_name}.{source_ext}'
+        try:
+            send_file_to_network_destination(source_path, remote_filename, destination)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 502
+        sent.append(remote_filename)
+
+    elif destination['delivery_kind'] == 'fcpxml':
+        # "XML + media only": sends the original HIRES source (same as
+        # csv_video, above) plus physical copies of any surviving music/
+        # VO/title-card/end-card assets recorded on this render, so the
+        # XML package's file:// references have real files sitting next
+        # to it on the destination even on a machine that never had this
+        # app's own upload folder mounted.
+        result = json.loads(row['result_json'] or '{}')
+        source_path = result.get('source_video_path')
+        if not source_path or not os.path.exists(source_path):
+            return jsonify(ok=False, error='The original source video for this render is no longer '
+                           'available locally (the working copy may have been cleaned up since the '
+                           'render finished) -- re-generate this promo to make it available again.'), 410
+        source_ext = os.path.splitext(source_path)[1].lstrip('.') or 'mp4'
+        base_name = (custom_name or '').strip() or os.path.splitext(row['orig_name'] or row['filename'])[0]
+        base_name = secure_filename(base_name) or 'source'
+        remote_filename = f'{base_name}.{source_ext}'
+        try:
+            send_file_to_network_destination(source_path, remote_filename, destination)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 502
+        sent.append(remote_filename)
+        for mat in (result.get('fcpxml_materials') or {}).values():
+            if not mat or not mat.get('path') or not os.path.exists(mat['path']):
+                continue
+            mat_remote = mat.get('orig_name') or os.path.basename(mat['path'])
+            try:
+                send_file_to_network_destination(mat['path'], mat_remote, destination)
+            except ValueError as e:
+                return jsonify(ok=False, error=str(e)), 502
+            sent.append(mat_remote)
+
+    if destination['delivery_kind'] in ('csv', 'csv_video'):
+        csv_text = build_scene_list_csv(row)
+        base_name = (custom_name or '').strip() or os.path.splitext(row['orig_name'] or row['filename'])[0]
+        base_name = secure_filename(base_name) or 'scenes'
+        csv_filename = f'{base_name}_scenes.csv'
+        try:
+            send_bytes_to_network_destination(csv_text.encode('utf-8'), csv_filename, destination)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 502
+        sent.append(csv_filename)
+
+    if destination['delivery_kind'] == 'fcpxml':
+        # The 'fcpxml' ("XML + media only") delivery_kind always sends the
+        # XML package by definition -- there's no separate opt-in checkbox
+        # for it (an earlier version had one; removed since it was just a
+        # redundant, always-true control once this dedicated kind exists).
+        try:
+            xml_text = build_fcpxml_package(row, include_audio_tracks=bool(destination.get('fcpxml_audio_tracks')))
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+        base_name = (custom_name or '').strip() or os.path.splitext(row['orig_name'] or row['filename'])[0]
+        base_name = secure_filename(base_name) or 'cut'
+        xml_filename = f'{base_name}_cut.xml'
+        try:
+            send_bytes_to_network_destination(xml_text.encode('utf-8'), xml_filename, destination)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 502
+        sent.append(xml_filename)
+
+    audit_log('trailer_send_to_destination', target=f'{destination["name"]}: {", ".join(sent)}',
+              user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True, filename=sent[0] if len(sent) == 1 else sent, sent=sent, destination=destination['name'])
+
+def _truthy(v):
+    """Accepts a JSON body's real boolean/1 as well as a form post's string
+    ('true'/'on'/'1') -- api_network_destinations_add/update take either,
+    since the admin destinations panel posts JSON but the field started
+    life as the kind of thing an HTML checkbox would submit."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ('1', 'true', 'on', 'yes')
+
+@app.route('/api/network/destinations', methods=['GET'])
+def api_network_destinations_list():
+    """Available to any signed-in user (not admin-only) -- everyone who can
+    generate a promo needs to see the destination list to pick one from,
+    the same way every user already sees the configured HIRES/music/etc.
+    network categories without needing admin rights. Passwords are never
+    included in this response."""
+    items = network_destinations_list()
+    for d in items:
+        d['has_password'] = bool(d.get('password'))
+        d.pop('password', None)
+    return jsonify(ok=True, items=items)
+
+@app.route('/api/network/destinations', methods=['POST'])
+def api_network_destinations_add():
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    data = request.get_json(silent=True) or request.form
+    name = (data.get('name') or '').strip()
+    path = (data.get('path') or '').strip()
+    if not name or not path:
+        return jsonify(ok=False, error='Name and network path are both required.'), 400
+    new_id = network_destination_add(
+        name, path, username=data.get('username'), password=data.get('password'),
+        delivery_kind=data.get('delivery_kind', 'video'),
+        include_fcpxml=_truthy(data.get('include_fcpxml')),
+        fcpxml_audio_tracks=_truthy(data.get('fcpxml_audio_tracks')))
+    audit_log('destination_add', target=name, user_id=session.get('user_id'),
+              username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True, id=new_id)
+
+@app.route('/api/network/destinations/<int:dest_id>', methods=['POST'])
+def api_network_destinations_update(dest_id):
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    data = request.get_json(silent=True) or request.form
+    existing = network_destination_get(dest_id)
+    if not existing:
+        return jsonify(ok=False, error='Not found'), 404
+    ok = network_destination_update(
+        dest_id, name=data.get('name'), path=data.get('path'),
+        username=data.get('username'), password=data.get('password') or None,
+        delivery_kind=data.get('delivery_kind'),
+        include_fcpxml=_truthy(data.get('include_fcpxml')) if 'include_fcpxml' in data else None,
+        fcpxml_audio_tracks=_truthy(data.get('fcpxml_audio_tracks')) if 'fcpxml_audio_tracks' in data else None)
+    if ok:
+        audit_log('destination_update', target=existing['name'], user_id=session.get('user_id'),
+                  username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=ok)
+
+@app.route('/api/network/destinations/<int:dest_id>', methods=['DELETE'])
+def api_network_destinations_delete(dest_id):
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    existing = network_destination_get(dest_id)
+    removed = network_destination_remove(dest_id)
+    if removed and existing:
+        audit_log('destination_remove', target=existing['name'], user_id=session.get('user_id'),
+                  username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=removed)
+
+
+def _monitor_snapshot(filter_user_id=None, include_username=False, kind=None):
+    """Build active/queued/finished lists from the jobs table.
+
+    When ``filter_user_id`` is set, only that user's jobs are included.
+    When None, every job is included (admin all-jobs view). ``kind`` keeps
+    one feature's jobs (see JOB_KINDS); None keeps them all. A queued job's
+    ``position`` is its place in the one queue every feature shares, so it
+    still says how many jobs of any kind are ahead of it."""
+    with JOB_QUEUE_LOCK:
+        queued_ids = list(JOB_QUEUE)
+    all_jobs = job_list_all()
+    if filter_user_id is not None:
+        snapshot = {jid: j for jid, j in all_jobs.items()
+                    if j.get('user_id') is not None and j.get('user_id') == filter_user_id}
+    else:
+        snapshot = all_jobs
+    if kind is not None:
+        snapshot = {jid: j for jid, j in snapshot.items() if j.get('kind') == kind}
+
+    queued = []
+    for i, jid in enumerate(queued_ids):
+        if jid not in snapshot:
+            continue
+        entry = {'job_id': jid, 'position': i,
+                 'orig_name': snapshot[jid].get('orig_name'),
+                 'user_id': snapshot[jid].get('user_id'), 'kind': snapshot[jid].get('kind')}
+        if include_username:
+            entry['username'] = snapshot[jid].get('username')
+        queued.append(entry)
+
+    active, finished = [], []
+    for jid, j in snapshot.items():
+        if jid in queued_ids:
+            continue
+        entry = {'job_id': jid, 'orig_name': j.get('orig_name'), 'percent': j.get('percent'),
+                 'step': j.get('step'), 'status': j.get('status'), 'created': j.get('created'),
+                 'user_id': j.get('user_id'), 'cancel_requested': bool(j.get('cancel_requested')),
+                 'kind': j.get('kind')}
+        if include_username:
+            entry['username'] = j.get('username')
+        if j.get('done'):
+            entry['error'] = j.get('error')
+            finished.append(entry)
+        else:
+            active.append(entry)
+    active.sort(key=lambda e: e['created'] or 0)
+    finished.sort(key=lambda e: e['created'] or 0, reverse=True)
+    return active, queued, finished
+
+
+@app.route('/api/monitor')
+@require_permission('promo_generation')
+def api_monitor():
+    """Live snapshot of *this account's* episodic plug jobs: running,
+    queued, or finished within JOB_TTL. Always scoped to the current user —
+    even for admins — so the Promo tab Job monitor only reflects your own
+    process. Admins use /api/admin/jobs for the whole-server view.
+
+    Only episodic plug jobs, because this is that tab's list, and because
+    the tab picks an unfinished job out of it after a reload to carry on
+    showing: handed a Vertical Shorts or Schedule Plug job, it would show
+    that as a plug being generated. ``?kind=all`` is every feature's jobs
+    for this account (the Dashboard's count); ``?kind=shorts`` or
+    ``?kind=schedule`` is one other feature's."""
+    uid = session.get('user_id')
+    if uid is None:
+        return jsonify(active=[], queued=[], finished=[], limit=GATE.status()['limit'])
+    kind = request.args.get('kind') or 'promo'
+    if kind != 'all' and kind not in JOB_KINDS:
+        return jsonify(error='Unknown kind of job.'), 400
+    active, queued, finished = _monitor_snapshot(filter_user_id=uid, include_username=False,
+                                                 kind=None if kind == 'all' else kind)
+    return jsonify(active=active, queued=queued, finished=finished[:20],
+                   limit=GATE.status()['limit'])
+
+
+@app.route('/api/admin/jobs')
+def api_admin_jobs():
+    """Whole-server job monitor for admins: every active, queued, and recent
+    finished job across all accounts. Used by Config > Jobs."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    active, queued, finished = _monitor_snapshot(filter_user_id=None, include_username=True)
+    gate = GATE.status()
+    return jsonify(ok=True, active=active, queued=queued, finished=finished[:50],
+                   limit=gate['limit'], running=gate['running'])
+
+
+@app.route('/api/admin/jobs/<job_id>/cancel', methods=['POST'])
+def api_admin_job_cancel(job_id):
+    """Admin-only cancel of any queued or running job, regardless of owner."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    j = job_get(job_id)
+    if not j:
+        return jsonify(ok=False, error='Unknown job id'), 404
+    ok = job_cancel(job_id)
+    if not ok:
+        j = job_get(job_id)
+        if not j:
+            return jsonify(ok=False, error='Unknown job id'), 404
+        return jsonify(ok=False, error='Job already finished'), 409
+    audit_log('job_cancel',
+              target=j.get('orig_name') or job_id,
+              detail=f"owner={j.get('username') or j.get('user_id')}",
+              user_id=session.get('user_id'), username=session.get('username'),
+              ip=_client_ip())
+    return jsonify(ok=True, cancelled=True, job_id=job_id)
+
+@app.route('/api/queue/status')
+def api_queue_status():
+    """Overall queue state: how many jobs are running vs the current concurrency
+    limit, plus every currently-queued job with its wait position."""
+    gate_status = GATE.status()
+    with JOB_QUEUE_LOCK:
+        queued = list(JOB_QUEUE)
+    queued_info = []
+    for i, jid in enumerate(queued):
+        j = job_get(jid)
+        queued_info.append({'job_id': jid, 'position': i, 'orig_name': (j or {}).get('orig_name')})
+    return jsonify(running=gate_status['running'], limit=gate_status['limit'], queued=queued_info)
+
+@app.route('/api/queue/limit', methods=['GET', 'POST'])
+def api_queue_limit():
+    """View or change how many trailer jobs are allowed to run at once. Changing
+    this takes effect immediately — queued jobs re-check the limit as soon as a
+    slot frees up or the limit itself changes."""
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        try:
+            new_limit = int(data.get('limit', request.form.get('limit')))
+        except (TypeError, ValueError):
+            return jsonify(error='limit must be an integer'), 400
+        if new_limit < 1:
+            return jsonify(error='limit must be at least 1'), 400
+        GATE.set_limit(new_limit)
+    return jsonify(**GATE.status())
+
+# ---- Health check: pings every external service this app depends on ----
+# For each one we just check that *something* is listening and answers HTTP —
+# we deliberately avoid hitting generation endpoints (Fish Audio /v1/tts,
+# ACE-Step /release_task, Woosh /generate, Whisper /v1/audio/transcriptions)
+# so a health check never costs GPU time or produces real output. Ollama is the
+# only service with a cheap, purpose-built status endpoint (/api/tags), so that
+# one's checked precisely; the rest are checked for bare reachability at their
+# base URL, which is enough to tell "service is up" from "connection refused".
+def _check_service(name, base_url, path='/', timeout=3):
+    t0 = time.time()
+    try:
+        r = requests.get(base_url.rstrip('/') + path, timeout=timeout)
+        latency_ms = round((time.time() - t0) * 1000)
+        # Any HTTP response at all means something is listening and answering,
+        # even a 404/405 for a path that server doesn't implement.
+        return {'name': name, 'url': base_url, 'status': 'up',
+                'http_status': r.status_code, 'latency_ms': latency_ms}
+    except requests.exceptions.Timeout:
+        return {'name': name, 'url': base_url, 'status': 'down', 'error': 'timeout'}
+    except requests.exceptions.ConnectionError:
+        return {'name': name, 'url': base_url, 'status': 'down', 'error': 'connection refused'}
+    except Exception as e:
+        return {'name': name, 'url': base_url, 'status': 'down', 'error': str(e)}
+
+@app.route('/api/network/list')
+def api_network_list():
+    """Lists the folders and files sitting in ?subpath= (default: the root)
+    of the network folder for ?category=hires|music|vo|sfx (defaults to
+    hires/video). Each category maps to its own root and its own allowed
+    extensions -- see _network_categories()."""
+    category = request.args.get('category', DEFAULT_NETWORK_CATEGORY)
+    subpath = request.args.get('subpath', '')
+    try:
+        full, sub, folders, files = list_network_files(category, subpath)
+        return jsonify(ok=True, root=full, category=category, subpath=sub,
+                        folders=folders, files=files, in_place=network_in_place(category))
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
+    except Exception as e:
+        return jsonify(ok=False, error=f'Could not reach network folder: {e}'), 500
+
+@app.route('/api/network/favorites')
+def api_network_favorites_list():
+    """This account's bookmarked folders, optionally narrowed to one
+    category via ?category=. No admin gate -- same access level as browsing
+    the network folders themselves (/api/network/list has none either),
+    since these are just personal shortcuts into what someone can already
+    reach by clicking through manually."""
+    category = request.args.get('category') or None
+    return jsonify(ok=True, items=network_favorites_list(session['user_id'], category))
+
+@app.route('/api/network/favorites', methods=['POST'])
+def api_network_favorites_add():
+    data = request.get_json(silent=True) or {}
+    category = (data.get('category') or '').strip()
+    path = (data.get('path') or '').strip()
+    label = (data.get('label') or '').strip()
+    if category not in _network_categories():
+        return jsonify(ok=False, error='Unknown category.'), 400
+    if not label:
+        # Falls back to the last path segment, or a readable placeholder for
+        # the category's own root (path='' there) -- never saves a blank
+        # label a favorites list would show as an empty row.
+        label = path.split('\\')[-1] if path else '(category root)'
+    network_favorite_add(session['user_id'], category, path, label)
+    return jsonify(ok=True, items=network_favorites_list(session['user_id'], category))
+
+@app.route('/api/network/favorites/<int:fid>', methods=['DELETE'])
+def api_network_favorites_remove(fid):
+    removed = network_favorite_remove(session['user_id'], fid)
+    if not removed:
+        return jsonify(ok=False, error='Not found.'), 404
+    return jsonify(ok=True)
+
+@app.route('/api/network/search')
+def api_network_search():
+    """Recursive file search starting at ?subpath= (default: category root)
+    for ?category=..., optionally filtered by ?q= (case-insensitive filename
+    substring -- blank returns every file found at any depth). See
+    list_network_files_recursive for the depth/result caps this respects and
+    why they exist."""
+    category = request.args.get('category', DEFAULT_NETWORK_CATEGORY)
+    subpath = request.args.get('subpath', '')
+    query = request.args.get('q', '')
+    try:
+        root, results, truncated = list_network_files_recursive(category, subpath, query)
+        return jsonify(ok=True, root=root, category=category, subpath=_sanitize_subpath(subpath),
+                        files=results, truncated=truncated)
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
+    except Exception as e:
+        return jsonify(ok=False, error=f'Could not search network folder: {e}'), 500
+
+@app.route('/api/network/fetch', methods=['POST'])
+def api_network_fetch():
+    """Copies one file from inside `subpath` of the network folder (for the
+    given category) into the local upload folder so it can be used exactly
+    like a drag-and-dropped file (see load_video() / _resolve_upload())."""
+    data = request.get_json(silent=True) or request.form
+    name = (data.get('name') or '').strip()
+    category = (data.get('category') or DEFAULT_NETWORK_CATEGORY).strip()
+    subpath = (data.get('subpath') or '').strip()
+    if not name:
+        return jsonify(ok=False, error='No filename given'), 400
+    try:
+        staged = stage_network_file(name, category, subpath)
+        # `url` lets the Player play the staged copy directly (there is none for a
+        # file left in place); callers that stage a file for the generate form use
+        # `filename`.
+        return jsonify(ok=True, filename=staged['local_name'], orig_name=name, category=category,
+                        url=f"/uploads/{staged['local_name']}",      # served from the share for a file left in place
+                        size=staged['size'], in_place=staged['in_place'], note=staged['note'])
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
+    except Exception as e:
+        return jsonify(ok=False, error=f'Could not fetch {name}: {e}'), 500
+
+@app.route('/api/network/combine', methods=['POST'])
+def api_network_combine():
+    """Combines several already-staged HIRES files (each fetched individually
+    via /api/network/fetch first) into one source video, so multi-part
+    episode footage can be treated as a single source by the rest of the
+    render pipeline completely unchanged. The combined output keeps the
+    same net_<ts>_ staging prefix a single fetch produces, which is the
+    ONLY thing load_video()/_resolve_video() actually check to trust a
+    staged file -- so nothing downstream needed to change to support this.
+
+    Requires every input to share the same file extension. ffmpeg's concat
+    demuxer with stream copy (-c copy, fast, no re-encode of what could be
+    a long broadcast episode) needs matching codecs to work at all; same
+    extension is the simple, reliable proxy for that a non-technical admin
+    can reason about, and if the codecs turn out to be genuinely
+    incompatible despite matching extensions, ffmpeg's own failure is
+    caught below and reported clearly rather than producing broken output."""
+    data = request.get_json(silent=True) or {}
+    names = data.get('files') or []
+    if not isinstance(names, list) or len(names) < 2:
+        return jsonify(ok=False, error='Select at least two files to combine.'), 400
+    if len(names) > 12:
+        return jsonify(ok=False, error='Too many files selected (max 12 at once).'), 400
+
+    exts, paths, total_size = set(), [], 0
+    for n in names:
+        safe = os.path.basename(str(n))
+        if not safe.startswith('net_'):
+            return jsonify(ok=False, error='Invalid file reference -- please re-select from the browser.'), 400
+        p = staged_path(safe)
+        if not os.path.exists(p):
+            return jsonify(ok=False, error=f'{safe} is no longer available -- please re-select it.'), 400
+        exts.add(os.path.splitext(safe)[1].lower())
+        paths.append(p)
+        total_size += os.path.getsize(p)
+
+    if len(exts) > 1:
+        return jsonify(ok=False, error='Selected files must share the same format '
+                       f'(found: {", ".join(sorted(exts))}).'), 400
+
+    # The combined size is what actually matters to the render pipeline --
+    # checked here even though each individual file was already checked at
+    # fetch time, since several files each under the limit can still add up
+    # to a combined file over it.
+    ok, err = check_video_size(total_size, label='The combined video')
+    if not ok:
+        return jsonify(ok=False, error=err), 400
+
+    ext = exts.pop()
+    combined_name = f'net_{int(time.time())}_{threading.get_ident()}_combined{ext}'
+    combined_path = os.path.join(app.config['UPLOAD_FOLDER'], combined_name)
+    list_path = combined_path + '.txt'
+    # Each segment's own duration, in the order they're being combined --
+    # returned so optional material labels on script cues (mats1, M2,
+    # material 1, etc. — naming is not standardised) can be offset onto the
+    # single combined file. Scripts with plain absolute timecodes ignore this.
+    # Probed before combining rather than after splitting the result back
+    # apart, since ffmpeg's concat-demuxer stream copy doesn't re-encode and
+    # so doesn't reliably preserve exact per-segment boundaries to re-derive
+    # them from the output alone.
+    segment_durations = [get_video_info(p).get('duration_sec', 0) for p in paths]
+    try:
+        with open(list_path, 'w', encoding='utf-8') as f:
+            for p in paths:
+                # ffmpeg's concat-demuxer list format needs its own escaping
+                # (single quotes around the path, literal quotes doubled),
+                # independent of shell quoting since this is a file ffmpeg
+                # parses itself, not a command-line argument.
+                f.write("file '" + p.replace("'", "'\\''") + "'\n")
+        cmd = [FFMPEG, '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c', 'copy', combined_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0 or not os.path.exists(combined_path):
+            return jsonify(ok=False, error='Could not combine these files -- they may not share a '
+                           'compatible codec even though the file extensions match.'), 500
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+
+    return jsonify(ok=True, filename=combined_name, orig_name=f'{len(names)} files combined{ext}',
+                   size=os.path.getsize(combined_path), url=f'/uploads/{combined_name}',
+                   segment_durations=segment_durations)
+
+# ---- Show templates (saved per-show asset bundles) ----
+
+def _tpl_num(key, default=None, lo=None, hi=None):
+    """Reads an optional numeric form field. Blank/absent -> default (so the UI can
+    leave a field untouched without wiping a previously saved value)."""
+    raw = (request.form.get(key) or '').strip()
+    if raw == '':
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+
+@app.route('/api/templates', methods=['GET'])
+@require_permission('promo_generation')
+def api_templates_list():
+    return jsonify(ok=True, templates=template_list(),
+                   slots=[{'key': k, 'label': v['label'], 'kind': v['kind']} for k, v in TEMPLATE_SLOTS.items()])
+
+@app.route('/api/templates/<int:tid>', methods=['GET'])
+@require_permission('promo_generation')
+def api_template_get(tid):
+    row = template_get(tid)
+    if not row:
+        return jsonify(ok=False, error='Template not found'), 404
+    return jsonify(ok=True, template=_template_public(row))
+
+@app.route('/api/templates', methods=['POST'])
+@require_permission('promo_generation')
+def api_template_save():
+    """Creates or updates a show template from whatever the trailer form currently
+    has selected. Accepts the same multipart field names the generate form uses
+    (including the `<field>_network` staged-file hidden inputs), so the "Add to
+    template" button can just re-post the picked files without any new plumbing.
+
+    Only slots that arrive with a file are written -- posting again with just a
+    new music bed updates that one slot and leaves the show's cards alone. Send
+    clear_<slot>=1 to deliberately empty a slot."""
+    name = (request.form.get('name') or '').strip()
+    if not name:
+        return jsonify(ok=False, error='Give the template a show name first.'), 400
+    if len(name) > 120:
+        return jsonify(ok=False, error='Name is too long (max 120 characters).'), 400
+
+    tid_raw = (request.form.get('template_id') or '').strip()
+    existing = template_get(int(tid_raw)) if tid_raw.isdigit() else None
+    if existing is None:
+        existing = template_get_by_name(name)  # saving under an existing name updates it
+
+    # Resolve whichever asset files were supplied this time round.
+    incoming = {}
+    for slot, meta in TEMPLATE_SLOTS.items():
+        exts = AUDIO_EXTENSIONS if meta['kind'] == 'audio' else ALLOWED_EXTENSIONS
+        p = _resolve_upload(meta['field'], exts)
+        if p:
+            incoming[slot] = p
+
+    if not existing and not incoming:
+        return jsonify(ok=False, error='Select at least one file (music, SFX, VO or a card), '
+                                       'or fill in the form, before saving a show.'), 400
+
+    # Capture the whole generator configuration, not just the files. A show
+    # template is "how this programme's promos are made" -- genre, transition,
+    # lengths, audio targets, voice choice -- with the assets as one part of that.
+    settings = dict(template_settings(existing)) if existing else {}
+    for key in TEMPLATE_SETTING_FIELDS:
+        if key in request.form:
+            settings[key] = (request.form.get(key) or '').strip()
+        elif key in TEMPLATE_BOOL_FIELDS and request.form:
+            # A checkbox absent from a submitted form means unticked, which is a
+            # real value -- not "leave whatever was there before".
+            settings[key] = ''
+    settings = {k: v for k, v in settings.items() if v != ''}
+
+    fields = {
+        'name': name,
+        'notes': (request.form.get('notes') or '').strip() or (existing or {}).get('notes'),
+        'genre': (request.form.get('genre') or '').strip() or (existing or {}).get('genre'),
+        'transition': (request.form.get('transition') or '').strip() or (existing or {}).get('transition'),
+        'xfade_dur': _tpl_num('xfade_dur', (existing or {}).get('xfade_dur'), 0.1, 2.0),
+        'vo_start': _tpl_num('vo_start', (existing or {}).get('vo_start'), 0),
+        'vo_volume': _tpl_num('vo_volume', (existing or {}).get('vo_volume'), 0.3, 3.0),
+        'vo_trim_start': _tpl_num('vo_trim_start', (existing or {}).get('vo_trim_start'), 0),
+        'vo_trim_end': _tpl_num('vo_trim_end', (existing or {}).get('vo_trim_end'), 0),
+        'title_card_vo_start': _tpl_num('title_card_vo_start', (existing or {}).get('title_card_vo_start'), 0),
+        'title_card_vo_end': _tpl_num('title_card_vo_end', (existing or {}).get('title_card_vo_end'), 0),
+        'end_card_vo_start': _tpl_num('end_card_vo_start', (existing or {}).get('end_card_vo_start'), 0),
+        'end_card_vo_end': _tpl_num('end_card_vo_end', (existing or {}).get('end_card_vo_end'), 0),
+        'settings_json': json.dumps(settings),
+    }
+    if fields['transition'] and fields['transition'] not in VALID_TRANSITIONS:
+        fields['transition'] = None
+
+    now = time.time()
+    conn = _tpl_db()
+    try:
+        if existing:
+            tid = existing['id']
+            conn.execute('UPDATE show_templates SET ' + ','.join(f'{k}=?' for k in fields) + ', updated_at=? WHERE id=?',
+                         list(fields.values()) + [now, tid])
+        else:
+            cols = list(fields.keys()) + ['created_at', 'updated_at']
+            cur = conn.execute(f'INSERT INTO show_templates ({",".join(cols)}) VALUES ({",".join("?" * len(cols))})',
+                               list(fields.values()) + [now, now])
+            tid = cur.lastrowid
+
+        for slot, meta in TEMPLATE_SLOTS.items():
+            if slot in incoming:
+                if existing:
+                    template_delete_asset_file(existing, slot)  # replace: drop the old master
+                stored, disp = template_store_asset(incoming[slot], slot,
+                                                    _upload_display_name(meta['field']))
+                conn.execute(f'UPDATE show_templates SET {slot}_file=?, {slot}_name=? WHERE id=?', (stored, disp, tid))
+            elif existing and request.form.get(f'clear_{slot}') in ('1', 'on', 'true'):
+                template_delete_asset_file(existing, slot)
+                conn.execute(f'UPDATE show_templates SET {slot}_file=NULL, {slot}_name=NULL WHERE id=?', (tid,))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify(ok=False, error=f'A template named "{name}" already exists.'), 409
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # The staged copies in UPLOAD_FOLDER have served their purpose -- the masters
+    # now live in TEMPLATES_DIR. Leave them be if they were network-staged files,
+    # since the same staged file may still be attached to the form for this job.
+    return jsonify(ok=True, template=_template_public(template_get(tid)),
+                   saved_slots=sorted(incoming.keys()), updated=bool(existing))
+
+@app.route('/api/templates/<int:tid>', methods=['DELETE'])
+@require_permission('promo_generation')
+def api_template_delete(tid):
+    if not template_delete(tid):
+        return jsonify(ok=False, error='Template not found'), 404
+    return jsonify(ok=True)
+
+@app.route('/api/templates/<int:tid>/asset/<slot>')
+@require_permission('promo_generation')
+def api_template_asset(tid, slot):
+    """Serves a template's stored asset so the UI can preview it (audio player /
+    card-VO in-out scrubbing) without re-uploading anything."""
+    if slot not in TEMPLATE_SLOTS:
+        return jsonify(ok=False, error='Unknown slot'), 404
+    row = template_get(tid)
+    p = template_asset_abspath(row, slot)
+    if not p:
+        return jsonify(ok=False, error='That slot is empty'), 404
+    return send_from_directory(TEMPLATES_DIR, os.path.basename(p))
+
+@app.route('/api/config', methods=['GET'])
+def api_config_get():
+    """Current values of every configurable AI service URL, for the Config tab.
+    Admin-only: exposes FISH_AUDIO_API_KEY, and lets you point the whole app's
+    AI services somewhere else -- not something a regular account should see
+    or touch."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    return jsonify(ok=True, config=current_config_values(),
+                   fields={k: {'label': v[0], 'help': v[1]} for k, v in CONFIGURABLE_SERVICES.items()})
+
+@app.route('/api/config', methods=['POST'])
+def api_config_post():
+    """Saves Config-tab edits to disk and applies them immediately (no restart needed)."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    data = request.get_json(silent=True) or {}
+    unknown = [k for k in data if k not in CONFIGURABLE_SERVICES]
+    if unknown:
+        return jsonify(ok=False, error=f'Unknown config key(s): {", ".join(unknown)}'), 400
+    try:
+        save_config_overrides(data)
+    except Exception as e:
+        return jsonify(ok=False, error=f'Could not save config: {e}'), 500
+    return jsonify(ok=True, config=current_config_values())
+
+@app.route('/api/config/test', methods=['POST'])
+def api_config_test():
+    """Pings a single URL from the Config tab's edit fields (before saving), so a
+    typo can be caught without committing it first. Body: {"name": "FISH_AUDIO_URL", "url": "..."}."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    data = request.get_json(silent=True) or {}
+    name = data.get('name', '')
+    url = (data.get('url') or '').strip()
+    if name not in CONFIGURABLE_SERVICES:
+        return jsonify(ok=False, error='Unknown service'), 400
+    if name == 'FISH_AUDIO_API_KEY':
+        return jsonify(ok=False, error='Not a URL field'), 400
+    if not url:
+        return jsonify(ok=False, error='No URL to test'), 400
+    base = url.rsplit('/v1/', 1)[0] if '/v1/' in url else url
+    path = '/api/tags' if name == 'OLLAMA_URL' else '/'
+    result = _check_service(name, base, path)
+    return jsonify(ok=result['status'] == 'up', **result)
+
+@app.route('/api/network/shares', methods=['GET'])
+def api_network_shares_get():
+    """Full network path/username for each of the six browsable categories
+    (HIRES/TCARD/ENDCARD/MUSIC/VO/SFX), for the Config > Network tab.
+    Admin-only, same reasoning as /api/config -- these can include a share
+    password. Never returns saved passwords in plaintext for display; the
+    UI shows a masked placeholder and only sends a new password when the
+    admin actually types one (see the POST route)."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    folders = load_network_folders()
+    out = {}
+    for cat in NETWORK_CATEGORY_KEYS:
+        row = folders.get(cat, {})
+        out[cat] = {
+            'path': row.get('path', ''), 'username': row.get('username', ''),
+            'has_password': bool(row.get('password')),
+            'in_place': bool(row.get('in_place')),
+            'can_in_place': cat in INPLACE_CATEGORIES,
+            # Which category this one reads while its own path is blank, if any.
+            'fallback': _network_categories().get(cat, {}).get('fallback'),
+        }
+    return jsonify(ok=True, categories=out)
+
+@app.route('/api/network/shares', methods=['POST'])
+def api_network_shares_post():
+    """Saves one category's network path/username/password. Body:
+    {"category": "music", "path": "\\\\server\\share\\folder",
+    "username": "...", "password": "..." (omit to leave the saved password
+    unchanged, send "" to explicitly clear it)}. Each category is fully
+    independent -- there's no shared default any of these fall back to, so
+    a category with no path configured simply isn't reachable until one is
+    set here. The one exception is 'shorts' (the Vertical Shorts source
+    folder), which reads the 'hires' folder while its own path is blank;
+    see _network_folder_row()."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    data = request.get_json(silent=True) or {}
+    category = (data.get('category') or '').strip()
+    if category not in NETWORK_CATEGORY_KEYS:
+        return jsonify(ok=False, error=f'Unknown category "{category}".'), 400
+    fields = {k: data[k] for k in ('path', 'username', 'password') if k in data}
+    if 'in_place' in data and category in INPLACE_CATEGORIES:
+        fields['in_place'] = bool(data['in_place'])
+    ok, err = save_network_folder(category, fields)
+    if not ok:
+        return jsonify(ok=False, error=err), 400
+    # Path is safe to log; username/password are never included in the audit
+    # detail even though they're in the request -- this is a record of WHAT
+    # changed and WHO changed it, not a place credentials should ever sit in
+    # plaintext a second time.
+    audit_log('network_folder_change', target=category,
+               detail=(f"path={fields.get('path', '(unchanged)')}" if 'path' in fields else '')
+                      + (f" in_place={fields['in_place']}" if 'in_place' in fields else '') or None,
+               user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True, category=category)
+
+@app.route('/api/production', methods=['GET'])
+def api_production_get():
+    """Deployment-wide production defaults (broadcast loudness/peak/dual-mono,
+    house mix ducking, scene-detection tuning) plus their spec -- label, help
+    text, type, and choices -- so the Config > Production tab renders itself
+    from one source of truth rather than hardcoding a second copy of the field
+    list that could drift from PRODUCTION_DEFAULT_SPEC.
+
+    Not admin-gated for reading: these are just numbers describing how promos
+    get rendered, and the generator's own behaviour already reflects them.
+    Changing them is admin-only (see POST below)."""
+    spec = {k: {kk: vv for kk, vv in v.items() if kk != 'default'}
+            for k, v in PRODUCTION_DEFAULT_SPEC.items()}
+    return jsonify(ok=True, values=load_production_defaults(), spec=spec,
+                   order=list(PRODUCTION_DEFAULT_SPEC.keys()))
+
+@app.route('/api/production', methods=['POST'])
+def api_production_post():
+    """Saves production defaults. Admin-only -- these are effectively the
+    delivery spec every future promo is rendered against, so this is a higher
+    bar than a per-job setting. Values that don't parse are ignored rather
+    than written through (see save_production_defaults), so a malformed
+    request can't quietly corrupt the spec."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    data = request.get_json(silent=True) or {}
+    values = save_production_defaults(data)
+    audit_log('production_defaults_change', detail=', '.join(f'{k}={v}' for k, v in data.items()) or None,
+               user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True, values=values)
+
+# ---- Branding routes ----
+# /branding/logo and /branding/favicon are in _PUBLIC_PATHS (see core.py) so
+# the login page -- rendered before any session exists -- can show the
+# configured logo/favicon too, not just the signed-in app shell. Serving an
+# image file to a logged-out client isn't a meaningful exposure (same content
+# a favicon <link> would leak anyway), so this is a safe carve-out from the
+# session gate.
+@app.route('/branding/logo')
+def branding_logo():
+    cfg = load_branding()
+    if cfg['logo_filename'] and os.path.exists(os.path.join(BRANDING_DIR, cfg['logo_filename'])):
+        return send_from_directory(BRANDING_DIR, cfg['logo_filename'])
+    # Prefer the same modern wordmark the landing page uses, not the legacy segment mark.
+    return redirect('/static/prism-logo.svg')
+
+@app.route('/branding/logo-dark')
+def branding_logo_dark():
+    """Same logo as /branding/logo, but the variant meant for a dark
+    background. The DEFAULT PRISM wordmark specifically needs this -- its
+    letters are solid near-black, correctly readable on the light default
+    background but effectively invisible on a dark one, so the default has
+    two pre-made variants (see static/prism-logo-dark.svg) switched via CSS
+    based on data-theme, not a single image stretched to cover both.
+
+    A custom admin-uploaded logo has no separate dark variant to switch
+    to -- Config > Branding only has one upload slot -- so this
+    deliberately falls back to that SAME custom file, not the dark
+    default. Getting a custom logo's own contrast right on both themes is
+    the uploader's call, same as it already was before this route
+    existed; this only fixes the shipped default, not a general
+    dual-variant upload feature nobody asked for."""
+    cfg = load_branding()
+    if cfg['logo_filename'] and os.path.exists(os.path.join(BRANDING_DIR, cfg['logo_filename'])):
+        return send_from_directory(BRANDING_DIR, cfg['logo_filename'])
+    return redirect('/static/prism-logo-dark.svg')
+
+@app.route('/branding/favicon')
+def branding_favicon():
+    cfg = load_branding()
+    if cfg['favicon_filename'] and os.path.exists(os.path.join(BRANDING_DIR, cfg['favicon_filename'])):
+        return send_from_directory(BRANDING_DIR, cfg['favicon_filename'])
+    return redirect('/static/favicon.ico')
+
+@app.route('/api/branding', methods=['GET'])
+def api_branding_get():
+    """Current brand name/tagline/footer/theme/logo/favicon state, for the
+    Config > Branding tab to populate its fields and for the login/index
+    pages' <title>/sidebar/footer/CSS variables. Read-only and not
+    admin-gated -- knowing the current branding isn't sensitive, only
+    changing it is (see the POST route below). Includes both the available
+    theme presets (so the UI never hardcodes its own copy of them, which
+    would drift from THEME_PRESETS) and the currently-resolved colors."""
+    cfg = load_branding()
+    return jsonify(ok=True, name=cfg['name'], tagline=cfg['tagline'], footer=cfg['footer'],
+                   accent_color=cfg['accent_color'], theme_name=cfg['theme_name'],
+                   theme_colors=cfg['theme_colors'],
+                   themes={k: v for k, v in THEME_PRESETS.items()},
+                   has_logo=bool(cfg['logo_filename']), has_favicon=bool(cfg['favicon_filename']))
+
+@app.route('/api/branding', methods=['POST'])
+def api_branding_post():
+    """Saves Branding-tab edits: name/tagline/footer/theme_name/accent_color
+    (form fields) and/or a new logo/favicon (file uploads) in the same
+    request. reset_logo=1/reset_favicon=1/reset_accent_color=1 clear that
+    item back to the built-in default without needing to re-enter anything
+    -- footer has no equivalent reset flag since an empty string already
+    means "no footer", the same thing a reset would produce; just save it
+    blank. Admin-only -- this changes what every signed-in account (and the
+    login page) sees, the same reasoning as /api/config."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    name = request.form.get('name')
+    tagline = request.form.get('tagline')
+    footer = request.form.get('footer')
+    if name is not None or tagline is not None or footer is not None:
+        save_branding_text(name, tagline, footer)
+    theme_name = request.form.get('theme_name')
+    if theme_name:
+        _, err = save_branding_theme(theme_name)
+        if err:
+            return jsonify(ok=False, error=err), 400
+    accent_color = request.form.get('accent_color')
+    if accent_color:
+        _, err = save_branding_color(accent_color)
+        if err:
+            return jsonify(ok=False, error=err), 400
+    logo_file = request.files.get('logo')
+    if logo_file and logo_file.filename:
+        _, err = save_branding_logo(logo_file)
+        if err:
+            return jsonify(ok=False, error=err), 400
+    favicon_file = request.files.get('favicon')
+    if favicon_file and favicon_file.filename:
+        _, err = save_branding_favicon(favicon_file)
+        if err:
+            return jsonify(ok=False, error=err), 400
+    if request.form.get('reset_logo') == '1':
+        clear_branding_logo()
+    if request.form.get('reset_favicon') == '1':
+        clear_branding_favicon()
+    if request.form.get('reset_accent_color') == '1':
+        clear_branding_color()
+    cfg = load_branding()
+    changed = [k for k in ('name', 'tagline', 'footer', 'theme_name', 'accent_color')
+               if request.form.get(k)] + \
+              [f'{k}_upload' for k in ('logo', 'favicon') if request.files.get(k) and request.files[k].filename] + \
+              [f'reset_{k}' for k in ('logo', 'favicon', 'accent_color') if request.form.get(f'reset_{k}') == '1']
+    audit_log('branding_change', detail=', '.join(changed) or None,
+               user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True, name=cfg['name'], tagline=cfg['tagline'], footer=cfg['footer'],
+                   accent_color=cfg['accent_color'], theme_name=cfg['theme_name'],
+                   theme_colors=cfg['theme_colors'], themes={k: v for k, v in THEME_PRESETS.items()},
+                   has_logo=bool(cfg['logo_filename']), has_favicon=bool(cfg['favicon_filename']))
+
+@app.route('/api/health')
+def api_health():
+    """Reachability check for every local model/media service the app talks to
+    (Ollama, Fish Audio S2, faster-whisper, ACE-Step, Woosh), checked in parallel
+    so one slow/dead service doesn't stall the others. Returns per-service status
+    plus an overall ok flag.
+
+    A service an admin has manually disabled (see set_service_disabled in
+    library_db.py) is reported as status='disabled' without actually being
+    probed -- skips the wasted network round-trip, and keeps "manually turned
+    off" visibly distinct from "happens to be unreachable right now" rather
+    than reporting both as the same generic 'down'. The UI's gating treats
+    anything other than 'up' as unavailable either way, so this needs no
+    special-casing there."""
+    disabled = load_disabled_services()
+    checks = [
+        ('ollama', OLLAMA_URL, '/api/tags'),
+        ('fish_audio', FISH_AUDIO_URL.rsplit('/v1/', 1)[0] if '/v1/' in FISH_AUDIO_URL else FISH_AUDIO_URL, '/'),
+        ('whisper', WHISPER_URL, '/'),
+        ('ace_step', ACE_STEP_URL, '/'),
+        ('woosh', WOOSH_URL, '/'),
+    ]
+    results = {}
+    threads = []
+    def worker(name, url, path):
+        results[name] = _check_service(name, url, path)
+    for name, url, path in checks:
+        if name in disabled:
+            continue
+        th = threading.Thread(target=worker, args=(name, url, path))
+        th.start()
+        threads.append(th)
+    # Joined against one shared deadline, not `timeout=5` per thread — since threads
+    # already run in parallel, waiting up to 5s for each one *sequentially* could
+    # take up to 5s × len(checks) in the worst case (multiple unreachable services)
+    # instead of the ~5s total this is actually meant to cap at.
+    deadline = time.time() + 5
+    for th in threads:
+        th.join(timeout=max(0, deadline - time.time()))
+    ordered = []
+    for name, url, path in checks:
+        if name in disabled:
+            ordered.append({'name': name, 'url': url, 'status': 'disabled',
+                            'error': 'Manually disabled by an admin (Config > Services).'})
+        else:
+            ordered.append(results.get(name, {'name': name, 'url': url, 'status': 'down', 'error': 'no response'}))
+    overall_ok = all(c['status'] == 'up' for c in ordered)
+    return jsonify(ok=overall_ok, checked_at=time.time(), services=ordered)
+
+@app.route('/api/services/toggle', methods=['POST'])
+def api_services_toggle():
+    """Admin-only: manually mark a service disabled/enabled, independent of
+    its live reachability. See load_disabled_services' docstring for why this
+    exists alongside the automatic health check."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    name = (request.form.get('name') or '').strip()
+    disabled = request.form.get('disabled') == '1'
+    ok, err = set_service_disabled(name, disabled)
+    if not ok:
+        return jsonify(ok=False, error=err), 400
+    return jsonify(ok=True, name=name, disabled=disabled)
+
+@app.route('/api/stt/transcribe', methods=['POST'])
+@require_permission('speech_to_text')
+def api_stt_transcribe():
+    """Standalone speech-to-text for the Speech to Text panel.
+
+    Wraps the same transcribe_video() the promo pipeline uses for dialogue-aware
+    cuts, so what you see here is exactly what the rating stage sees. Accepts any
+    media the server can decode (video or audio) -- the audio is extracted to
+    16 kHz mono before upload either way."""
+    src = _resolve_upload('stt_file', ALLOWED_EXTENSIONS | AUDIO_EXTENSIONS)
+    if not src:
+        return jsonify(ok=False, error='Upload a video or audio file to transcribe.'), 400
+    try:
+        words, segments, outcome = transcribe_video_detailed(src)
+    finally:
+        if os.path.exists(src) and inside_uploads(src) and not os.path.basename(src).startswith('net_'):
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+    if not segments and not words:
+        reason = outcome.get('reason') or 'no reason was given'
+        if outcome.get('ok'):
+            return jsonify(ok=False, error=f'Nothing to transcribe: {reason}.'), 422
+        return jsonify(ok=False, error=f'Transcription failed: {reason}.'), 502
+
+    full = ' '.join(sg['text'] for sg in segments).strip()
+
+    def _srt_time(t):
+        h, rem = divmod(max(0.0, t), 3600)
+        m, sec = divmod(rem, 60)
+        return f'{int(h):02d}:{int(m):02d}:{int(sec):02d},{int((sec % 1) * 1000):03d}'
+
+    srt = '\n'.join(f'{i+1}\n{_srt_time(sg["start"])} --> {_srt_time(sg["end"])}\n{sg["text"]}\n'
+                    for i, sg in enumerate(segments))
+    return jsonify(ok=True, segments=segments, words=len(words), text=full,
+                   srt=srt, duration=round(segments[-1]['end'], 1) if segments else 0,
+                   model=WHISPER_MODEL)
+
+@app.route('/api/voices/tags')
+def api_voice_tags():
+    """Inline delivery tags for Fish Audio, in the syntax the configured model
+    expects. Shared by the Narration section of the generate form and the Fish
+    Audio tool so both offer the same set."""
+    return jsonify(ok=True, **fish_tag_catalogue())
+
+@app.route('/api/voices')
+def api_voices():
+    """Lists narration voices and languages for the Narration dropdowns, for
+    the narration engine (Fish Audio; the ?engine= parameter is retained for
+    compatibility with saved templates and existing API callers)
+    to fish_audio). There's no bundled default voice — if the list comes back
+    empty, the UI should fall back to "upload a reference sample" for
+    zero-shot cloning."""
+    force = request.args.get('refresh') == '1'
+    engine = request.args.get('engine', 'fish_audio')
+    engine = 'fish_audio'   # only narration engine; parameter kept for compatibility
+    voices, source, error = list_voices_for_engine(engine, force=force)
+    return jsonify(ok=error is None, voices=voices, languages=FISH_AUDIO_LANGUAGES,
+                    source=source, error=error, engine=engine)
+
+@app.route('/api/voices/clone', methods=['POST'])
+def api_voices_clone():
+    """Registers a new named voice on the self-hosted Fish Audio server (see
+    fish_audio_add_reference). Admin-only: this is a shared, global resource
+    -- every account picks from the same Voice dropdown -- same reasoning as
+    /api/config being admin-only."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    voice_id = (request.form.get('id') or '').strip()
+    text = (request.form.get('text') or '').strip()
+    audio = request.files.get('audio')
+    if not audio or not audio.filename:
+        return jsonify(ok=False, error='Choose a reference audio file.'), 400
+    fn = secure_filename(audio.filename)
+    if not fn:
+        return jsonify(ok=False, error='Invalid audio filename.'), 400
+    tmp_path = os.path.join(app.config['UPLOAD_FOLDER'], f'voiceclone_{int(time.time()*1000)}{os.path.splitext(fn)[1]}')
+    audio.save(tmp_path)
+    try:
+        ok, err = fish_audio_add_reference(voice_id, tmp_path, text)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    if not ok:
+        return jsonify(ok=False, error=err), 502
+    # The voice list is cached (_VOICES_CACHE_TTL) -- force a refresh so the
+    # new voice shows up immediately rather than after the cache expires.
+    list_voices_for_engine('fish_audio', force=True)
+    return jsonify(ok=True, id=voice_id)
+
+@app.route('/api/voices/delete', methods=['POST'])
+def api_voices_delete():
+    """Deletes a registered voice from the self-hosted Fish Audio server (see
+    fish_audio_delete_reference). Admin-only, same reasoning as clone above."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    voice_id = (request.form.get('id') or '').strip()
+    ok, err = fish_audio_delete_reference(voice_id)
+    if not ok:
+        return jsonify(ok=False, error=err), 502
+    list_voices_for_engine('fish_audio', force=True)
+    return jsonify(ok=True, id=voice_id)
+
+@app.route('/api/vo/preview', methods=['POST'])
+@require_permission('text_to_speech', 'promo_generation')
+def api_vo_preview():
+    """Generates a short narration clip so the script/voice/rate/language can be
+    checked by ear before it's used in an actual trailer job. Runs synchronously
+    (previews are short) and returns a URL to the generated WAV, served from the
+    same /uploads/<filename> route as everything else in UPLOAD_FOLDER."""
+    text = (request.form.get('text') or '').strip()
+    if not text:
+        return jsonify(ok=False, error='No narration text to preview'), 400
+    # In the Narration box this is an audition, so a hard cap keeps it snappy.
+    # The Tools tab passes full=1 to render a complete script as a deliverable.
+    cap = 5000 if request.form.get('full') in ('1', 'true', 'on') else 800
+    truncated = len(text) > cap
+    if truncated:
+        text = text[:cap]
+    try:
+        rate = int(request.form.get('rate', 175))
+    except ValueError:
+        rate = 175
+    voice_id = (request.form.get('voice') or '').strip() or None
+    language = (request.form.get('language') or '').strip() or None
+    engine = (request.form.get('engine') or 'fish_audio').strip()
+    engine = 'fish_audio'   # only narration engine; parameter kept for compatibility
+
+    ref_path = None
+    if 'ref_upload' in request.files and request.files['ref_upload'].filename:
+        f = request.files['ref_upload']
+        fn = secure_filename(f.filename)
+        if fn:
+            ref_path = os.path.join(app.config['UPLOAD_FOLDER'], f'voprevref_{int(time.time()*1000)}{os.path.splitext(fn)[1]}')
+            f.save(ref_path)
+            voice_id = None  # an uploaded reference clone takes priority over a picked registered voice
+
+    out_name = f'vopreview_{int(time.time()*1000)}.wav'
+    out_path = os.path.join(app.config['UPLOAD_FOLDER'], out_name)
+    ok, err = generate_tts(text, out_path, rate=rate, voice_id=voice_id,
+                            reference_audio_path=ref_path, language=language, engine=engine)
+    if not ok:
+        return jsonify(ok=False, error=err or 'Preview generation failed'), 502
+    return jsonify(ok=True, url=f'/uploads/{out_name}', filename=out_name,
+                   engine=engine, truncated=truncated, characters=len(text),
+                   duration=round(probe_duration(out_path) or 0, 1))
+
+UPLOAD_TTL = int(os.environ.get('UPLOAD_TTL', 6 * 3600))  # seconds
+_SWEEP_INTERVAL = int(os.environ.get('UPLOAD_SWEEP_INTERVAL', 900))
+
+def sweep_upload_folder(ttl=None):
+    """Deletes anything in UPLOAD_FOLDER older than `ttl` seconds.
+
+    Backstop for the things per-job cleanup deliberately can't touch: shared
+    net_* staging files, VO previews, and intermediates from a job whose process
+    died mid-render. Finished trailers live on in LIBRARY_DIR, which this never
+    touches, so reclaiming an aged /uploads/ copy only breaks a stale open tab.
+    Returns bytes freed."""
+    ttl = UPLOAD_TTL if ttl is None else ttl
+    folder = app.config['UPLOAD_FOLDER']
+    now = time.time()
+    freed = 0
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        return 0
+    for name in entries:
+        p = os.path.join(folder, name)
+        try:
+            if not os.path.isfile(p):
+                continue
+            if now - os.path.getmtime(p) < ttl:
+                continue
+            size = os.path.getsize(p)
+            os.remove(p)
+            freed += size
+        except OSError:
+            pass
+    if freed:
+        print(f'Upload sweeper reclaimed {freed / (1024*1024):.1f} MB of files older than {ttl}s')
+    return freed
+
+def _sweeper_loop():
+    while True:
+        time.sleep(_SWEEP_INTERVAL)
+        try:
+            sweep_upload_folder()
+        except Exception as e:
+            print(f'Upload sweeper error: {e}')
+
+def free_disk_mb(path=None):
+    """Free space in MB on the filesystem holding `path` (UPLOAD_FOLDER by default)."""
+    try:
+        return shutil.disk_usage(path or app.config['UPLOAD_FOLDER']).free / (1024 * 1024)
+    except OSError:
+        return None
+
+def _remove_job_intermediate(path):
+    """Deletes a per-job intermediate file the render pipeline is finished
+    with -- EXCEPT a shared network-staged file (net_<ts>_<name>), which
+    this must never touch.
+
+    Real bug this fixes: several call sites inside _run_trailer_job deleted
+    an uploaded VO/SFX/card-VO path unconditionally right after using it,
+    completely bypassing the net_* protection _cleanup_job_temp already has
+    a few lines below (added specifically because "the same staged file can
+    legitimately be attached to two concurrent jobs" -- and, just as much,
+    to the SAME job's next render if the user reuses their Browse Library
+    selection without re-picking). Whenever the source was a network pick,
+    this deleted the shared staged copy mid-render, so a second job -- or
+    even a retry of the same one -- would find it gone and fail with
+    "please re-select", even though the file chip still showed it as
+    selected. A direct browser upload's own per-job temp file isn't shared
+    with anything else, so it's still deleted normally; only the shared
+    staging case is protected here, matching _cleanup_job_temp exactly.
+    Silently no-ops if the path is falsy or already gone."""
+    if not path or not os.path.exists(path):
+        return
+    if os.path.basename(path).startswith('net_') or not inside_uploads(path):
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+def _cleanup_job_temp(jid, params, keep_basename=None):
+    """Removes every temp file a job could have created, whatever exit path it took.
+
+    UPLOAD_FOLDER is a tempdir that only clears on process restart, so anything
+    left behind here accumulates for the life of the server. Previously nothing
+    was cleaned on any of the ~10 error returns in _run_trailer_job, and the
+    uploaded source video was never deleted at all -- on a long-running LAN box
+    that grows without bound until the disk fills.
+
+    `keep_basename` is the finished trailer, which must survive (it's served from
+    /uploads/ and copied into the library)."""
+    folder = app.config['UPLOAD_FOLDER']
+    victims = []
+    # Per-job intermediates are all prefixed with the job id (base_ts == jid).
+    try:
+        for f in os.listdir(folder):
+            if keep_basename and f == keep_basename:
+                continue
+            if f.endswith(f'_{jid}.mp4') or f.endswith(f'_{jid}.wav') or f.endswith(f'_{jid}.m4a'):
+                victims.append(os.path.join(folder, f))
+            elif f'_{jid}_' in f or f.startswith(f'seg_{jid}') or f.startswith(f'norm_{jid}'):
+                victims.append(os.path.join(folder, f))
+    except OSError as e:
+        print(f'Job {jid} cleanup could not list {folder}: {e}')
+    # Explicit per-job inputs (source video, staged template copies, uploads).
+    for key in ('path', 'sfx_upload_path', 'vo_upload_path', 'vo_ref_upload_path',
+                'scoring_audio_path', 'end_card_path', 'schedule_card_path',
+                'title_card_vo_path', 'end_card_vo_path', 'transition_matte_path'):
+        p = params.get(key)
+        # scoring_audio_path carries the sentinel 'GENERATE' rather than a path.
+        if not (isinstance(p, str) and p != 'GENERATE' and os.path.isabs(p)):
+            continue
+        # net_* files are the shared staging area for network-share picks: the
+        # same staged file can legitimately be attached to two concurrent jobs,
+        # so deleting it here could pull the source out from under the other one.
+        # The age-based sweeper below reclaims those instead.
+        if os.path.basename(p).startswith('net_') or not inside_uploads(p):
+            continue
+        victims.append(p)
+    freed = 0
+    for p in set(victims):
+        try:
+            if os.path.isfile(p):
+                freed += os.path.getsize(p)
+                os.remove(p)
+        except OSError:
+            pass
+    if freed:
+        print(f'Job {jid} cleanup freed {freed / (1024*1024):.1f} MB')
+
+def run_trailer_job(jid, params):
+    keep = None
+    try:
+        _run_trailer_job(jid, params)
+        res = (job_get(jid) or {}).get('result') or {}
+        url = res.get('trailer_url') or ''
+        if url.startswith('/uploads/'):
+            keep = os.path.basename(url)
+    except JobCancelled:
+        print(f'Trailer job {jid} cancelled')
+        job_set(jid, error='Cancelled', status='cancelled')
+    except MediaToolTimeout as e:
+        print(f'Trailer job {jid} timed out: {e}')
+        job_set(jid, error=f'A media processing step timed out and was stopped ({e}). '
+                           'The source may be corrupt, or the server is overloaded.')
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f'Trailer job {jid} crashed: {e}')
+        job_set(jid, error=f'Unexpected error: {e}')
+    finally:
+        # Runs on success, failure, cancellation and timeout alike -- except for a
+        # successful preview, whose source video and staged assets must survive
+        # until the user renders (or the preview TTL expires and the age-based
+        # sweeper reclaims them).
+        holding = params.get('preview_only') and not (job_get(jid) or {}).get('error')
+        if not holding:
+            _cleanup_job_temp(jid, params, keep_basename=keep)
+
+
+def _vo_beats_from_text(text):
+    """Split promo VO into selection beats (sentences / lines)."""
+    import re
+    if not text or not str(text).strip():
+        return []
+    raw = str(text).replace('\r\n', '\n').replace('\r', '\n')
+    parts = []
+    for line in raw.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        # Strip simple delivery tags like [happy] for matching
+        line = re.sub(r'\[[^\]]+\]', ' ', line)
+        line = re.sub(r'\([^)]+\)', ' ', line)
+        line = re.sub(r'\s+', ' ', line).strip()
+        if not line:
+            continue
+        # Further split long lines on sentence ends
+        chunks = re.split(r'(?<=[.!?])\s+', line)
+        for c in chunks:
+            c = c.strip()
+            if c:
+                parts.append(c)
+    if not parts:
+        parts = [str(text).strip()]
+    beats = []
+    for c in parts:
+        words = re.findall(r"[A-Za-z0-9']+", c.lower())
+        if not words:
+            continue
+        beats.append({'text': c, 'words': words, 'word_count': len(words)})
+    return beats
+
+
+def _token_overlap_score(beat_words, scene):
+    """How well a scene's description/dialogue matches a VO beat."""
+    if not beat_words:
+        return 0.0
+    blob = ' '.join([
+        str(scene.get('ai_desc') or ''),
+        str(scene.get('dialogue') or ''),
+        str(scene.get('description') or ''),
+    ]).lower()
+    if not blob.strip():
+        return 0.0
+    import re
+    scene_words = set(re.findall(r"[A-Za-z0-9']+", blob))
+    if not scene_words:
+        return 0.0
+    hit = sum(1 for w in beat_words if w in scene_words and len(w) > 2)
+    return hit / max(1, len([w for w in beat_words if len(w) > 2]))
+
+
+def select_scenes_vo_led(scenes_data, vo_text, trailer_duration, max_scene_dur, min_seg_dur,
+                         min_gap, transcribe_for_cuts=False, word_starts=None,
+                         phrase_ends=None, word_ends=None, sync_beats=False, beat_times=None,
+                         vo_beats=None):
+    """Pick one scene per VO beat, sized to that beat's share of the target duration.
+
+    `vo_beats` may be pre-built (e.g. from Whisper on an uploaded VO) with optional
+    per-beat `duration`. Otherwise beats are parsed from `vo_text`.
+    """
+    beats = list(vo_beats) if vo_beats else _vo_beats_from_text(vo_text)
+    if not beats or not scenes_data:
+        return None, 0.0  # signal caller to fall back
+    total_words = sum(b['word_count'] for b in beats) or 1
+    timed = [b for b in beats if b.get('duration')]
+    total_timed = sum(b['duration'] for b in timed) or 0.0
+    used = set()
+    selected = []
+    total_sel = 0.0
+    for bi, beat in enumerate(beats):
+        remaining_beats = len(beats) - bi
+        remaining_budget = max(min_seg_dur, trailer_duration - total_sel)
+        # Prefer real VO segment duration when we transcribed an upload; else word share
+        if beat.get('duration') and total_timed > 0:
+            share = trailer_duration * (beat['duration'] / total_timed)
+        else:
+            share = trailer_duration * (beat['word_count'] / total_words)
+        if remaining_beats > 1:
+            share = min(share, remaining_budget - min_seg_dur * (remaining_beats - 1) * 0.5)
+        share = max(min_seg_dur, min(share, remaining_budget))
+        if max_scene_dur:
+            share = min(share, max_scene_dur)
+
+        best = None
+        best_key = None
+        for i, s in enumerate(scenes_data):
+            if i in used:
+                continue
+            # Scoped to the same material only -- see the identical fix and
+            # full explanation at the main selection loop's own min_gap
+            # check in _run_trailer_job.
+            if any(abs(s['start'] - c['start']) < min_gap and s.get('material') == c.get('material')
+                   for c in selected):
+                continue
+            if s['duration'] < min_seg_dur * 0.6:
+                continue
+            match = _token_overlap_score(beat['words'], s)
+            # Prefer match, then total_score, then duration fit
+            dur_fit = 1.0 - min(1.0, abs(s['duration'] - share) / max(share, 1.0))
+            key = (match, s.get('total_score', 0), dur_fit, 1 if s.get('has_face') else 0)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = (i, s, match)
+        if best is None:
+            # Relax gap and try again
+            for i, s in enumerate(scenes_data):
+                if i in used:
+                    continue
+                if s['duration'] < min_seg_dur * 0.5:
+                    continue
+                match = _token_overlap_score(beat['words'], s)
+                key = (match, s.get('total_score', 0))
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best = (i, s, match)
+        if best is None:
+            continue
+        i, s, match = best
+        used.add(i)
+        seg_dur = min(s['duration'], share, remaining_budget)
+        if max_scene_dur:
+            seg_dur = min(seg_dur, max_scene_dur)
+        seg_dur = max(0.3, seg_dur)
+        seg_start = s['start']
+        if transcribe_for_cuts and word_starts:
+            snapped_start = nearest_word_boundary(seg_start, word_starts, max_snap=0.45, hard_limit=seg_start + seg_dur)
+            if seg_start < snapped_start < seg_start + seg_dur:
+                drift = snapped_start - seg_start
+                seg_start = snapped_start
+                seg_dur = max(0.3, seg_dur - drift)
+        scene_end = s['start'] + s['duration']
+        if sync_beats and beat_times:
+            target_cut = total_sel + seg_dur
+            # Constrained to a tight window around the already-computed,
+            # word-boundary-aware target (see BEAT_SYNC_MAX_NUDGE) -- not the
+            # whole remaining scene. A beat outside this range is too far to
+            # snap to without risking a mid-word/mid-phrase cut that the
+            # speech-safety pass below won't be able to find and correct.
+            nudge_lo = max(total_sel + 0.3, target_cut - BEAT_SYNC_MAX_NUDGE)
+            nudge_hi = min(total_sel + (scene_end - seg_start), target_cut + BEAT_SYNC_MAX_NUDGE)
+            snapped_cut = nearest_beat(target_cut, beat_times, nudge_lo, nudge_hi)
+            seg_dur = max(0.3, min(scene_end - seg_start, snapped_cut - total_sel))
+        if transcribe_for_cuts and (phrase_ends or word_ends) and seg_dur < (scene_end - seg_start):
+            target_end = seg_start + seg_dur
+            snapped_end = nearest_speech_out(target_end, phrase_ends, word_ends, hard_limit=scene_end)
+            if seg_start < snapped_end <= scene_end:
+                seg_dur = max(0.3, snapped_end - seg_start)
+        s = dict(s)
+        s['trim_start'] = seg_start
+        s['selected_dur'] = seg_dur
+        s['vo_beat'] = beat['text'][:120]
+        s['vo_match'] = round(match, 3)
+        selected.append(s)
+        total_sel += seg_dur
+        if trailer_duration - total_sel < min_seg_dur * 0.5:
+            break
+    if not selected:
+        return None, 0.0
+    # (material, start), not start alone -- see the identical fix and its
+    # full explanation elsewhere in this file for cross-material ordering.
+    selected.sort(key=lambda x: (x.get('material') or 0, x['start']))
+    return selected, total_sel
+
+
+def _run_trailer_job(jid, params):
+    path = params['path']; orig_name = params['orig_name']; mode = params['mode']
+    genre = params['genre']; scoring_mode = params['scoring_mode']; trailer_length = params['trailer_length']
+    delivery_format = params.get('delivery_format', 'mp4_high')
+    max_scene_dur = params.get('max_scene_dur')
+    scene_threshold = params.get('scene_threshold', 30.0)
+    min_scene_len_sec = params.get('min_scene_len_sec', 0.5)
+    detector = params.get('detector', 'content')
+    adaptive_threshold = params.get('adaptive_threshold', 3.0)
+    transition = params['transition']; xfade_dur = params['xfade_dur']
+    transition_matte_path = params.get('transition_matte_path')
+    target_loudness = params['target_loudness']; true_peak = params['true_peak']
+    music_duck_db = params.get('music_duck_db', -3)
+    duck_depth_db = params.get('duck_depth_db', -15)
+    duck_release_hold = params.get('duck_release_hold', 0.7)
+    broadcast_stereo = params.get('broadcast_stereo', False)
+    beat_match = params['beat_match']; model = params['model']
+    sfx_mode = params['sfx_mode']; sfx_upload_path = params['sfx_upload_path']
+    vo_mode = params['vo_mode']; vo_upload_path = params['vo_upload_path']; vo_text = params['vo_text']
+    vo_voice = params['vo_voice']; vo_rate = params['vo_rate']; vo_start = params['vo_start']
+    vo_language = params.get('vo_language'); vo_ref_upload_path = params.get('vo_ref_upload_path')
+    vo_engine = params.get('vo_engine', 'fish_audio')
+    vo_volume = params.get('vo_volume', 1.15)
+    vo_trim_start = params.get('vo_trim_start', 0.0); vo_trim_end = params.get('vo_trim_end')
+    sync_beats = params['sync_beats']
+    whisper_enhance = params.get('whisper_enhance', False)
+    # Speech-safe cutting shouldn't be a side effect of which RATING mode was
+    # picked. Knowing where speech is matters for every promo -- cutting a
+    # sentence in half sounds broken regardless of whether dialogue also
+    # influenced which scenes got chosen. So transcription now runs whenever
+    # faster-whisper is reachable, and `whisper_enhance` narrows to its real
+    # remaining job: whether dialogue also contributes to a scene's SCORE.
+    # Opt-out via SPEECH_SAFE_CUTS=0 for anyone who'd rather not spend the
+    # transcription time on a source with no dialogue worth protecting.
+    transcribe_for_cuts = (whisper_enhance or
+                           os.environ.get('SPEECH_SAFE_CUTS', '1').lower() not in ('0', 'false', 'no'))
+    end_card_path = params['end_card_path']; schedule_card_path = params['schedule_card_path']
+    cut_clean = params.get('cut_clean', True); card_fit = params.get('card_fit', 'fit'); vo_smart = params.get('vo_smart', True)
+    title_card_vo_path = params.get('title_card_vo_path'); title_card_vo_start = params.get('title_card_vo_start', 0.0); title_card_vo_end = params.get('title_card_vo_end')
+    end_card_vo_path = params.get('end_card_vo_path'); end_card_vo_start = params.get('end_card_vo_start', 0.0); end_card_vo_end = params.get('end_card_vo_end')
+    title_card_vo_path, end_card_vo_path, _dup_notes = _drop_duplicate_card_vo(params)
+    params.setdefault('script_vo_notes', [])
+    params['script_vo_notes'] = list(params['script_vo_notes'] or []) + _dup_notes
+    end_card_video_start = params.get('end_card_video_start', 0.0); end_card_video_end = params.get('end_card_video_end')
+    schedule_video_start = params.get('schedule_video_start', 0.0); schedule_video_end = params.get('schedule_video_end')
+    scoring_audio_path = params['scoring_audio_path']; prompt = params['prompt']
+
+    # AI Vision scoring and Whisper-based cut safety are both load-bearing
+    # for the quality of an automatically-generated plug, not optional
+    # enhancements -- a broadcast promo assembled without them silently
+    # degrades to generic OpenCV heuristics for scene choice and no
+    # protection against a cut landing mid-word. That degradation used to
+    # happen invisibly (every per-scene AI call failing the same way,
+    # falling back to a neutral score, with nothing surfacing to the user
+    # that scoring never actually ran) -- user-requested: fail the job
+    # up front with a clear reason instead, before spending any time on
+    # scene detection, so a down service is obvious rather than showing up
+    # later as an oddly generic-looking promo.
+    #
+    # Neither check applies to a timecode-cue job: build_cue_clips uses
+    # neither service at all (see the identical `script_cues` guards on the
+    # AI-scoring and transcription blocks below), so requiring them there
+    # would block a job that was never going to use them.
+    if not (params.get('script_cues') or []):
+        unreachable = []
+        if mode == 'ai':
+            check = _check_service('ollama', OLLAMA_URL, '/api/tags')
+            if check['status'] != 'up':
+                unreachable.append(f"AI Vision (Ollama at {OLLAMA_URL}): {check.get('error', 'unreachable')}")
+        if transcribe_for_cuts:
+            check = _check_service('whisper', WHISPER_URL, '/')
+            if check['status'] != 'up':
+                unreachable.append(f"Speech-to-text (faster-whisper at {WHISPER_URL}): {check.get('error', 'unreachable')}")
+        if unreachable:
+            job_set(jid, error='Cannot generate a promo plug right now -- required service(s) unreachable: '
+                                + '; '.join(unreachable) +
+                                '. Scene scoring and mid-word cut protection both depend on these. '
+                                'Check Config > Services (or the API tab\'s health check) and try again '
+                                'once they\'re back, or ask your admin.')
+            return
+
+    job_set(jid, percent=2, step='Reading video info')
+    last_ffmpeg_stderr = None
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration = total_frames / fps if fps else 0
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    src_fps = fps if fps and fps > 0 else 30
+    cap.release()
+
+    trailer_duration = trailer_length
+    min_required = trailer_length * 1.5
+    if video_duration < min_required:
+        job_set(jid, error=f'Video is only {video_duration:.1f}s long, but a {trailer_length}s episodic promo plug requires at least {min_required:.1f}s of raw video. Upload a longer video or select a shorter length.')
+        return
+
+    # Measure card durations before selecting scenes
+    card_files = []
+    card_labels = []
+    card_durations = []
+    _card_vo_ts = int(time.time() * 1000)
+    _vo_notes = []
+    if end_card_path and os.path.exists(end_card_path):
+        if end_card_video_start > 0 or end_card_video_end is not None:
+            trimmed = os.path.join(app.config['UPLOAD_FOLDER'], f'titlecard_trim_{_card_vo_ts}.mp4')
+            result = trim_card_video(end_card_path, end_card_video_start, end_card_video_end, trimmed)
+            if result:
+                end_card_path = result
+        if title_card_vo_path and os.path.exists(title_card_vo_path):
+            muxed = os.path.join(app.config['UPLOAD_FOLDER'], f'titlecard_vo_{_card_vo_ts}.mp4')
+            if params.get('card_vo_tighten', True):
+                title_card_vo_path, title_card_vo_start, title_card_vo_end, _saved = tighten_card_vo(
+                    title_card_vo_path, title_card_vo_start, title_card_vo_end, tag='tcvo')
+                if _saved:
+                    _vo_notes.append(f'Title card voice-over: {_saved:.1f}s of silence between and around the words taken out.')
+            result = mux_card_vo(end_card_path, title_card_vo_path, title_card_vo_start, title_card_vo_end, muxed)
+            if result:
+                end_card_path = result
+        card_files.append(end_card_path)
+        card_labels.append('Title card')
+    if schedule_card_path and os.path.exists(schedule_card_path):
+        if schedule_video_start > 0 or schedule_video_end is not None:
+            trimmed = os.path.join(app.config['UPLOAD_FOLDER'], f'endcard_trim_{_card_vo_ts}.mp4')
+            result = trim_card_video(schedule_card_path, schedule_video_start, schedule_video_end, trimmed)
+            if result:
+                schedule_card_path = result
+        if end_card_vo_path and os.path.exists(end_card_vo_path):
+            muxed = os.path.join(app.config['UPLOAD_FOLDER'], f'endcard_vo_{_card_vo_ts}.mp4')
+            if params.get('card_vo_tighten', True):
+                end_card_vo_path, end_card_vo_start, end_card_vo_end, _saved = tighten_card_vo(
+                    end_card_vo_path, end_card_vo_start, end_card_vo_end, tag='ecvo')
+                if _saved:
+                    _vo_notes.append(f'End card voice-over: {_saved:.1f}s of silence between and around the words taken out.')
+            result = mux_card_vo(schedule_card_path, end_card_vo_path, end_card_vo_start, end_card_vo_end, muxed)
+            if result:
+                schedule_card_path = result
+        card_files.append(schedule_card_path)
+        card_labels.append('End card')
+    for cf in card_files:
+        d = probe_duration(cf)
+        if d is None or d <= 0:
+            # Previously this silently substituted 5s. A wrong card duration feeds
+            # the scene-budget maths and every xfade offset after it, so the whole
+            # concat desyncs and the user gets a subtly broken trailer with no
+            # error. Failing here is far better than guessing.
+            job_set(jid, error=f'Could not read the duration of the card video "{os.path.basename(cf)}" — '
+                               'it may be corrupt or in an unsupported format. Re-export it and try again.')
+            return
+        card_durations.append(d)
+    total_card_dur = sum(card_durations)
+
+    # Card fit. A title or end card that is long for a short plug leaves the
+    # scenes too little room, and the only thing that used to close the gap
+    # was a 1 s last-resort nudge at the very end. Measure how short each card
+    # can safely get (its voice finished, its animation settled), and if the
+    # cards would crowd the scenes out, shorten them now, before scenes are
+    # chosen. card_floors also bound the last-resort pass below.
+    card_floors = [min(d, 1.0) for d in card_durations]
+    card_originals = list(card_durations)
+    card_fit_info = {'policy': card_fit, 'cards': [], 'notes': []}
+    card_fit_info['notes'].extend(_vo_notes)
+    if card_files:
+        labels = card_labels
+        brief_ = params.get('script_brief') or {}
+        title_ = (brief_.get('tcard') or {}).get('title')
+        window_ = bool(title_)       # the script names the title: cut the piece that holds it, not the card's head
+        measured = [_card_measure(cf, d, title=title_, window=window_)
+                    for cf, d, lbl in zip(card_files, card_durations, card_labels)] \
+            if card_fit != 'off' else [(min(d, 1.0), {}) for d in card_durations]
+        card_floors = [m[0] for m in measured]
+        if card_fit != 'off':
+            need_ = None
+            # The tune-in line of the narration plays over the cards: they must last as long as it does.
+            try:
+                need_ = _card_voice_need(params, brief_)
+            except Exception as e:
+                print(f'Tune-in line length not measured: {e}')
+                need_ = None
+            if need_:
+                card_floors, short_ = cutcraft.raise_floors_for_voice(
+                    card_floors, card_durations, need_ + scriptbrief.CARD_LEAD + cutcraft.VO_TAIL, xfade_dur)
+                card_fit_info['notes'].append(
+                    f'The tune-in line is {need_:.1f}s long, so the cards are kept at least that long.'
+                    + (f' They are {short_:.1f}s too short for it even at full length.' if short_ > 0.05 else ''))
+            # With the script's own clips, those clips set how much scene time the plug needs; the cards give way to them.
+            cue_time_ = None
+            n_mat_ = len(params.get('materials_paths') or [])
+            cues_ = [c for c in (params.get('script_cues') or []) if c.get('material') and 1 <= c['material'] <= n_mat_]
+            if cues_:
+                cue_time_ = sum(max(0.8, (c['out'] - c['time']) if c.get('out') else 4.0) for c in cues_)
+            plan_floors = card_floors
+            if cue_time_:
+                # The script's own clips come first: the cards get what is left of the plug, down to a bare
+                # minimum, even when that cuts into the title's hold or the tune-in line.
+                plan_floors = [min(d, cutcraft.CARD_MIN) for d in card_durations]
+            plan = cutcraft.plan_card_fit(trailer_length, card_durations, plan_floors, min_scenes=cue_time_)
+            if cue_time_:
+                for i in range(len(card_files)):
+                    t_ = plan['targets'][i]
+                    if t_ < card_floors[i] - 0.05:
+                        card_fit_info['notes'].append(
+                            f'{labels[i]} cut to {t_:.1f}s, shorter than the {card_floors[i]:.1f}s its title and voice want: '
+                            f'the script\'s clips ({cue_time_:.0f}s) take priority in a {trailer_length:g}s plug.')
+            for i in range(len(card_files)):
+                cut = card_durations[i] - plan['targets'][i]
+                if cut > 0.05:
+                    adj = os.path.join(app.config['UPLOAD_FOLDER'],
+                                       f'cardfit_{jid}_{i}_{int(time.time() * 1000) % 100000}.mp4')
+                    t_at = measured[i][1].get('title_at') if i < len(measured) else None
+                    start_ = cutcraft.card_window(card_durations[i], plan['targets'][i], t_at) if window_ else 0.0
+                    res = _adjust_card_duration(card_files[i], -cut, adj, start=start_)
+                    if res:
+                        card_files[i] = res
+                        card_durations[i] -= cut
+                        note = f'{labels[i]} shortened by {cut:.1f}s so the scenes have room.'
+                        if window_ and start_ > 0.05:
+                            note = (f'{labels[i]} cut to its {card_durations[i] - cut:.1f}s from {start_:.1f}s on '
+                                    f'(the part with the title), not its first seconds.')
+                        card_fit_info['notes'].append(note)
+            total_card_dur = sum(card_durations)
+            card_floors = [min(f, d) for f, d in zip(card_floors, card_durations)]
+            # The tune-in line must end before the plug does. When the cards are too short for it, it starts
+            # under the end of the last scene (a J-cut) by as much as it is short.
+            params['card_jcut'] = 0.0
+            if need_:
+                room_ = total_card_dur - max(0, len(card_durations) - 1) * xfade_dur
+                deficit_ = scriptbrief.CARD_LEAD + need_ + cutcraft.VO_TAIL - room_
+                if deficit_ > 0.02:
+                    deficit_ += 0.25                       # room for the pause kept between words
+                    params['card_jcut'] = round(min(3.0, deficit_), 2)
+                    card_fit_info['notes'].append(
+                        f'The tune-in line ({need_:.1f}s) starts {params["card_jcut"]:.1f}s under the last scene so it ends before the plug does.'
+                        + (f' It is still {deficit_ - 3.0:.1f}s too long for the cards.' if deficit_ > 3.0 else ''))
+            if plan['short_by'] > 0.05:
+                card_fit_info['notes'].append(
+                    f'Even at their shortest the cards leave the scenes {plan["short_by"]:.1f}s less than '
+                    f'recommended for a {trailer_length:g}s plug. Consider a shorter card or a longer plug.')
+        for i, d in enumerate(card_durations):
+            if i < len(measured) and measured[i][1].get('why'):
+                card_fit_info['notes'].append(f'{labels[i]}: {measured[i][1]["why"]}.')
+            card_fit_info['cards'].append({'label': labels[i] if i < len(labels) else f'Card {i + 1}',
+                                           'was': round(card_originals[i], 2) if i < len(card_originals) else None,
+                                           'secs': round(d, 2), 'floor': round(card_floors[i], 2),
+                                           'details': measured[i][1]})
+    card_fit_info['scene_budget'] = round(trailer_length - total_card_dur, 2)
+
+    # Scene target starts at trailer_length, minus cards duration
+    base_target = max(5, trailer_length - total_card_dur)
+
+    # Shared by both paths below. base_ts is the per-job filename prefix for every
+    # intermediate; it used to be assigned partway through the analysis block,
+    # which the resume path skips entirely.
+    base_ts = jid  # already unique per job (see job_new()) -- using it here too
+                   # avoids two jobs finishing a step in the same second (quite
+                   # possible with MAX_CONCURRENT_JOBS > 1) from both writing to
+                   # the same trailer_<ts>.mp4 path at once.
+    early_bgm_path = None
+    early_bgm_source = 'none'
+
+    cut_quiet = []
+    cut_words = []
+    preselected = params.get('preselected')
+    if preselected:
+        # Rendering an approved preview: detection, quality scoring, AI vision
+        # scoring and selection were all done during the preview pass, so skip
+        # straight to extraction. On a long episode that's the majority of the
+        # job's wall-clock time, and repeating it could also produce a slightly
+        # different cut than the one the user actually approved.
+        job_set(jid, percent=34, step=f'Rendering approved cut ({len(preselected)} clips)')
+        selected = [dict(s) for s in preselected]
+        # (material, start), not start alone -- see the identical fix and
+        # its full explanation elsewhere in this file for cross-material
+        # ordering.
+        selected.sort(key=lambda x: (x.get('material') or 0, x['start']))
+        total_sel = sum(s['selected_dur'] for s in selected)
+        scene_list = [None] * int(params.get('preview_total_scenes') or len(selected))
+        word_starts = word_ends = []
+        beat_times = []
+        # Needed below by the final exact-length correction, which now runs
+        # for this path too (see the shortfall/residual block after this
+        # if/else) -- previously computed only in the else: branch, which
+        # left an approved cut with NO duration correction applied at all
+        # whenever scenes were dropped/added without the total happening to
+        # land back on trailer_length by chance.
+        min_seg_dur = max(0.8, xfade_dur * 2.5)
+        if max_scene_dur:
+            min_seg_dur = min(min_seg_dur, max_scene_dur)
+        # No fresh transcription is run for an approved-cut render (that's
+        # the whole point -- analysis isn't repeated), so there's no new
+        # word/phrase timing to protect specific speech in THIS pass. The
+        # correction below still runs and still respects each clip's own
+        # min_seg_dur floor; it just can't additionally avoid landing a trim
+        # inside dialogue the way a fresh render's speech-aware pass can.
+        # Real per-scene selected_dur values (already speech-safe from
+        # whichever pass originally produced them) are still what's being
+        # adjusted, so this isn't operating blind -- just without a second,
+        # independent speech check layered on top for this specific pass.
+        speech_spans = []
+        phrase_ends = []
+    else:
+        job_set(jid, percent=8, step='Detecting scene cuts')
+        # Detect scenes via PySceneDetect. When multiple materials are loaded
+        # (M1/M2/… without combine), detect each source separately and keep
+        # times local to that file — script cues match by material + time.
+        materials = params.get('materials_paths') or [path]
+        materials = [p for p in materials if p and os.path.isfile(p)]
+        if not materials:
+            materials = [path]
+        scene_list = []  # (start, end, material_num, source_path)
+        # Timecode cues (script upload / Manual Entry) drive selection
+        # exclusively further down via build_cue_clips, which builds each
+        # cue's own in/out span directly and never reads scene_list or
+        # scenes_data at all -- so actually running PySceneDetect here would
+        # be pure wasted time (real, measurable time on a long episode) for
+        # a result nothing downstream uses. Left empty so the existing
+        # "if not scene_list" fallback-synthesis immediately below runs
+        # unconditionally in this case, producing the same minimal,
+        # single-scene-per-material placeholder it already builds for a
+        # source with no detectable cuts at all -- one code path for both
+        # "cues present" and "cues absent but detection legitimately found
+        # nothing", rather than a second, separate one.
+        if not (params.get('script_cues') or []):
+            for mi, mpath in enumerate(materials):
+                mat_num = mi + 1
+                job_set(jid, step=f'Detecting scene cuts (source {mat_num}/{len(materials)})')
+                sl = detect_scenes(mpath, threshold=scene_threshold,
+                                   min_scene_len_sec=min_scene_len_sec, downscale=2,
+                                   detector=detector, adaptive_threshold=adaptive_threshold)
+                if not sl:
+                    continue
+                for start, end in sl:
+                    scene_list.append((start, end, mat_num, mpath))
+        if not scene_list:
+            # Timecode cues bypass PySceneDetect's own boundaries entirely
+            # (build_cue_clips builds clips directly from each cue's own
+            # in/out span) -- a source with no detectable cuts at all (a
+            # single, continuous static shot, or just below the detection
+            # threshold) is still perfectly usable when cues are supplied,
+            # so this is only a hard failure for the ordinary,
+            # scene-detection-driven selection path below.
+            if not (params.get('script_cues') or []):
+                job_set(jid, error='No scene changes detected. Try a video with clear cuts, or lower the detection threshold.')
+                return
+            # Synthesize one fallback "scene" per material spanning its own
+            # whole file, purely so the existing quality/AI-vision scoring
+            # block right below (built around scene_list/scenes_data never
+            # being empty) has something harmless to process -- the
+            # cue-exclusive selection path further down never reads
+            # scenes_data at all, so what gets scored here is discarded,
+            # not actually used to pick anything.
+            #
+            # Must be real FrameTimecode objects, not plain floats: tc_frames/
+            # tc_seconds (used throughout scoring) read PySceneDetect's own
+            # .frame_num/.seconds attributes and recurse infinitely on a type
+            # that doesn't have them -- confirmed directly, a real crash this
+            # exact code caused before switching to FrameTimecode here.
+            for mi, mpath in enumerate(materials):
+                dur = probe_duration(mpath) or 1.0
+                cap = cv2.VideoCapture(mpath)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                cap.release()
+                start_tc = FrameTimecode(0.0, fps)
+                end_tc = FrameTimecode(max(dur, 1.0 / fps), fps)
+                scene_list.append((start_tc, end_tc, mi + 1, mpath))
+        if not (params.get('script_cues') or []) and len(materials) == 1 and len(scene_list) == 1 and (
+                tc_seconds(scene_list[0][1]) - tc_seconds(scene_list[0][0])) > video_duration * 0.95:
+            # PySceneDetect's own fallback: no real cuts found, so it returned one
+            # scene spanning the whole video. Selecting from a single "scene" isn't
+            # meaningful — surface this clearly instead of silently treating the
+            # entire source as one giant clip. Excluded when cues are present: the
+            # synthesized whole-file placeholder scene built just above ALWAYS
+            # spans the whole file by design for a single material, and the
+            # cue-exclusive path never selects from it anyway -- it's a harmless
+            # placeholder for the scoring code below, not a real selection
+            # candidate, so this check has nothing meaningful to warn about here.
+            job_set(jid, error='No distinct scene cuts were found — PySceneDetect sees this video as one continuous shot. Try lowering the detection threshold or upload footage with visible cuts.')
+            return
+
+        job_set(jid, percent=15, step=f'Rating {len(scene_list)} scenes (sharpness/brightness)')
+        # Score scenes
+        from statistics import median
+        def _score_one_scene(item):
+            start, end, mat_num, src_path = item
+            # Each worker opens its own VideoCapture — cv2.VideoCapture is not safe to
+            # share across threads (concurrent .set()/.read() calls on one handle can
+            # corrupt each other's seeks), but independent handles on the same file
+            # decode concurrently just fine and this is what actually lets scene
+            # scoring use more than one CPU core.
+            local_cap = cv2.VideoCapture(src_path)
+            try:
+                mid_f = int((tc_frames(start) + tc_frames(end)) / 2)
+                local_cap.set(cv2.CAP_PROP_POS_FRAMES, mid_f)
+                ret, frame = local_cap.read()
+                if not ret:
+                    return None
+                dur = tc_seconds(end) - tc_seconds(start)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                lap = cv2.Laplacian(gray, cv2.CV_64F).var()
+                bri = float(np.mean(gray))
+                h, w = gray.shape
+                edges = cv2.Canny(gray, 50, 150)
+                edge_ratio = float(np.count_nonzero(edges)) / (h * w)
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                mean_hue = float(np.mean(hsv[:,:,0]))
+                mean_sat = float(np.mean(hsv[:,:,1]))
+                mean_val = float(np.mean(hsv[:,:,2]))
+                has_face = False
+                if ONNX_PATH is not None:
+                    # get_fd() returns one cached, shared FaceDetectorYN instance — its
+                    # setInputSize()+detect() pair isn't safe for concurrent callers, so
+                    # this part alone stays serialized. It's cheap relative to decode +
+                    # Laplacian/Canny/HSV, so the lock doesn't erase the parallel gain.
+                    with _fd_lock:
+                        _, faces = get_fd(w, h).detect(frame)
+                    has_face = faces is not None and len(faces) > 0
+                return {
+                    'start': tc_seconds(start), 'end': tc_seconds(end),
+                    'start_f': tc_frames(start), 'end_f': tc_frames(end),
+                    'duration': dur, 'laplacian': round(lap, 2), 'brightness': round(bri, 1),
+                    'edge_ratio': round(edge_ratio, 3), 'mean_hue': round(mean_hue, 1),
+                    'mean_sat': round(mean_sat, 1), 'mean_val': round(mean_val, 1),
+                    'has_face': has_face, 'frame': frame, 'frame_idx': mid_f,
+                    'material': mat_num, 'source_path': src_path,
+                }
+            finally:
+                local_cap.release()
+
+        with ThreadPoolExecutor(max_workers=min(8, len(scene_list) or 1)) as ex:
+            scored = list(ex.map(_score_one_scene, scene_list))
+        scenes_data = [r for r in scored if r is not None]
+        if not scenes_data:
+            job_set(jid, error='No frames could be read.')
+            return
+
+        med_lap = median([s['laplacian'] for s in scenes_data])
+        for s in scenes_data:
+            # Quality (OpenCV heuristics) is scored 1-3, deliberately the
+            # smallest of the three components: it's the crudest signal
+            # (sharpness/brightness/duration/face presence), so it should
+            # break ties and filter out obvious junk rather than dominate.
+            # AI vision contributes 1-5 (the strongest voice, since it's the
+            # only component that actually understands scene *content*), and
+            # dialogue 1-2 on top. Each sub-signal below is worth at most 1
+            # so a scene has to be good on several axes to reach 3, rather
+            # than maxing out on sharpness alone.
+            score = 0
+            if s['laplacian'] > med_lap * 1.2: score += 1
+            if 80 < s['brightness'] < 180: score += 1
+            if 1 < s['duration'] < 8: score += 1
+            if s['has_face']:
+                # A face/reaction shot is generally more useful in a trailer than
+                # empty B-roll of similar sharpness/brightness.
+                score += 1
+            if s['duration'] < 0.7:
+                # Sub-fragment scenes (whip-pans, flash cuts) can still win on raw
+                # sharpness/brightness alone with no duration credit at all —
+                # penalize them explicitly so they don't out-rank a real scene of
+                # similar visual quality and end up as a flicker cut in the output.
+                score -= 1
+            # Clamped to the documented 1-3 range: four possible +1s above
+            # could otherwise reach 4, and the -1 penalty could reach -1,
+            # either of which would silently break the "quality is 1-3"
+            # contract the AI/dialogue weights are balanced against.
+            s['quality_score'] = max(1, min(3, score))
+
+        if mode == 'ai' and not (params.get('script_cues') or []):
+            # Skipped entirely when timecode cues are present: user-requested
+            # and confirmed -- the cue-exclusive selection path further down
+            # never reads quality_score/vision_score at all, so scoring them
+            # here is pure wasted work (real Ollama round trips, one per
+            # scene, that previously ran and failed/timed out for no benefit
+            # whenever the vision service wasn't reachable, exactly as seen
+            # in a real render's own logs).
+            # Only AI-score scenes that could realistically make the cut. Previously
+            # every detected scene got a vision call -- on a 45-minute episode that's
+            # 200-400 Ollama round trips to choose ~12 clips, and it dominated the
+            # job's wall-clock time.
+            #
+            # Candidates are chosen two ways so the shortlist stays both good and
+            # spread out: the globally highest quality_score scenes, plus the best
+            # few from each time bucket across the source. Without the buckets a
+            # shortlist can cluster in one well-lit stretch and then get thinned out
+            # by the min_gap spacing rule during selection, leaving nothing to pick.
+            ai_pool = scenes_data
+            if len(scenes_data) > AI_SCORE_LIMIT:
+                ranked = sorted(scenes_data, key=lambda s: s['quality_score'], reverse=True)
+                chosen = {id(s): s for s in ranked[:max(1, AI_SCORE_LIMIT // 2)]}
+                n_buckets = max(1, min(AI_SCORE_LIMIT // 4, 12))
+                span = max(video_duration, 1e-6)
+                buckets = {}
+                for s in scenes_data:
+                    b = min(n_buckets - 1, int(s['start'] / span * n_buckets))
+                    buckets.setdefault(b, []).append(s)
+                per_bucket = max(1, (AI_SCORE_LIMIT - len(chosen)) // n_buckets)
+                for b in sorted(buckets):
+                    for s in sorted(buckets[b], key=lambda x: x['quality_score'], reverse=True)[:per_bucket]:
+                        if len(chosen) >= AI_SCORE_LIMIT:
+                            break
+                        chosen.setdefault(id(s), s)
+                ai_pool = list(chosen.values())
+                print(f'AI scoring shortlist: {len(ai_pool)} of {len(scenes_data)} scenes '
+                      f'(cap AI_SCORE_LIMIT={AI_SCORE_LIMIT})')
+
+            # Anything not shortlisted keeps a neutral AI prior -- the same value used
+            # when a vision response can't be parsed -- so it stays selectable if
+            # spacing rules exhaust the shortlist, just ranked below scored scenes.
+            ai_pool_ids = {id(s) for s in ai_pool}
+            for s in scenes_data:
+                if id(s) not in ai_pool_ids:
+                    s['total_score'] = s['quality_score'] + AI_NEUTRAL_SCORE
+                    s['ai_desc'] = ''
+
+            # Tell the model what it's selecting *for*. The prompt never mentioned the
+            # genre before, so an action promo and a drama promo were ranked by the
+            # same generic "good for a movie trailer" criterion. See
+            # build_ai_vision_prompt() for genre/priority/negative layering details.
+            ai_prompt = build_ai_vision_prompt(prompt, genre,
+                                                priority_prompt=params.get('priority_prompt'),
+                                                negative_prompt=params.get('negative_prompt'))
+
+            n_scenes_ai = len(ai_pool)
+            _ai_progress = {'done': 0}
+            _ai_progress_lock = threading.Lock()
+
+            def _ask_vision(b64, budget, allow_thinking, structured=True):
+                """One /api/generate call. Returns (text, response_json).
+
+                Two things fight us on a chatty reasoning model like qwen3-vl:
+                  * it puts chain-of-thought in a separate `thinking` field, and
+                    Ollama counts those tokens against num_predict; and
+                  * told to answer in one line, it writes a paragraph anyway and
+                    gets truncated (done_reason='length') before the score.
+
+                Prompt wording alone does not fix either. Ollama's structured
+                output does: passing a JSON schema in `format` constrains decoding
+                to that shape, so the model cannot ramble and stops as soon as the
+                object closes. That both removes the truncation failure and makes
+                each call much shorter -- which matters at ~60 frames a job.
+                `structured=False` is the fallback for older Ollama builds that
+                reject the `format` field."""
+                payload = {
+                    'model': model, 'prompt': ai_prompt, 'stream': False, 'images': [b64],
+                    # Near-greedy decoding: scene ranking should be reproducible
+                    # across runs of the same source, and the default sampling
+                    # temperature made scores jitter between jobs.
+                    'options': {'temperature': 0.1, 'num_predict': budget},
+                }
+                if structured and AI_STRUCTURED_OK:
+                    payload['format'] = {
+                        'type': 'object',
+                        'properties': {
+                            'score': {'type': 'integer', 'minimum': 1, 'maximum': 5},
+                            'desc': {'type': 'string'},
+                        },
+                        'required': ['score', 'desc'],
+                    }
+                if not allow_thinking:
+                    # Understood by newer Ollama for reasoning models; older
+                    # builds ignore the unknown key rather than erroring.
+                    payload['think'] = False
+                r = requests.post(f'{OLLAMA_URL}/api/generate', json=payload, timeout=180)
+                data = r.json()
+                if data.get('error'):
+                    raise RuntimeError(data['error'])
+                txt = (data.get('response') or '').strip()
+                if not txt:
+                    txt = (data.get('thinking') or '').strip()
+                return txt, data
+
+            def _parse_vision(txt):
+                # Structured output path: a JSON object is the expected shape now,
+                # so try that before any of the text heuristics below.
+                if txt.lstrip().startswith('{'):
+                    try:
+                        obj = json.loads(txt)
+                        sc = int(obj.get('score'))
+                        if 1 <= sc <= 5:
+                            return _clean_ai_desc(str(obj.get('desc') or '')), sc
+                    except (ValueError, TypeError, AttributeError):
+                        pass  # malformed -- salvage below
+                    # Truncated JSON is the common failure (done_reason='length'
+                    # cuts the object mid-string), so pull the fields out by hand
+                    # rather than discarding a reply that has both values in it.
+                    j_sc = re.search(r'"score"\s*:\s*([1-5])\b', txt)
+                    j_de = re.search(r'"desc"\s*:\s*"([^"]*)', txt)
+                    if j_sc:
+                        return (_clean_ai_desc(j_de.group(1)) if j_de else ''), int(j_sc.group(1))
+                    if j_de:
+                        # Score unusable/out of range, but the description is fine.
+                        txt = j_de.group(1)
+
+                """(description, score) from a model reply, or (desc, None) if no
+                score could be found.
+
+                The prompt asks for SCORE first precisely because chatty models run
+                past the token budget mid-sentence: with the score leading, a reply
+                truncated by `length` still yields a usable rating and whatever
+                description made it out. Either field order is accepted, since
+                templates saved with the old prompt still ask for DESC first."""
+                # Strip markdown emphasis first: models often bold the labels,
+                # which breaks a plain 'SCORE:' match.
+                txt = re.sub(r'[*_`]+', '', txt or '')
+                score_m = re.search(r'SCORE\s*:?\s*([1-5])', txt, re.I)
+                if not score_m:
+                    # Models that ignore the format usually still emit a bare digit.
+                    score_m = (re.search(r'\b([1-5])\s*/\s*5\b', txt)
+                               or re.search(r'\b([1-5])\s*$', txt.strip()))
+                desc_m = re.search(r'DESC\s*:?\s*(.+?)(?:\s*\|\s*SCORE|$)', txt, re.S | re.I)
+                if not desc_m:
+                    # No DESC label (or it was cut off): fall back to the longest
+                    # sentence-ish run of prose in the reply.
+                    plain = re.sub(r'SCORE\s*:?\s*[1-5]\s*(?:/\s*5)?\s*\|?', ' ', txt, flags=re.I)
+                    plain = re.sub(r'#+', ' ', plain)
+                    cand = max((p.strip() for p in re.split(r'[.\n]', plain)),
+                               key=len, default='')
+                    # A bare rating digit at the end is the score, not prose.
+                    cand = re.sub(r'\s*\b[1-5]\s*(?:/\s*5)?\s*$', '', cand).strip()
+                    desc = _clean_ai_desc(cand) if len(cand) > 12 else ''
+                else:
+                    desc = _clean_ai_desc(desc_m.group(1))
+                return desc, (int(score_m.group(1)) if score_m else None)
+
+            def _score_one_ai(ai_i, s):
+                _, buf = cv2.imencode('.jpg', s['frame'], [cv2.IMWRITE_JPEG_QUALITY, 85])
+                b64 = base64.b64encode(buf.tobytes()).decode()
+                global AI_STRUCTURED_OK
+                try:
+                    # Retry on an UNPARSEABLE reply, not merely an empty one: a
+                    # reasoning model that ran out of budget leaves `response`
+                    # empty but `thinking` full of chain-of-thought, which is
+                    # non-empty yet useless. Treating that as an answer is what
+                    # silently sent every scene to the neutral score.
+                    try:
+                        txt, data = _ask_vision(b64, AI_NUM_PREDICT, allow_thinking=False)
+                    except RuntimeError as e:
+                        if 'format' not in str(e).lower():
+                            raise
+                        # Ollama too old for structured output -- disable it for
+                        # the rest of this process and carry on unstructured.
+                        print('Ollama rejected the structured-output `format` field; '
+                              'falling back to text parsing for this session. '
+                              'Upgrade Ollama for more reliable scene rating.')
+                        AI_STRUCTURED_OK = False
+                        txt, data = _ask_vision(b64, AI_NUM_PREDICT, allow_thinking=False,
+                                                structured=False)
+                    desc, score = _parse_vision(txt)
+                    if score is None:
+                        print(f'AI vision reply unusable for scene {ai_i+1} '
+                              f'(done_reason={data.get("done_reason")!r}, {len(txt)} chars); '
+                              f'retrying without a token cap. First 200 chars: {txt[:200]!r}')
+                        txt, data = _ask_vision(b64, AI_NUM_PREDICT * 3,
+                                                allow_thinking=True, structured=False)
+                        desc, score = _parse_vision(txt)
+                    if score is None:
+                        print(f'AI vision score parse failed for scene {ai_i+1}, defaulting to '
+                              f'{AI_NEUTRAL_SCORE}. done_reason={data.get("done_reason")!r} '
+                              f'raw={txt[:300]!r}')
+                    s['ai_desc'] = desc
+                    s['vision_score'] = score if score is not None else AI_NEUTRAL_SCORE
+                    s['total_score'] = s['quality_score'] + s['vision_score']
+                except Exception as e:
+                    print(f'AI vision request failed for scene {ai_i+1}, defaulting to {AI_NEUTRAL_SCORE}: {e}')
+                    s['vision_score'] = AI_NEUTRAL_SCORE
+                    s['total_score'] = s['quality_score'] + AI_NEUTRAL_SCORE
+                with _ai_progress_lock:
+                    _ai_progress['done'] += 1
+                    job_set(jid, percent=18 + int(12 * _ai_progress['done'] / max(n_scenes_ai, 1)),
+                            step=f"AI-rating scene {_ai_progress['done']}/{n_scenes_ai}")
+
+            # Bounded concurrency, not unbounded: these are independent HTTP calls (so
+            # parallelizing them is the single biggest wall-clock win in the whole
+            # pipeline when Ollama is slow), but firing all of them at once could
+            # overwhelm a single Ollama instance's request queue or GPU memory. 4 is a
+            # reasonable default for a typical self-hosted single-GPU setup.
+            with ThreadPoolExecutor(max_workers=min(AI_SCORE_WORKERS, n_scenes_ai or 1)) as ex:
+                list(ex.map(lambda pair: _score_one_ai(*pair), enumerate(ai_pool)))
+            # Scoring for this job is now genuinely finished -- every frame's
+            # /api/generate call above has returned, since list(ex.map(...))
+            # blocks until they all have. Transcription (faster-whisper,
+            # often sharing this GPU) starts shortly below; freeing the
+            # vision model's VRAM right now, rather than leaving it to
+            # Ollama's own keep-alive window, is specifically what this
+            # setting exists for. See unload_ollama_model()'s docstring for
+            # why this is a single call here rather than one per frame above.
+            if load_production_defaults().get('unload_vision_after_scoring', True):
+                unload_ollama_model(model)
+        else:
+            for s in scenes_data:
+                s['total_score'] = s['quality_score']
+
+        # Dialogue transcription (faster-whisper) — improves scene selection and
+        # cutting several ways:
+        # 1. Scenes with actual quotable dialogue get a small scoring boost, so
+        #    selection isn't purely based on visual sharpness/brightness/AI framing.
+        # 2. Word-level timestamps let cut in/out points snap to word boundaries
+        #    later, instead of landing mid-word.
+        # 3. Segment (phrase/sentence) ends are the PREFERRED snap target -- landing
+        #    on "...and then she left." sounds finished, where a word boundary
+        #    mid-sentence ("...and then she") is technically not mid-word but still
+        #    reads as clipped. See phrase_ends below.
+        # 4. speech_spans lets the exact-duration corrector know which parts of a
+        #    clip actually contain talking, so it can absorb its rounding error out
+        #    of silence instead of shaving syllables off dialogue.
+        word_starts, word_ends, phrase_ends, speech_spans = [], [], [], []
+        if transcribe_for_cuts and not (params.get('script_cues') or []):
+            # Also skipped for timecode cues, same reasoning as AI vision
+            # scoring above: build_cue_clips never reads word/phrase
+            # boundaries at all (that's only consumed by the ordinary
+            # best-scenes loop's own snapped_start/snapped_end logic, which
+            # the cue-exclusive path skips entirely), so transcribing here
+            # would be a real Whisper round trip spent on data nothing
+            # downstream uses.
+            job_set(jid, percent=31, step='Transcribing dialogue (faster-whisper)')
+            words, segments = transcribe_video(path)
+            if words or segments:
+                word_starts = [w['start'] for w in words]
+                word_ends = [w['end'] for w in words]
+                phrase_ends = [sg['end'] for sg in segments]
+                speech_spans = [(sg['start'], sg['end']) for sg in segments]
+                if cut_clean:
+                    # Measured silences let a cut land where the sound
+                    # really stops, rather than where Whisper estimated it
+                    # (usually good to 50-150 ms, no better).
+                    job_set(jid, percent=32, step='Finding pauses for clean cuts')
+                    try:
+                        cut_quiet = _detect_silence_intervals(path, noise_db=-38, min_dur=0.08, timeout=300, sample_rate=16000)
+                    except Exception as e:
+                        print(f'Clean-cut silence scan skipped: {e}')
+                        cut_quiet = []
+                for s in scenes_data:
+                    overlap_text = ' '.join(
+                        sg['text'] for sg in segments if sg['start'] < s['end'] and sg['end'] > s['start']
+                    ).strip()
+                    s['dialogue'] = overlap_text
+                    # The scoring bonus below is still gated on the user actually
+                    # choosing an STT rating mode -- transcribing for cut safety
+                    # shouldn't silently change how scenes are *scored* when they
+                    # picked VISION-only. Cut safety and scoring are now separate
+                    # concerns (see transcribe_for_cuts vs whisper_enhance).
+                    if overlap_text and whisper_enhance:
+                        # Speech contributes 1-2: 1 for having quotable
+                        # dialogue at all, 2 if it's a question or
+                        # exclamation (which tend to make better trailer
+                        # beats than flat statements). Smallest of the three
+                        # components alongside quality (1-3) and AI vision
+                        # (1-5) -- it's a useful nudge, not a reason to pick
+                        # a visually poor scene.
+                        bonus = 2 if ('?' in overlap_text or '!' in overlap_text) else 1
+                        s['speech_score'] = bonus
+                        s['total_score'] += bonus
+                    else:
+                        s['speech_score'] = 0
+            else:
+                # Transcription unavailable/failed -- skip every speech-aware
+                # behavior below rather than half-applying it.
+                transcribe_for_cuts = False
+                whisper_enhance = False
+
+        # "Edit to music": prep the BGM *before* picking scenes so cut points can be
+        # snapped onto its beat grid. Only worth the extra generation pass when the
+        # user actually asked for it — otherwise BGM is prepared later as before.
+        base_ts = jid  # already unique per job (see job_new()) -- using it here too
+                       # avoids two jobs finishing this step in the same second
+                       # (quite possible with MAX_CONCURRENT_JOBS > 1) from both
+                       # writing to the same trailer_<ts>.mp4 path at once.
+        beat_times = []
+        if sync_beats:
+            job_set(jid, percent=32, step='Preparing music for beat-synced cuts')
+            early_bgm_path, early_bgm_source = prepare_bgm_track(genre, scoring_mode, scoring_audio_path,
+                                                                  base_target, base_ts,
+                                                                  trim_start=params.get('scoring_audio_trim_start') or 0.0,
+                                                                  trim_end=params.get('scoring_audio_trim_end'))
+            if early_bgm_path:
+                beat_times = detect_beat_times(early_bgm_path, base_target)
+                if not beat_times:
+                    sync_beats = False  # detection failed (e.g. librosa missing) — fall back silently
+            else:
+                sync_beats = False
+
+        job_set(jid, percent=33, step='Selecting scenes')
+        # Pick top scenes by score to fill target, then sort by timecode
+        # Iterative: xfade transitions shorten output, so compensate
+        # When cues exist, they drive selection EXCLUSIVELY via
+        # build_cue_clips below -- apply_script_priority (a total_score
+        # boost feeding the greedy best-scenes loop) is no longer used at
+        # all in that case, since there IS no best-scenes loop to feed once
+        # cues are present. Kept only as a message here, not a scoring
+        # step, so the person still sees confirmation their cues parsed
+        # and how many will be used.
+        script_cues = params.get('script_cues') or []
+        if script_cues:
+            job_set(jid, step=f'{len(script_cues)} timecode cue(s) will drive scene selection exclusively')
+        # Floor for how short a *budget-truncated* clip is allowed to be. Without this,
+        # whichever scene happens to land last (in score order, not timeline order) just
+        # gets clipped to "whatever duration is left" — which can be a fraction of a
+        # second. That sliver then lands wherever its timecode falls once we re-sort by
+        # start time, often producing a jarring near-invisible cut right before the end.
+        # A scene's own *natural* PySceneDetect duration can still be shorter than this
+        # (that's a legitimate quick cut in the source) — this floor only stops us from
+        # truncating a longer scene down below it just to hit the target duration exactly.
+        min_seg_dur = max(0.8, xfade_dur * 2.5)
+        if max_scene_dur:
+            min_seg_dur = min(min_seg_dur, max_scene_dur)
+        # Minimum spacing (in source timeline seconds) required between two
+        # selected scenes' start points. Without this, greedy score-based
+        # selection can pick several scenes from the same high-scoring stretch of
+        # the video (e.g. one well-lit dialogue scene) and leave the rest of the
+        # source entirely unrepresented. Scaled to the source length but bounded
+        # so it's meaningful on both short and long videos.
+        base_min_gap = max(2.0, min(8.0, video_duration * 0.03))
+        trailer_duration = base_target
+        # Narration/script presence now decides how selection works
+        # AUTOMATICALLY -- no manual mode to pick. If narration (a TTS script
+        # or an uploaded VO track) is supplied, it drives selection for
+        # whatever portion of the trailer it naturally covers; best-scenes
+        # ALWAYS fills whatever remains, rather than narration replacing
+        # best-scenes outright the way the old "Voiceover" mode used to.
+        # Script cues need no separate branch here at all -- apply_script_priority
+        # already boosted total_score unconditionally above, before this point,
+        # so cue-matched scenes are already strongly preferred by best-scenes'
+        # own greedy ranking (and, when narration also runs, by its matching
+        # tiebreak too, since that reads the same boosted score). "Script
+        # alone" and "script + narration" both already compose correctly
+        # through that one shared signal -- no separate script-selection
+        # algorithm was ever needed.
+        has_narration = bool((params.get('vo_text') or '').strip()) or \
+                        (params.get('vo_mode') == 'upload' and params.get('vo_upload_path'))
+
+        # --- Timecode-priority selection (script cues / Manual Entry) ---
+        # User-requested and confirmed: when cues exist at all, the final
+        # promo uses ONLY those cues -- narration-led and best-scenes
+        # selection below are both skipped entirely, not blended with cues.
+        # Each cue's own in/out becomes the clip via build_cue_clips
+        # (bypassing PySceneDetect's own scene boundaries, since a cue may
+        # legitimately span several of its shot changes combined into one
+        # cut), then _rebalance_selected_durations -- the same
+        # proportional stretch/shrink already used for preview-edit
+        # rebalancing -- adjusts each cue's own in/out to collectively hit
+        # the target duration, exactly the "AI can adjust the in/out to
+        # fill remaining time" behaviour requested.
+        used_driver = 'score'
+        min_gap = base_min_gap
+        if script_cues:
+            selected = build_cue_clips(script_cues, materials, min_seg_dur=min_seg_dur)
+            used_driver = 'cue'
+            if selected:
+                selected = _rebalance_selected_durations(selected, trailer_duration, min_seg_dur=min_seg_dur)
+            total_sel = sum(s['selected_dur'] for s in selected)
+            n_seg = len(selected) + len(card_files)
+            xfade_loss = max(0, (n_seg - 1)) * xfade_dur
+            expected_total = total_sel + total_card_dur - xfade_loss
+            shortfall = trailer_length - expected_total
+        else:
+            # --- Narration-led selection (only ever covers what narration actually
+            # supplies -- best-scenes below fills whatever budget is left over) ---
+            selected = []
+            total_sel = 0
+            if has_narration:
+                vo_for_sel = cutcraft.strip_vo_markers(params.get('vo_text')) if params.get('vo_mode') != 'tts' else (params.get('vo_text') or '').strip()
+                vo_beats = None
+                # Uploaded narration: transcribe with Whisper so selection can follow the spoken lines
+                if not vo_for_sel and params.get('vo_mode') == 'upload' and params.get('vo_upload_path'):
+                    job_set(jid, percent=34, step='Transcribing uploaded narration for selection')
+                    _vo_words, _vo_segs = transcribe_audio_file(
+                        params.get('vo_upload_path'),
+                        trim_start=params.get('vo_trim_start') or 0.0,
+                        trim_end=params.get('vo_trim_end'),
+                    )
+                    vo_beats = _vo_beats_from_segments(_vo_segs)
+                    if vo_beats:
+                        vo_for_sel = ' '.join(b['text'] for b in vo_beats)
+                        job_set(jid, step=f'Uploaded narration transcribed ({len(vo_beats)} segments)')
+                    else:
+                        job_set(jid, step='Could not transcribe uploaded narration — using best scenes only')
+                if vo_for_sel or vo_beats:
+                    job_set(jid, percent=35, step='Selecting scenes from narration')
+                    vo_sel, vo_total = select_scenes_vo_led(
+                        scenes_data, vo_for_sel, trailer_duration, max_scene_dur, min_seg_dur,
+                        base_min_gap, transcribe_for_cuts=transcribe_for_cuts, word_starts=word_starts,
+                        phrase_ends=phrase_ends, word_ends=word_ends,
+                        sync_beats=sync_beats, beat_times=beat_times,
+                        vo_beats=vo_beats)
+                    if vo_sel:
+                        selected, total_sel = vo_sel, vo_total
+                        used_driver = 'vo'
+                        job_set(jid, step=f'Narration-led selection: {len(selected)} beats matched, '
+                                           f'filling remaining budget with best scenes')
+                    else:
+                        job_set(jid, step='Narration-led selection found no matches — using best scenes only')
+                else:
+                    job_set(jid, step='No narration script or transcript — using best scenes only')
+
+            shortfall = 0.0
+            # Whatever narration-led selection above produced (empty if there was
+            # no narration, or none of it matched) is preserved across every pass
+            # below rather than being thrown away and re-decided from scratch --
+            # narration-pinned scenes stay pinned; only the REMAINING budget gets
+            # filled by best-scenes on top of them.
+            narration_selected = list(selected)
+            narration_total = total_sel
+
+            for pass_attempt in range(4):
+                # Relax the gap requirement on later passes: if spacing is preventing
+                # us from filling the duration budget, it's better to allow some
+                # clustering than to ship a trailer that's noticeably short.
+                min_gap = max(1.0, base_min_gap - pass_attempt * (base_min_gap / 4))
+                scenes_data.sort(key=lambda x: x['total_score'], reverse=True)
+                # Start from narration's picks (if any), not from empty -- the
+                # min_gap check below against every scene already in `selected`
+                # naturally excludes both those exact scenes (distance 0 from
+                # themselves) and anything too close to them, so no separate
+                # exclusion list is needed to avoid double-picking or crowding a
+                # narration-covered stretch of the timeline.
+                selected = list(narration_selected)
+                total_sel = narration_total
+                for s in scenes_data:
+                    remaining = trailer_duration - total_sel
+                    if remaining < min_seg_dur:
+                        # Not enough budget left for a decent-length clip — stop selecting
+                        # rather than truncating the next scene into a sliver. The
+                        # shortfall gets absorbed by nudging trailer_duration up on the
+                        # next pass_attempt below.
+                        break
+                    # Too close in the source timeline to an already-selected
+                    # scene -- skip it in favor of spreading selections across
+                    # the video, rather than over-sampling one stretch of it.
+                    # Scoped to the SAME material only: a real, confirmed bug --
+                    # each material's own timecodes are local to that source
+                    # (see apply_script_priority's own docstring), so a scene
+                    # from material 2 at local time 0:35 and one from material 1
+                    # at local time 0:38 are three seconds apart in two
+                    # completely unrelated files, not three seconds apart in
+                    # any shared timeline at all. The unscoped version of this
+                    # check could exclude a script-matched scene from one
+                    # material purely because ANOTHER material's already-picked
+                    # scene happened to land at a numerically close local
+                    # timecode -- exactly the shape of "script detected the
+                    # cue but didn't select it" a real report described.
+                    if any(abs(s['start'] - c['start']) < min_gap and s.get('material') == c.get('material')
+                           for c in selected):
+                        continue
+                    seg_dur = min(s['duration'], remaining)
+                    if max_scene_dur:
+                        seg_dur = min(seg_dur, max_scene_dur)
+                    seg_start = s['start']
+                    if transcribe_for_cuts and word_starts:
+                        # Don't start playback mid-word — nudge the in-point forward to
+                        # the start of the nearest word within this scene (capped so we
+                        # never drift far from the original visual cut point).
+                        snapped_start = nearest_word_boundary(seg_start, word_starts, max_snap=0.45, hard_limit=seg_start + seg_dur)
+                        if seg_start < snapped_start < seg_start + seg_dur:
+                            drift = snapped_start - seg_start
+                            seg_start = snapped_start
+                            seg_dur = max(0.3, seg_dur - drift)
+                    scene_end = s['start'] + s['duration']
+                    if sync_beats and beat_times:
+                        # Nudge this segment's end so the *cumulative* cut point lands on
+                        # the nearest beat, within what this scene can actually supply --
+                        # but only within a tight window around the already-computed,
+                        # word-boundary-aware target (see BEAT_SYNC_MAX_NUDGE), not the
+                        # whole remaining scene. A beat outside this range is too far to
+                        # snap to without risking a mid-word/mid-phrase cut the
+                        # speech-safety pass below won't be able to find and correct.
+                        target_cut = total_sel + seg_dur
+                        nudge_lo = max(total_sel + 0.3, target_cut - BEAT_SYNC_MAX_NUDGE)
+                        nudge_hi = min(total_sel + (scene_end - seg_start), target_cut + BEAT_SYNC_MAX_NUDGE)
+                        snapped_cut = nearest_beat(target_cut, beat_times, nudge_lo, nudge_hi)
+                        seg_dur = max(0.3, min(scene_end - seg_start, snapped_cut - total_sel))
+                    if transcribe_for_cuts and (phrase_ends or word_ends) and seg_dur < (scene_end - seg_start):
+                        # This is a separate `if`, not `elif` -- beat-sync above (when
+                        # enabled) picks a rhythmically-aligned out-point first, and this
+                        # then refines THAT point for speech safety, rather than being
+                        # skipped whenever beat-sync is on. It used to be `elif`, which
+                        # meant turning on "sync cuts to the beat" silently disabled
+                        # "don't cut mid-word" for every clip's out-point.
+                        #
+                        # Prefers a complete-phrase end over a bare word end -- see
+                        # nearest_speech_out for why that distinction is worth a
+                        # wider snap window.
+                        target_end = seg_start + seg_dur
+                        snapped_end = nearest_speech_out(target_end, phrase_ends, word_ends, hard_limit=scene_end)
+                        if seg_start < snapped_end <= scene_end:
+                            seg_dur = max(0.3, snapped_end - seg_start)
+                    s['trim_start'] = seg_start
+                    s['selected_dur'] = seg_dur
+                    selected.append(s)
+                    total_sel += seg_dur
+                # (material, start), not start alone -- see the identical fix
+                # and its full explanation elsewhere in this file for
+                # cross-material ordering.
+                selected.sort(key=lambda x: (x.get('material') or 0, x['start']))
+
+                n_seg = len(selected) + len(card_files)
+                xfade_loss = max(0, (n_seg - 1)) * xfade_dur
+                expected_total = total_sel + total_card_dur - xfade_loss
+                shortfall = trailer_length - expected_total
+                if abs(shortfall) <= 0.5 or pass_attempt == 3:
+                    break
+                trailer_duration = total_sel + shortfall * 1.15
+
+        # A positive shortfall here means every pass_attempt ran out of usable
+        # scenes (limited spacing/availability) before hitting the target, and
+        # the "no tiny sliver clips" rule above refused to add one more to close
+        # a small gap. Rather than ship a trailer noticeably under the requested
+        # length, extend the chronologically LAST selected clip using slack it
+        # already has within its own detected scene boundaries -- this grows an
+        # existing cut instead of adding a new one, so it doesn't reintroduce
+        # the flash-cut problem that rule exists to prevent.
+        if selected and shortfall > 0.15:
+            last = selected[-1]
+            slack = last['duration'] - last['selected_dur']
+            if slack > 0.05:
+                grow = min(slack, shortfall)
+                new_end = last['trim_start'] + last['selected_dur'] + grow
+                if transcribe_for_cuts and (phrase_ends or word_ends):
+                    # Growing this clip to close the shortfall creates a new cut
+                    # point too -- give it the same speech-boundary safety the main
+                    # truncation path gets above, or this top-up can reintroduce
+                    # exactly the mid-word cut the rest of this mechanism exists
+                    # to prevent.
+                    scene_end_abs = last['start'] + last['duration']
+                    snapped = nearest_speech_out(new_end, phrase_ends, word_ends, hard_limit=scene_end_abs)
+                    if last['trim_start'] < snapped <= scene_end_abs:
+                        new_end = snapped
+                grow = max(0.0, new_end - (last['trim_start'] + last['selected_dur']))
+                last['selected_dur'] += grow
+                total_sel += grow
+                shortfall -= grow
+
+        # A grown last clip (immediately above) can only close a shortfall as
+        # large as ITS OWN remaining slack -- when the source simply doesn't
+        # have that much room left in already-selected scenes (every one of
+        # them is already using all the footage it has), pull in additional,
+        # not-yet-selected scenes from the same scored pool instead of
+        # shipping a trailer that's noticeably short with nothing left to try.
+        # This mirrors what the manual "Preview the cut" edit flow already
+        # does when adding alternates after a drop
+        # (_autofill_short_selection_from_alternates) -- the fully-automatic
+        # generate path had no equivalent, so a source whose top-scored
+        # scenes didn't have enough combined slack could come up short with
+        # no further attempt to fix it at all.
+        #
+        # By this point every pass_attempt above already scanned every scene
+        # in scenes_data at the loosest spacing that loop allows (min_gap
+        # floors at 1.0s, never below), so a candidate skipped there purely
+        # for being too close to an already-picked scene would be skipped
+        # again here for the same reason -- making this step a no-op exactly
+        # when it's needed most. As a genuine last resort (only reached when
+        # every looser option already failed), spacing is relaxed further
+        # here -- clustering two clips closer together in the source is a
+        # smaller problem than shipping a trailer noticeably under the
+        # requested length.
+        if shortfall > 0.5:
+            last_resort_gap = min(min_gap, 0.3)
+            used_starts = {(s.get('material'), round(s['start'], 3)) for s in selected}
+            candidates = [s for s in scenes_data
+                          if (s.get('material'), round(s['start'], 3)) not in used_starts]
+            candidates.sort(key=lambda x: x['total_score'], reverse=True)
+            for cand in candidates:
+                if shortfall <= 0.5:
+                    break
+                if any(abs(cand['start'] - c['start']) < last_resort_gap and cand.get('material') == c.get('material')
+                       for c in selected):
+                    continue
+                seg_dur = min(cand['duration'], shortfall)
+                if max_scene_dur:
+                    seg_dur = min(seg_dur, max_scene_dur)
+                if seg_dur < min_seg_dur:
+                    continue
+                seg_start = cand['start']
+                if transcribe_for_cuts and word_starts:
+                    snapped_start = nearest_word_boundary(seg_start, word_starts, max_snap=0.45, hard_limit=seg_start + seg_dur)
+                    if seg_start < snapped_start < seg_start + seg_dur:
+                        drift = snapped_start - seg_start
+                        seg_start = snapped_start
+                        seg_dur = max(0.3, seg_dur - drift)
+                scene_end = cand['start'] + cand['duration']
+                if transcribe_for_cuts and (phrase_ends or word_ends) and seg_dur < (scene_end - seg_start):
+                    target_end = seg_start + seg_dur
+                    snapped_end = nearest_speech_out(target_end, phrase_ends, word_ends, hard_limit=scene_end)
+                    if seg_start < snapped_end <= scene_end:
+                        seg_dur = max(0.3, snapped_end - seg_start)
+                # Adding a scene also adds one more transition, which costs
+                # xfade_dur off the assembled total -- accounted for here the
+                # same way the main pass_attempt loop's own expected_total
+                # calc does, so this doesn't overshoot and leave the final
+                # exact-length correction below fighting an overshoot instead
+                # of a shortfall.
+                net_gain = seg_dur - xfade_dur
+                if net_gain <= 0:
+                    continue
+                cand = dict(cand)
+                cand['trim_start'] = seg_start
+                cand['selected_dur'] = seg_dur
+                selected.append(cand)
+                total_sel += seg_dur
+                shortfall -= net_gain
+            selected.sort(key=lambda x: (x.get('material') or 0, x['start']))
+
+        # Final exact-length correction. Everything above works in tolerances
+        # (the loop breaks at abs(shortfall) <= 0.5, and the grow-the-last-clip
+        # step only handles being UNDER target and only as far as that clip's
+        # own slack allows), so a finished trailer could legitimately land up
+        # to ~0.5s off the requested length -- and being OVER wasn't corrected
+        # at all. For a broadcast promo plug that has to fit an exact slot,
+        # "15 sec" needs to mean 15.00, not 14.6 or 15.4.
+        #
+        # This step now runs unconditionally for BOTH paths (moved out of this
+        # else: branch -- see right after this if/preselected/else block ends)
+        # since it operates purely on the already-built `selected` list and a
+        # handful of values available either way, not on anything specific to
+        # a fresh scene-selection pass. It used to run only here, which meant
+        # an approved-cut render (drop/add scenes, then "Lock cut & render")
+        # got NO duration correction at all -- dropping even one scene without
+        # adding a replacement landed the final render however short that made
+        # it, silently, with no attempt to close the gap.
+
+    if not selected:
+        job_set(jid, error='No scenes selected.')
+        return
+
+    # Clean cuts. Whatever picked the clips, nudge each in and out so it never
+    # lands inside a word: room kept for the transition fade, the in point
+    # moved to the start of a sentence when it falls mid-sentence, hairline
+    # gaps between words skipped for a real pause. Script timecode cues are
+    # the user's own exact in/out points, so those stay as written. The exact
+    # length correction below then works from these settled clips.
+    if transcribe_for_cuts and word_starts and not preselected:
+        cut_words = cutcraft.refine_words(list(zip(word_starts, word_ends)), cut_quiet)
+    if cut_clean and cut_words and used_driver != 'cue' and not preselected:
+        for s in selected:
+            src = s.get('source_path')
+            if src and src != path:
+                continue        # the speech we have is the primary file's only
+            new_ts, new_dur, _rep = cutcraft.refine_clip(
+                s.get('trim_start', s['start']), s['selected_dur'],
+                (s['start'], s['start'] + s['duration']),
+                cut_words, speech_spans, xfade=xfade_dur, min_len=min_seg_dur)
+            s['trim_start'], s['selected_dur'] = new_ts, new_dur
+        total_sel = sum(s['selected_dur'] for s in selected)
+
+    # Distributes the remaining error across clips proportionally rather than
+    # dumping it all on one: taking 0.4s off a single clip is an audible jolt,
+    # taking ~0.05s off each of eight is not. Grows are capped by each clip's
+    # real remaining slack inside its own detected scene (never invents
+    # footage that isn't there); trims are floored at min_seg_dur so
+    # correction can't shave a clip into a sliver.
+    #
+    # IMPORTANT -- trims are ALSO capped by each clip's speech-free tail (see
+    # speech_free_slack). Without that, this pass would silently undo the
+    # word/phrase snapping a fresh selection pass already did: every cut point
+    # carefully placed on a phrase end, then this shaving ~0.05s off each one
+    # to hit an exact total, putting them all back inside speech by a
+    # syllable's width. Exact duration and speech integrity were directly
+    # fighting, and duration was winning. A clip whose dialogue runs to its
+    # end now contributes nothing to the correction and is left exactly where
+    # the snapping put it; the error is absorbed by clips that have actual
+    # silence to give. If NO clip has silence to spare, the trailer ships a
+    # few hundredths off target rather than clipping a word -- the right
+    # trade for something whose whole job is sounding broadcast-clean. For an
+    # approved-cut render specifically, speech_spans is empty (see above), so
+    # this protection doesn't additionally apply there -- the correction
+    # still respects min_seg_dur, just without that second independent check.
+    n_seg = len(selected) + len(card_files)
+    xfade_loss = max(0, (n_seg - 1)) * xfade_dur
+    residual = trailer_length - (total_sel + total_card_dur - xfade_loss)
+    if selected and abs(residual) > 0.01:
+        for _ in range(3):  # a couple of passes: caps mean one pass may not absorb it all
+            if abs(residual) <= 0.01:
+                break
+            if residual > 0:
+                headroom = [(s, max(0.0, s['duration'] - s['selected_dur'])) for s in selected]
+            else:
+                headroom = []
+                for s in selected:
+                    room = max(0.0, s['selected_dur'] - min_seg_dur)
+                    if transcribe_for_cuts and speech_spans:
+                        clip_start = s['trim_start']
+                        clip_end = clip_start + s['selected_dur']
+                        room = min(room, speech_free_slack(clip_start, clip_end, speech_spans))
+                    headroom.append((s, room))
+            total_head = sum(h for _s, h in headroom)
+            if total_head <= 0.01:
+                break  # nothing left to give -- accept the residual rather than distort a clip
+            step = residual
+            for s, head in headroom:
+                if head <= 0:
+                    continue
+                delta = step * (head / total_head)
+                delta = min(delta, head) if delta > 0 else max(delta, -head)
+                s['selected_dur'] += delta
+                total_sel += delta
+                residual -= delta
+
+    # Last-resort gap-filler, user-requested: when a residual still remains
+    # after every scene-clip-based correction above -- e.g. every selected
+    # clip is already at zero headroom (hard color-cut scenes with
+    # selected_dur == duration already) or capped by min_seg_dur/speech-free
+    # slack -- absorb up to CARD_DURATION_ADJUST_LIMIT seconds, combined
+    # across both cards, by growing (freeze-framing the last frame) or
+    # shrinking (tail-trimming) the title/end cards themselves. This
+    # deliberately runs AFTER, not instead of, the scene-based correction
+    # above, and is capped small: a card is branding/informational, not
+    # content, so it should only mop up the last sliver of a gap, never
+    # carry it. Runs unconditionally (both preview and full render) since
+    # `total_card_dur` feeds the preview's own estimated_duration too.
+    if card_files and abs(residual) > 0.01:
+        growing = residual > 0
+        limit = cutcraft.card_adjust_limit(trailer_length, card_fit)
+
+        def _absorb(budget, floors, tag):
+            """Spread `budget` seconds over the cards, growing or shrinking,
+            never shrinking a card under its floor."""
+            nonlocal residual, total_card_dur
+            for i in range(len(card_files)):
+                if budget <= 0.01:
+                    break
+                if growing:
+                    take = budget
+                else:
+                    take = min(budget, max(0.0, card_durations[i] - floors[i]))
+                if take < 0.05:
+                    continue
+                delta = take if growing else -take
+                adjusted_path = os.path.join(app.config['UPLOAD_FOLDER'],
+                                              f'cardadj_{jid}_{i}_{int(time.time() * 1000) % 100000}.mp4')
+                result = _adjust_card_duration(card_files[i], delta, adjusted_path)
+                if result:
+                    card_files[i] = result
+                    card_durations[i] += delta
+                    total_card_dur += delta
+                    residual -= delta
+                    budget -= take
+                    card_fit_info['notes'].append(
+                        f'{card_labels[i]} {"held" if growing else "trimmed"} {take:.1f}s{tag} to land on '
+                        f'{trailer_length:g}s.')
+            return budget
+
+        # First, within what each card can give without cutting its voice or
+        # its animation. 'off' keeps the old behaviour: 1.0 s total, floor 1.0 s.
+        _absorb(min(abs(residual), limit), card_floors, '')
+        # Only if the plug would still miss its exact length, take the old
+        # last resort (down to 1.0 s a card, up to 1.0 s in total) and say so.
+        if not growing and card_fit != 'off' and abs(residual) > 0.01:
+            _absorb(min(abs(residual), CARD_DURATION_ADJUST_LIMIT),
+                    [min(d, 1.0) for d in card_durations], ' (past where it settles)')
+
+    # How clean did each edge end up? Shown in the review so a risky cut is
+    # visible before anything is rendered.
+    for s in selected:
+        src = s.get('source_path')
+        if cut_words and not preselected and (not src or src == path):
+            ts = s.get('trim_start', s['start'])
+            s['cut'] = {'in': cutcraft.classify_cut('in', ts, cut_words, speech_spans),
+                        'out': cutcraft.classify_cut('out', ts + s['selected_dur'], cut_words, speech_spans)}
+        else:
+            s['cut'] = None
+    cut_info = cutcraft.cut_summary([s['cut'] for s in selected if s.get('cut')])
+    cut_info['checked'] = bool(cut_words) and not preselected
+    cut_info['cleaned'] = bool(cut_clean)
+
+    # Narration: read the recording against the script and plan the cuts now,
+    # so the review shows them and the render uses exactly this plan.
+    if (params.get('preview_only') and vo_smart and vo_mode == 'upload' and vo_upload_path
+            and os.path.exists(vo_upload_path)):
+        job_set(jid, percent=33, step='Reading the narration against the script')
+        try:
+            plan_text = vo_text
+            if not (vo_text or '').strip():
+                # The script's own voice-over lines, each placed where its clip (or the card) lands.
+                plan_text, place_notes = _script_vo_text(params.get('script_brief'), selected, card_durations, xfade_dur, params.get('vo_jcut') or 0.0, params.get('card_jcut') or 0.0)
+                params['script_vo_notes'] = list(place_notes or []) + [n for n in (params.get('script_vo_notes') or []) if 'same recording' in n or 'whole narration' in n]
+            params['vo_plan'] = _build_vo_plan(vo_upload_path, plan_text or vo_text, vo_trim_start, vo_trim_end,
+                                               vo_start, trailer_length - cutcraft.VO_TAIL)
+        except Exception as e:
+            print(f'VO planning skipped: {e}')
+            params['vo_plan'] = None
+
+    try:
+        params['card_vo_suggest'] = _suggest_card_vo_ranges(params, params.get('script_brief')) if params.get('preview_only') else None
+    except Exception as e:
+        print(f'Card narration suggestions skipped: {e}')
+        params['card_vo_suggest'] = None
+
+    if params.get('preview_only'):
+        # Analysis is done; stop here instead of spending minutes on extraction,
+        # transitions and mixing for a cut the user hasn't seen yet.
+        pid = f'pv{jid}'
+        job_set(jid, percent=34, step='Writing preview thumbnails')
+
+        # Runner-ups: the next-best scoring scenes that didn't make the cut, so a
+        # rejected clip can be swapped for a real alternative instead of forcing a
+        # full re-analysis. Spaced by the same min_gap rule the selector uses, and
+        # excluding anything already chosen.
+        #
+        # chosen_starts is keyed on (material, rounded start) together, not
+        # start alone -- the same fix, for the same reason, as every other
+        # min_gap check in this file: two different materials' own local
+        # timelines can share numerically identical or close start times
+        # without being anywhere near each other in the source video.
+        chosen_starts = {(s.get('material'), round(s['start'], 3)) for s in selected}
+        alternates = []
+        if not preselected:
+            for cand in sorted(scenes_data, key=lambda x: x['total_score'], reverse=True):
+                if len(alternates) >= PREVIEW_ALTERNATES:
+                    break
+                if (cand.get('material'), round(cand['start'], 3)) in chosen_starts:
+                    continue
+                if any(abs(cand['start'] - o['start']) < min_gap and cand.get('material') == o.get('material')
+                       for o in alternates):
+                    continue
+                if any(abs(cand['start'] - s['start']) < min_gap and cand.get('material') == s.get('material')
+                       for s in selected):
+                    continue
+                cand = dict(cand)
+                cand.setdefault('selected_dur', min(cand['duration'], max_scene_dur or cand['duration']))
+                cand.setdefault('trim_start', cand['start'])
+                alternates.append(cand)
+
+        def _thumb(scene, tag, i):
+            frame = scene.get('frame')
+            if frame is None:
+                # Cue-driven clips (build_cue_clips) never go through
+                # _score_one_scene at all, so they have no pre-captured
+                # 'frame' the way an ordinary detected-and-scored scene
+                # does -- a real, reported gap ("no thumbnail" for a
+                # cue-selected scene). Extracted directly here instead:
+                # opens the clip's OWN source_path (never a single, shared
+                # file -- the same fix, for the same reason, as the
+                # video_filename fix right below) and seeks to its own
+                # actual start time.
+                src = scene.get('source_path') or params.get('path')
+                if not src or not os.path.exists(src):
+                    return None
+                try:
+                    cap = cv2.VideoCapture(src)
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                    seek_time = scene.get('trim_start', scene.get('start', 0.0))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(seek_time * fps))
+                    ok, frame = cap.read()
+                    cap.release()
+                    if not ok:
+                        return None
+                except Exception as e:
+                    print(f'Preview thumbnail {tag}{i} frame extraction failed: {e}')
+                    return None
+            try:
+                tw = 320
+                h, w = frame.shape[:2]
+                small = cv2.resize(frame, (tw, max(1, int(h * tw / max(w, 1)))))
+                tname = f'preview_{pid}_{tag}{i}.jpg'
+                cv2.imwrite(os.path.join(app.config['UPLOAD_FOLDER'], tname), small,
+                            [cv2.IMWRITE_JPEG_QUALITY, 78])
+                return f'/uploads/{tname}'
+            except Exception as e:
+                print(f'Preview thumbnail {tag}{i} failed: {e}')
+                return None
+
+        thumbs = [_thumb(s, 's', i) for i, s in enumerate(selected)]
+        alt_thumbs = [_thumb(s, 'a', i) for i, s in enumerate(alternates)]
+
+        def _slim(rows):
+            # Only the fields the render half consumes -- frames and other
+            # non-serializable analysis state are deliberately dropped.
+            # script_boost / script_desc / vo_beat kept so re-fetched previews
+            # and the UI can still show why each scene was chosen.
+            #
+            # material / source_path are NOT optional extras here: a real,
+            # reported bug -- omitting them meant an approved multi-material
+            # cut's own scenes lost track of which file they actually came
+            # from the moment they passed through this slimming step. The
+            # actual final "lock and render" pass (the preselected branch
+            # above) reads scene.get('source_path') to know which file to
+            # extract from, falling back to the single primary source when
+            # it's missing -- so every material-2 clip in a locked render
+            # was silently extracted from material 1's own file instead,
+            # even though the PREVIEW (which never goes through _slim,
+            # since it renders straight from `selected`) correctly showed
+            # material 2's own footage and thumbnail.
+            return [{'start': s['start'], 'end': s['end'], 'duration': s['duration'],
+                     'selected_dur': s['selected_dur'], 'trim_start': s.get('trim_start', s['start']),
+                     'material': s.get('material'), 'source_path': s.get('source_path'),
+                     'total_score': s['total_score'], 'quality_score': s.get('quality_score', 0),
+                     'vision_score': s.get('vision_score'), 'speech_score': s.get('speech_score', 0),
+                     'ai_desc': s.get('ai_desc', ''), 'has_face': s.get('has_face', False),
+                     'vo_beat': s.get('vo_beat'), 'vo_match': s.get('vo_match'), 'cut': s.get('cut'),
+                     'script_boost': s.get('script_boost'), 'script_desc': s.get('script_desc'),
+                     'edge_ratio': s.get('edge_ratio', 0), 'mean_hue': s.get('mean_hue', 0)}
+                    for s in rows]
+
+        slim = _slim(selected)
+        slim_alt = _slim(alternates)
+        # basename of the source video under UPLOAD_FOLDER, handed back so the
+        # preview grid's Play buttons can play a selected scene straight from
+        # /uploads/<name> -- same file the render step itself reads from.
+        video_filename = os.path.basename(params['path'])
+
+        # ---- Selection transparency (why each scene was chosen) ----
+        # Lets the UI show whether VO-led, script cues, or priority prompt
+        # actually influenced the cut, instead of leaving the user guessing.
+        script_cues = params.get('script_cues') or []
+        script_matched = sum(1 for s in selected if s.get('script_boost'))
+        selection_info = {
+            'driver': used_driver,  # 'vo' | 'score'
+            'driver_label': (
+                'Narration-led (VO/script text matched to scenes)' if used_driver == 'vo'
+                else 'Best-score (quality + AI vision + speech + script boosts)'
+            ),
+            'priority_prompt': (params.get('priority_prompt') or '').strip() or None,
+            'negative_prompt': (params.get('negative_prompt') or '').strip() or None,
+            'script_cues_parsed': len(script_cues),
+            'script_cues_matched': script_matched,
+            'script_cues': [
+                {
+                    'time': round(c['time'], 2),
+                    'timecode': _seconds_to_tc(c['time']),
+                    'desc': (c.get('desc') or '')[:160],
+                }
+                for c in script_cues[:40]  # cap for response size
+            ],
+            'vo_beats_used': sum(1 for s in selected if s.get('vo_beat')),
+        }
+
+        def _scene_why(s):
+            """Human-readable reason this scene made the cut."""
+            reasons = []
+            if s.get('vo_beat'):
+                beat_txt = (s.get('vo_beat') or '')[:80]
+                match_txt = (f" (match {s.get('vo_match'):.0%})" if s.get('vo_match') is not None else '')
+                reasons.append(f'VO beat: "{beat_txt}"{match_txt}')
+            if s.get('script_boost'):
+                desc_txt = (s.get('script_desc') or 'matched timecode')[:80]
+                reasons.append(f'Script cue (+{s.get("script_boost"):.1f}): "{desc_txt}"')
+            if s.get('vision_score'):
+                reasons.append(f"AI vision {s.get('vision_score')}")
+            if s.get('has_face'):
+                reasons.append('face present')
+            if not reasons:
+                reasons.append(f"score {s.get('total_score', 0):.1f}")
+            return reasons
+
+        preview_store(pid, {'params': params, 'selected': slim, 'thumbs': thumbs,
+                            'alternates': slim_alt, 'alt_thumbs': alt_thumbs,
+                            'total_scenes': len(scene_list), 'video_duration': video_duration,
+                            'total_card_dur': total_card_dur,
+                            'selection': selection_info})
+        result = dict(
+            status='preview', preview=True, preview_id=pid,
+            orig_name=orig_name, total_scenes=len(scene_list), selected_scenes=len(selected),
+            video_duration=round(video_duration, 1), trailer_length=trailer_length,
+            scenes_duration=round(total_sel, 1),
+            estimated_duration=round(total_sel + total_card_dur - max(0, len(selected) + len(card_files) - 1) * xfade_dur, 1),
+            cut_info=cut_info, card_fit=card_fit_info, vo_plan=_vo_plan_summary(params.get('vo_plan')),
+            script_brief=_brief_summary(params.get('script_brief'), params.get('vo_plan')),
+            plan_view=_plan_view(params, params.get('vo_plan'), card_fit_info,
+                                 round(total_sel + total_card_dur - max(0, len(selected) + len(card_files) - 1) * xfade_dur, 1), xfade_dur),
+            video_filename=video_filename,
+            selection=selection_info,
+            scenes=[{'scene': i + 1, 'start': round(s['start'], 1), 'end': round(s['end'], 1),
+                     'quality': s['total_score'], 'duration': round(s['selected_dur'], 1),
+                     'quality_score': s.get('quality_score', 0),
+                     'vision_score': s.get('vision_score'),
+                     'speech_score': s.get('speech_score', 0),
+                     'has_face': bool(s.get('has_face')),
+                     'vo_beat': s.get('vo_beat'),
+                     'vo_match': s.get('vo_match'),
+                     'cut': s.get('cut'),
+                     'script_boost': round(s.get('script_boost') or 0, 2) or None,
+                     'script_desc': s.get('script_desc') or None,
+                     'material': s.get('material'),
+                     # A real, reported bug: the top-level video_filename
+                     # below is ONE shared file (params['path'], the primary
+                     # source) used for every scene's own Play button --
+                     # correct for a single-source job, but for a
+                     # multi-material one it meant a material-2 scene's Play
+                     # button actually played from material 1's own file.
+                     # Each scene now carries its own, matching its actual
+                     # source_path, for the frontend to use instead of the
+                     # single shared one.
+                     'video_filename': os.path.basename(s.get('source_path') or params.get('path', '')),
+                     'why': _scene_why(s),
+                     'description': _scene_desc(s), 'thumb': thumbs[i]}
+                    for i, s in enumerate(selected)],
+            alternates=[{'alt': i + 1, 'start': round(s['start'], 1), 'end': round(s['end'], 1),
+                         'quality': s['total_score'], 'duration': round(s['selected_dur'], 1),
+                         'quality_score': s.get('quality_score', 0),
+                         'vision_score': s.get('vision_score'),
+                         'speech_score': s.get('speech_score', 0),
+                         'has_face': bool(s.get('has_face')),
+                         'script_boost': round(s.get('script_boost') or 0, 2) or None,
+                         'script_desc': s.get('script_desc') or None,
+                         'material': s.get('material'),
+                         'video_filename': os.path.basename(s.get('source_path') or params.get('path', '')),
+                         'description': _scene_desc(s), 'thumb': alt_thumbs[i]}
+                        for i, s in enumerate(alternates)])
+        job_set(jid, percent=100, step='Preview ready', done=True, result=result)
+        return
+
+    job_set(jid, percent=38, step=f'Extracting {len(selected)} selected clips')
+    # Extract selected segments + card videos as temp files. `extracted`
+    # tracks which of `selected` actually produced a usable clip, so stats
+    # reported to the user (selected_scenes, trailer_duration) reflect what's
+    # really in the output rather than what was merely picked.
+    #
+    # Run in parallel: each clip is an independent ffmpeg process reading the same
+    # source read-only, so there's nothing to serialize. This used to be a plain
+    # sequential loop and was one of the longest single stages of the job.
+    _extract_errors = []
+    _extract_lock = threading.Lock()
+    _extract_progress = {'done': 0}
+    n_to_extract = len(selected)
+
+    def _extract_one(seg_i, seg):
+        out_seg = os.path.join(app.config['UPLOAD_FOLDER'], f'seg_{base_ts}_{seg_i}.mp4')
+        trim_start = seg.get('trim_start', seg['start'])
+
+        def _enc(fast_seek):
+            # fast_seek puts -ss before -i (input seeking: quick, but can land
+            # awkwardly relative to keyframes). The retry puts it after -i
+            # (output seeking: decodes from the start, slower but exact).
+            # Multi-material jobs store the correct source on each scene so
+            # M2 clips are cut from material 2, not the primary path.
+            src = seg.get('source_path') or path
+            pre = ['-ss', str(trim_start), '-i', src] if fast_seek else ['-i', src, '-ss', str(trim_start)]
+            return [FFMPEG, '-y'] + pre + [
+                '-t', str(seg['selected_dur']),
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k', out_seg]
+
+        for attempt, fast in enumerate((True, False)):
+            try:
+                r = run_ffmpeg(_enc(fast), label=f'clip extract @{trim_start:.1f}s')
+                stderr = r.stderr
+            except MediaToolTimeout as e:
+                stderr = str(e)
+            if os.path.exists(out_seg) and os.path.getsize(out_seg) > 0:
+                with _extract_lock:
+                    _extract_progress['done'] += 1
+                    job_set(jid, percent=38 + int(10 * _extract_progress['done'] / max(n_to_extract, 1)),
+                            step=f"Extracting clips {_extract_progress['done']}/{n_to_extract}")
+                return seg_i, out_seg, seg
+            print(f'FFMPEG seg extraction {"error" if attempt == 0 else "retry also failed"} '
+                  f'(scene at {trim_start}s): {stderr[:500]}')
+            with _extract_lock:
+                _extract_errors.append(stderr[-800:])
+        with _extract_lock:
+            _extract_progress['done'] += 1
+        return None
+
+    with ThreadPoolExecutor(max_workers=min(EXTRACT_WORKERS, n_to_extract or 1)) as ex:
+        results = list(ex.map(lambda p: _extract_one(*p), enumerate(selected)))
+
+    # Reassemble in the original order — ThreadPoolExecutor.map preserves input
+    # order, but filter first so a dropped clip doesn't shift the rest.
+    ok_results = [r for r in results if r is not None]
+    seg_files = [r[1] for r in ok_results]
+    extracted = [r[2] for r in ok_results]
+    if _extract_errors:
+        last_ffmpeg_stderr = _extract_errors[-1]
+
+    if len(extracted) < len(selected):
+        dropped = len(selected) - len(extracted)
+        print(f'{dropped} selected scene(s) failed extraction and were dropped from the trailer.')
+    selected = extracted
+    total_sel = sum(s['selected_dur'] for s in selected)
+
+    if not selected:
+        job_set(jid, error='All selected scenes failed to extract.' + (f' Last ffmpeg error: {last_ffmpeg_stderr}' if last_ffmpeg_stderr else ''))
+        return
+
+    all_inputs = seg_files + card_files
+    n_total = len(all_inputs)
+
+    out_path = os.path.join(app.config['UPLOAD_FOLDER'], f'trailer_{base_ts}.mp4')
+    sfx_timestamps = []
+
+    norm = (f'scale={src_w}:{src_h}:force_original_aspect_ratio=decrease,'
+            f'pad={src_w}:{src_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={src_fps}')
+
+    job_set(jid, percent=50, step='Building transitions & crossfades')
+    if n_total == 1:
+        try:
+            r = run_ffmpeg([FFMPEG, '-y', '-i', all_inputs[0], '-vf', norm,
+                            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+                            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k',
+                            '-movflags', '+faststart', out_path],
+                           label='single-clip encode')
+            if r.returncode != 0:
+                print(f'FFMPEG single concat error: {r.stderr[:500]}')
+                last_ffmpeg_stderr = r.stderr[-800:]
+        except MediaToolTimeout as e:
+            last_ffmpeg_stderr = str(e)
+    else:
+        # One metadata pass per input (duration + whether it carries audio),
+        # replacing what used to be three separate ffprobe spawns per input.
+        # Probed in parallel since these are independent read-only calls.
+        with ThreadPoolExecutor(max_workers=min(8, n_total)) as ex:
+            infos = list(ex.map(probe_media_info, all_inputs))
+
+        # Normalize every input to ensure consistent video/audio before xfade.
+        # Only re-encode if audio is missing (add silent audio as fallback).
+        normed_inputs = []
+        for i, (inp, info) in enumerate(zip(all_inputs, infos)):
+            if info['has_audio']:
+                normed_inputs.append(inp)
+                continue
+            normed = os.path.join(app.config['UPLOAD_FOLDER'], f'norm_{base_ts}_{i}.mp4')
+            try:
+                run_ffmpeg([FFMPEG, '-y', '-i', inp,
+                            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+                            '-map', '0:v:0', '-map', '1:a:0', '-shortest', normed],
+                           timeout=120, label='silent-audio mux')
+            except MediaToolTimeout as e:
+                print(f'Silent-audio mux timed out for input {i}: {e}')
+            if os.path.exists(normed) and os.path.getsize(normed) > 0:
+                normed_inputs.append(normed)
+                # Adding an audio track can change the container duration
+                # slightly, so this one input gets re-probed; the untouched
+                # inputs keep the duration measured above.
+                d = probe_duration(normed)
+                if d and d > 0:
+                    infos[i] = {'duration': d, 'has_audio': True}
+            else:
+                normed_inputs.append(inp)
+
+        durations = [info['duration'] for info in infos]
+        if any(d is None or d <= 0 for d in durations):
+            # Every xfade offset is computed by summing these. A single bad value
+            # (this used to silently become 5.0) shifts every transition after it
+            # and desynchronises audio from video for the rest of the trailer, so
+            # this fails the job instead of shipping a subtly broken render.
+            bad = [os.path.basename(all_inputs[i]) for i, d in enumerate(durations) if d is None or d <= 0]
+            job_set(jid, error='Could not read the duration of these clips, so transition timing '
+                               f'could not be calculated reliably: {", ".join(bad[:5])}. '
+                               'This usually means ffprobe is missing or a clip is corrupt.')
+            return
+
+        all_inputs = normed_inputs
+        n_total = len(all_inputs)
+
+        # The exact length this assembly should come out at. Two candidates,
+        # and the distinction matters: sum(durations) - crossfade overlaps is
+        # what the filter graph will *naturally* produce, but that inherits
+        # every clip's frame-quantisation error (a real render asking for
+        # 15.0s landed at 15.10s this way). trailer_length is what the user
+        # actually asked for and what a broadcast slot requires. Prefer the
+        # requested length, but only when the natural assembly is already
+        # within a hair of it -- if they differ by more than ~0.75s the
+        # shortfall is real (not enough usable source material; see the
+        # correction pass in the analysis half) and hard-cutting to
+        # trailer_length would just chop the tail off the last clip, which is
+        # worse than shipping slightly short. See the -t note below.
+        natural_target = sum(durations) - max(0, n_total - 1) * xfade_dur
+        assembled_target = (trailer_length
+                            if abs(natural_target - trailer_length) <= 0.75
+                            else natural_target)
+
+        norm = (f'scale={src_w}:{src_h}:force_original_aspect_ratio=decrease,'
+                f'pad={src_w}:{src_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={src_fps}')
+        filter_parts = [f'[{i}:v]{norm}[n{i}]' for i in range(n_total)]
+        use_matte = transition == 'custom_matte' and transition_matte_path and os.path.exists(transition_matte_path)
+        matte_input_args = []
+
+        if use_matte:
+            # Custom transition: blend each cut using a user-uploaded matte's luma as
+            # an opacity mask (maskedmerge) instead of one of ffmpeg's built-in xfade
+            # wipe shapes. xfade computes its own overlap windows internally from a
+            # single offset per cut; maskedmerge has no such concept, so each clip is
+            # split by hand into a unique middle portion plus the tail/head slivers
+            # (xfade_dur long) that feed the transition either side of it, and the
+            # whole thing is reassembled with one concat filter at the end.
+            matte_ext = os.path.splitext(transition_matte_path)[1].lower()
+            is_image = matte_ext in {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+            matte_input_idx = n_total  # the matte is appended as one extra -i after all_inputs
+            matte_input_args = (['-loop', '1', '-i', transition_matte_path] if is_image
+                                 else ['-stream_loop', '-1', '-i', transition_matte_path])
+            filter_parts.append(
+                f'[{matte_input_idx}:v]{norm},format=gray,trim=0:{xfade_dur},setpts=PTS-STARTPTS[mattebase]')
+            n_trans = n_total - 1
+            filter_parts.append('[mattebase]split=' + str(n_trans) + ''.join(f'[mt{i}]' for i in range(n_trans)))
+
+            seg_labels = []
+            for i in range(n_total):
+                start = xfade_dur if i > 0 else 0
+                end = durations[i] - (xfade_dur if i < n_total - 1 else 0)
+                if end <= start:
+                    # Clip too short to give a full xfade_dur to both neighboring
+                    # transitions — keep a thin sliver instead of an empty/negative one.
+                    end = start + 0.05
+                filter_parts.append(f'[n{i}]trim=start={start}:end={end},setpts=PTS-STARTPTS[seg{i}]')
+                seg_labels.append(f'seg{i}')
+                if i < n_total - 1:
+                    tail_start = max(0, durations[i] - xfade_dur)
+                    filter_parts.append(f'[n{i}]trim=start={tail_start}:end={durations[i]},setpts=PTS-STARTPTS[tailA{i}]')
+                    filter_parts.append(f'[n{i+1}]trim=start=0:end={xfade_dur},setpts=PTS-STARTPTS[headB{i}]')
+                    filter_parts.append(f'[tailA{i}][headB{i}][mt{i}]maskedmerge[trans{i}]')
+                    seg_labels.append(f'trans{i}')
+                    offset = sum(durations[:i + 1]) - (i + 1) * xfade_dur
+                    sfx_timestamps.append(max(offset, 0) + xfade_dur * 0.5)
+            concat_inputs = ''.join(f'[{lbl}]' for lbl in seg_labels)
+            filter_parts.append(f'{concat_inputs}concat=n={len(seg_labels)}:v=1:a=0[vout]')
+            prev_label = 'vout'
+        else:
+            prev_label = 'n0'
+            for i in range(n_total - 1):
+                offset = sum(durations[:i + 1]) - (i + 1) * xfade_dur
+                sfx_timestamps.append(max(offset, 0) + xfade_dur * 0.5)
+                out_label = f'v{i+1}'
+                filter_parts.append(
+                    f'[{prev_label}][n{i+1}]xfade=transition={transition}:duration={xfade_dur}:offset={max(offset, 0)}[{out_label}]')
+                prev_label = out_label
+
+        # Audio acrossfade chain — matches video transition timing exactly either way
+        audio_parts = []
+        for i in range(n_total):
+            audio_parts.append(f'[{i}:a]atrim=0:{durations[i]}[a{i}]')
+        for i in range(1, n_total):
+            prev = f'af{i-1}' if i > 1 else 'a0'
+            audio_parts.append(f'[{prev}][a{i}]acrossfade=d={xfade_dur}:c1=tri[af{i}]')
+        last_audio_label = f'af{n_total-1}'
+        # Pin the audio chain to exactly the target length before it reaches
+        # the encoder. -t alone (below) leaves the audio stream a frame or two
+        # long, because AAC encodes in fixed-size frames and rounds up to the
+        # next frame boundary past the cut -- a real render pinned video to
+        # exactly 15.000s this way while audio still came out 15.100s. apad
+        # first so a marginally-short chain gets padded rather than
+        # truncated-to-nothing, then atrim to the exact sample position;
+        # apad's padding is silence, so it can only ever add inaudible tail,
+        # never cut real audio short.
+        if n_total > 1:
+            audio_parts.append(
+                f'[{last_audio_label}]apad=whole_dur={assembled_target:.3f},'
+                f'atrim=0:{assembled_target:.3f},asetpts=PTS-STARTPTS[afinal]')
+        else:
+            audio_parts.append(
+                f'[a0]apad=whole_dur={assembled_target:.3f},'
+                f'atrim=0:{assembled_target:.3f},asetpts=PTS-STARTPTS[afinal]')
+        last_audio_label = 'afinal'
+        filter_parts.extend(audio_parts)
+
+        cmd = [FFMPEG, '-y']
+        for f in all_inputs:
+            cmd.extend(['-i', f])
+        cmd.extend(matte_input_args)
+        cmd.extend(['-filter_complex', ';'.join(filter_parts)])
+        last_vlabel = f'[{prev_label}]'
+        cmd.extend(['-map', last_vlabel, '-map', f'[{last_audio_label}]'])
+        cmd.extend(['-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-pix_fmt', 'yuv420p',
+                     '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart'])
+        # Force the assembled output to exactly the intended length, and keep
+        # the two streams the same length as each other.
+        #
+        # Two separate problems this fixes, both observed in a real render
+        # (requested 15.0s -> got 15.20s total, with video 15.08s and audio
+        # 15.20s, i.e. 0.12s of A/V drift):
+        #  * Extracted clips are frame-quantised, so each one is a few ms
+        #    longer or shorter than the float duration asked for. Summed over
+        #    8-10 clips that's a visible overshoot no amount of upstream
+        #    arithmetic can remove, because the arithmetic isn't what's wrong.
+        #  * The audio chain trims each input to durations[i] (the *requested*
+        #    length) while the video chain concatenates the *actual* extracted
+        #    frames, so the two chains disagree by exactly that quantisation
+        #    error and the audio ends up trailing the video.
+        # -t caps both streams at the same wall-clock length, and -shortest
+        # stops encoding as soon as either ends, so neither can run past the
+        # other. Applied as output options (after the codec flags, before
+        # out_path) so they govern the muxed result rather than any one input.
+        cmd.extend(['-t', f'{assembled_target:.3f}', '-shortest', out_path])
+        try:
+            r = run_ffmpeg(cmd, timeout=FFMPEG_LONG_TIMEOUT, label='xfade concat')
+            if r.returncode != 0:
+                print(f'FFMPEG xfade error: {r.stderr[:1000]}')
+                last_ffmpeg_stderr = r.stderr[-800:]
+        except MediaToolTimeout as e:
+            last_ffmpeg_stderr = str(e)
+
+    # Cleanup segment files
+    for f in seg_files:
+        if os.path.exists(f):
+            os.remove(f)
+
+    filename = os.path.basename(out_path)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        detail = ''
+        if not seg_files:
+            detail = ' No scene clips were successfully extracted from the source video — check that ffmpeg/ffprobe are installed and on PATH, and that the uploaded video isn\'t corrupt.'
+        elif last_ffmpeg_stderr:
+            detail = f' Last ffmpeg error: {last_ffmpeg_stderr.strip()}'
+        job_set(jid, error=f'Episodic Promo Plug generation failed (ffmpeg output empty).{detail}')
+        return
+    # Verify it's a valid video, and capture the ACTUAL assembled duration.
+    # This is scenes + cards - crossfade overlap, which is NOT the same as
+    # total_sel (scenes only). Ducking windows and the reported trailer length
+    # both used total_sel previously: the trailing duck window got clipped short,
+    # so music never ducked under the end-card VO, and the duration shown to the
+    # user understated the real file by the length of the cards.
+    assembled_duration = probe_duration(out_path)
+    if assembled_duration is None or assembled_duration <= 0:
+        job_set(jid, error='Episodic Promo Plug generation failed (invalid/corrupt output).')
+        return
+
+    job_set(jid, percent=58, step='Normalizing audio levels')
+    # Normalize the raw SOT (original dialogue/nat sound baked into the source clips)
+    # to a consistent loudness up front. Source footage can come in recorded at very
+    # different levels — this keeps everything downstream (SFX ducking, BGM
+    # sidechain detection, VO ducking) working off a predictable baseline instead of
+    # being thrown off by an unusually quiet or hot original recording.
+    sot_norm = os.path.join(app.config['UPLOAD_FOLDER'], f'sotnorm_{base_ts}.mp4')
+    # -t/-shortest here as well as on the concat above: loudnorm re-encodes
+    # the audio, and an AAC re-encode rounds its stream length up to the next
+    # frame boundary, which silently undoes the exact-length pinning the
+    # concat step just did (observed: concat produced video 15.000s / audio
+    # 15.000s, then this pass shipped audio at 15.100s against the same
+    # 15.000s video). Video is stream-copied here so it can't drift; capping
+    # both keeps them equal. assembled_duration is probed from the actual
+    # concat output rather than reusing assembled_target, so this can only
+    # ever preserve that file's real length, never impose a different one.
+    _norm_cap = ['-t', f'{assembled_duration:.3f}', '-shortest'] if assembled_duration else []
+    r = subprocess.run([FFMPEG, '-y', '-i', out_path,
+                        '-af', f'loudnorm=I={target_loudness}:TP={true_peak}:LRA=7',
+                        '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart']
+                       + _norm_cap + [sot_norm],
+                       capture_output=True, text=True, timeout=120)
+    if os.path.exists(sot_norm) and os.path.getsize(sot_norm) > 0:
+        os.replace(sot_norm, out_path)
+    else:
+        print(f'SOT normalization error: {r.stderr[:500]}')
+
+    job_set(jid, percent=62, step='Adding sound effects at cuts')
+    # Generate SFX and mix into trailer audio. Whatever the source (AI-generated,
+    # uploaded, or synthesized), the *same* hit gets stamped at every cut via
+    # stamp_hits() so it's never just a single one-shot lost at the front.
+    sfx_ok = False
+    sfx_source = 'none'  # 'woosh' | 'uploaded' | 'synth_fallback' | 'none'
+    sfx_path = os.path.join(app.config['UPLOAD_FOLDER'], f'sfx_{base_ts}.wav')
+    if sfx_mode != 'none' and sfx_timestamps:
+        hit_wave = None
+        if sfx_mode == 'upload' and sfx_upload_path:
+            hit_wave = load_hit_waveform(
+                sfx_upload_path,
+                offset=params.get('sfx_upload_trim_start') or 0.0,
+                trim_end=params.get('sfx_upload_trim_end'))
+            sfx_source = 'uploaded' if hit_wave is not None else 'none'
+        elif sfx_mode == 'genre' and genre:
+            woosh_sfx_path = os.path.join(app.config['UPLOAD_FOLDER'], f'woosh_sfx_{base_ts}.flac')
+            if woosh_sfx(genre, woosh_sfx_path, duration=0.8) and os.path.getsize(woosh_sfx_path) > 0:
+                hit_wave = load_hit_waveform(woosh_sfx_path)
+                if os.path.exists(woosh_sfx_path):
+                    os.remove(woosh_sfx_path)
+                sfx_source = 'woosh' if hit_wave is not None else 'none'
+            # No ACE-Step fallback here by design — ACE-Step is a music model, not an
+            # SFX model, so a failed Woosh call goes straight to the procedural synth
+            # fallback below rather than a mismatched-model attempt. The "From genre"
+            # option is gated on Woosh alone (see data-requires on sfx_mode=genre) so
+            # this branch is only reached when Woosh was expected to work.
+            if hit_wave is None:
+                hit_wave = synth_sfx_waveform(genre)
+                sfx_source = 'synth_fallback' if hit_wave is not None else 'none'
+        if hit_wave is not None:
+            sfx_ok = stamp_hits(hit_wave, sfx_timestamps, sfx_path)
+            if not sfx_ok:
+                sfx_source = 'none'
+        if sfx_ok:
+            sfx_m4a = os.path.join(app.config['UPLOAD_FOLDER'], f'sfx_{base_ts}.m4a')
+            sfx_cmd = [FFMPEG, '-y', '-i', sfx_path]
+            if sfx_source == 'synth_fallback':
+                # Light production polish so the procedurally-synthesized fallback
+                # doesn't sound as bare/synthetic next to AI-generated SFX.
+                sfx_cmd += ['-af', 'aecho=0.6:0.5:35:0.25,alimiter=limit=0.9']
+            sfx_cmd += ['-c:a', 'aac', '-b:a', '192k', sfx_m4a]
+            subprocess.run(sfx_cmd, capture_output=True, text=True, timeout=30)
+            if os.path.exists(sfx_m4a) and os.path.getsize(sfx_m4a) > 0:
+                # Mix SFX into the trailer audio
+                with_sfx = os.path.join(app.config['UPLOAD_FOLDER'], f'with_sfx_{base_ts}.mp4')
+                r = subprocess.run([FFMPEG, '-y', '-i', out_path, '-i', sfx_m4a,
+                                    '-filter_complex',
+                                    '[0:a]volume=1.0[a0];[1:a]volume=0.85[a1];'
+                                    '[a0][a1]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[outa]',
+                                    '-map', '0:v', '-map', '[outa]',
+                                    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                                    '-shortest', with_sfx],
+                                   capture_output=True, text=True, timeout=120)
+                if os.path.exists(with_sfx) and os.path.getsize(with_sfx) > 0:
+                    os.replace(with_sfx, out_path)
+            if os.path.exists(sfx_path):
+                os.remove(sfx_path)
+            if os.path.exists(sfx_m4a):
+                os.remove(sfx_m4a)
+    _remove_job_intermediate(sfx_upload_path)
+    _remove_job_intermediate(title_card_vo_path)
+    _remove_job_intermediate(end_card_vo_path)
+
+    job_set(jid, percent=80, step='Generating/mixing background music')
+    # Prepare background music (ducked under SOT) as its own stem — the actual
+    # merge into out_path happens later in the unified final mix below, once we
+    # also know whether a voiceover is being added.
+    bgm_source = 'none'  # 'uploaded' | 'ai_generated' | 'synth_fallback' | 'none'
+    bgm_ready_path = None
+    if scoring_audio_path and total_sel > 0:
+        # Fit the music to the WHOLE assembled trailer, not just the scene
+        # segments. This used to be total_sel (scenes only), so the music ran out
+        # the moment the title/end cards started and they played dry -- exactly
+        # where a promo most wants a bed under the card VO.
+        scenes_dur = assembled_duration
+        prepared_bgm = None
+
+        if early_bgm_path and os.path.exists(early_bgm_path):
+            # Reuse the track generated for beat-sync instead of paying for a
+            # second ACE-Step/generation pass; just re-fit it to the exact length.
+            prepared_bgm = finalize_bgm_duration(early_bgm_path, scenes_dur, base_ts)
+            bgm_source = early_bgm_source if prepared_bgm else 'none'
+            if os.path.exists(early_bgm_path):
+                os.remove(early_bgm_path)
+        else:
+            prepared_bgm, bgm_source = prepare_bgm_track(genre, scoring_mode, scoring_audio_path, scenes_dur, base_ts,
+                                                           trim_start=params.get('scoring_audio_trim_start') or 0.0,
+                                                           trim_end=params.get('scoring_audio_trim_end'))
+
+        # NOTE: independent of sync_beats above, not sequential to it. When
+        # sync_beats is also on, cut points were already snapped (during scene
+        # selection, before this point) to early_bgm_path's ORIGINAL beat grid.
+        # time-stretching it here for tempo matching shifts where those beats
+        # actually fall in the final mix, so combining both can leave cuts
+        # slightly off the beat they were synced to. Not fixed automatically
+        # (re-detecting/re-snapping post-stretch would mean redoing scene
+        # selection here) -- surfaced to the user instead, in the form's help
+        # text next to these two checkboxes.
+        if prepared_bgm and beat_match:
+            job_set(jid, step='Beat-matching music to video tempo')
+            matched = os.path.join(app.config['UPLOAD_FOLDER'], f'matched_{base_ts}.wav')
+            if beat_match_audio(path, prepared_bgm, scenes_dur, matched):
+                prepared_bgm_m4a = os.path.join(app.config['UPLOAD_FOLDER'], f'matched_{base_ts}.m4a')
+                subprocess.run([FFMPEG, '-y', '-i', matched,
+                                '-c:a', 'aac', '-b:a', '192k', prepared_bgm_m4a],
+                               capture_output=True, text=True, timeout=30)
+                if os.path.exists(prepared_bgm_m4a) and os.path.getsize(prepared_bgm_m4a) > 0:
+                    prepared_bgm = prepared_bgm_m4a
+                if os.path.exists(matched):
+                    os.remove(matched)
+
+        if prepared_bgm:
+            # Normalize the BGM track's own loudness only, to its baseline "full swell"
+            # level (music_duck_db under overall target — so it never competes with SOT
+            # even at full volume). The actual ducking during dialogue is applied later,
+            # in the final mix, using deterministic silence-detected windows (see
+            # _build_duck_volume_expr below) rather than a reactive sidechain here — that
+            # lets a single minimum-gap "hold" rule govern both BGM-vs-SOT and BGM-vs-VO
+            # instead of two separately-tuned compressors that could disagree with each other.
+            bgm_target = target_loudness + music_duck_db
+            bgm_ready_path = os.path.join(app.config['UPLOAD_FOLDER'], f'bgmready_{base_ts}.m4a')
+            r = subprocess.run([FFMPEG, '-y', '-i', prepared_bgm,
+                                '-af', f'loudnorm=I={bgm_target}:TP={true_peak}:LRA=7',
+                                '-c:a', 'aac', '-b:a', '192k', bgm_ready_path],
+                               capture_output=True, text=True, timeout=120)
+            if not (os.path.exists(bgm_ready_path) and os.path.getsize(bgm_ready_path) > 0):
+                print(f'BGM prep error: {r.stderr[:500]}')
+                bgm_ready_path = None
+            if os.path.exists(prepared_bgm):
+                os.remove(prepared_bgm)
+
+    # Voiceover: upload or TTS. Prepared as its own stem here too — mixed in below,
+    # in the same unified final mix, so it can duck SOT and BGM by different amounts.
+    vo_source = 'none'  # 'uploaded' | 'tts' | 'none'
+    vo_error = None
+    vo_ready_path = None
+    if vo_mode != 'none':
+        if vo_mode == 'tts':
+            engine_label = 'Fish Audio'
+            if vo_ref_upload_path:
+                vo_step_note = f' (cloning voice from uploaded reference sample via {engine_label})'
+            elif vo_voice:
+                vo_step_note = f' (voice: {vo_voice}, {engine_label})'
+            else:
+                vo_step_note = f' ({engine_label}, no voice selected)'
+        else:
+            vo_step_note = ''
+        job_set(jid, percent=90, step='Adding narration' + vo_step_note)
+        vo_raw_path = None
+        if vo_mode == 'upload' and vo_upload_path and os.path.exists(vo_upload_path):
+            vo_raw_path = vo_upload_path
+            vo_source = 'uploaded'
+        elif vo_mode == 'tts':
+            tts_wav = os.path.join(app.config['UPLOAD_FOLDER'], f'tts_{base_ts}.wav')
+            tts_kwargs = {'rate': vo_rate, 'voice_id': vo_voice, 'language': vo_language, 'engine': vo_engine}
+            if vo_ref_upload_path and os.path.exists(vo_ref_upload_path):
+                tts_kwargs['reference_audio_path'] = vo_ref_upload_path
+            ok, err = generate_tts(vo_text, tts_wav, **tts_kwargs)
+            if ok:
+                vo_raw_path = tts_wav
+                vo_source = 'tts'
+            else:
+                vo_error = err
+                print(f'TTS error: {err}')
+
+        if vo_raw_path:
+            # Normalize the VO's own loudness first — an uploaded voiceover can be
+            # recorded much quieter or hotter than expected, which would otherwise
+            # throw off both how audible it ends up and how reliably it triggers
+            # the ducking below. If this is an uploaded VO, trim it to
+            # [vo_trim_start, vo_trim_end) first — that's a window within the
+            # source file itself, separate from vo_start below (which places the
+            # already-trimmed narration on the trailer's own timeline).
+            ms = max(0, int(vo_start * 1000))
+            vo_edited_path = None
+            if vo_source == 'uploaded' and vo_smart:
+                # Cut at the script's own points. The plan was made (and shown)
+                # at the review step; a plan is made here for a direct render.
+                vo_plan = params.get('vo_plan')
+                if vo_plan is None and 'vo_plan' not in params:
+                    try:
+                        plan_text = vo_text
+                        if not (vo_text or '').strip():
+                            plan_text, _n = _script_vo_text(params.get('script_brief'), selected, card_durations, xfade_dur, params.get('vo_jcut') or 0.0, params.get('card_jcut') or 0.0)
+                        vo_plan = _build_vo_plan(vo_raw_path, plan_text or vo_text, vo_trim_start, vo_trim_end,
+                                                 vo_start, trailer_length - cutcraft.VO_TAIL)
+                    except Exception as e:
+                        print(f'VO planning skipped: {e}')
+                        vo_plan = None
+                if vo_plan and vo_plan.get('edited') and vo_plan.get('pieces'):
+                    job_set(jid, step='Cutting the narration at the script points')
+                    vo_edited_path = _render_vo_from_plan(
+                        vo_plan, vo_raw_path,
+                        os.path.join(app.config['UPLOAD_FOLDER'], f'voedit_{base_ts}.wav'))
+                    if vo_edited_path:
+                        vo_raw_path = vo_edited_path
+                        ms = 0          # the plan already placed every line on the plug's timeline
+            vo_ready_path = os.path.join(app.config['UPLOAD_FOLDER'], f'voready_{base_ts}.m4a')
+            cmd = [FFMPEG, '-y']
+            if vo_source == 'uploaded' and not vo_edited_path and (vo_trim_start > 0 or vo_trim_end is not None):
+                cmd.extend(['-ss', str(vo_trim_start)])
+                if vo_trim_end is not None:
+                    cmd.extend(['-to', str(vo_trim_end)])
+            cmd.extend(['-i', vo_raw_path,
+                        '-af', f'loudnorm=I={target_loudness}:TP={true_peak}:LRA=7,adelay={ms}|{ms},volume={vo_volume}',
+                        # Forces a standard, well-supported rate (already used
+                        # elsewhere in this app for other audio processing)
+                        # rather than whatever loudnorm+this AAC encoder would
+                        # otherwise pick on their own -- a smaller, separate
+                        # good-practice fix, not the actual fix for silence
+                        # detection misreading this file (see
+                        # _detect_silence_intervals' own docstring for that).
+                        '-ar', '44100',
+                        '-c:a', 'aac', '-b:a', '192k', vo_ready_path])
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if not (os.path.exists(vo_ready_path) and os.path.getsize(vo_ready_path) > 0):
+                print(f'VO prep error: {r.stderr[:500]}')
+                vo_ready_path = None
+        _remove_job_intermediate(vo_upload_path)
+        _edited = os.path.join(app.config['UPLOAD_FOLDER'], f'voedit_{base_ts}.wav')
+        if os.path.exists(_edited):
+            os.remove(_edited)
+        tts_wav = os.path.join(app.config['UPLOAD_FOLDER'], f'tts_{base_ts}.wav')
+        if os.path.exists(tts_wav):
+            os.remove(tts_wav)
+
+    # Unified final mix: combine SOT (already in out_path) with whichever of
+    # BGM/VO are present. If VO is playing, SOT gets ducked to near-silence (two
+    # people talking over each other is unusable) via a live sidechain, since VO
+    # presence is unambiguous there. BGM's duck is different: it needs to stay
+    # ducked whenever EITHER SOT or VO has anything going on, and — per request —
+    # must not swell back up on every brief pause, only after a real gap. A
+    # reactive sidechain has no concept of a minimum "hold" before releasing (only
+    # attack/release ramp times), so BGM ducking is computed deterministically
+    # instead: silence-detect SOT and VO separately, union the two "not silent"
+    # timelines, bridge any gap shorter than duck_release_hold seconds (so a short
+    # dialogue pause doesn't count as a real release), then apply duck_depth_db
+    # only within those merged windows via a per-frame volume expression.
+    #
+    # Broadcast delivery toggle: if enabled, every element is forced to be
+    # identically audible in both channels (true center / dual-mono), so nothing
+    # is lost if played back or checked on a single channel. This is applied as
+    # the very last step, after all ducking/mixing — it only changes the stereo
+    # image (L/R placement), never the levels or ducking decided above it.
+    CENTER_FILTER = 'aformat=channel_layouts=stereo,pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1'
+    if bgm_ready_path or vo_ready_path or broadcast_stereo:
+        job_set(jid, step='Finalizing audio mix')
+        final_mixed = os.path.join(app.config['UPLOAD_FOLDER'], f'finalmix_{base_ts}.mp4')
+        cmd = [FFMPEG, '-y', '-i', out_path]
+        inputs = []
+        if bgm_ready_path:
+            cmd += ['-i', bgm_ready_path]
+            inputs.append('bgm')
+        if vo_ready_path:
+            cmd += ['-i', vo_ready_path]
+            inputs.append('vo')
+
+        tail = (CENTER_FILTER + ',' if broadcast_stereo else '') + f'loudnorm=I={target_loudness}:TP={true_peak}:LRA=7'
+
+        bgm_duck_expr = None
+        if bgm_ready_path:
+            job_set(jid, step='Detecting dialogue gaps for music ducking')
+            sot_silence = _detect_silence_intervals(out_path)
+            sot_windows = _active_windows_from_silence(sot_silence, assembled_duration)
+            vo_windows = []
+            if vo_ready_path:
+                vo_silence = _detect_silence_intervals(vo_ready_path)
+                # Bound to the VO clip's own real length -- see
+                # _active_windows_from_silence's docstring: without this, a
+                # short VO with no detected internal silence reads as "active"
+                # for the rest of the trailer, well past where it actually ends.
+                vo_real_dur = probe_duration(vo_ready_path) or assembled_duration
+                vo_windows = _active_windows_from_silence(vo_silence, assembled_duration,
+                                                           content_duration=vo_real_dur)
+            combined = _union_windows([sot_windows, vo_windows])
+            # Expand each active-speech window so music starts ducking slightly
+            # before speech and stays down a short guard after speech ends.
+            # This is the main fix for "music recovers while someone is still talking".
+            if combined:
+                expanded = []
+                for s, e in combined:
+                    expanded.append((
+                        max(0.0, s - DUCK_PRE_ROLL),
+                        e + DUCK_POST_SPEECH_GUARD
+                    ))
+                combined = _union_windows([expanded])
+            duck_windows = _merge_windows_with_hold(combined, duck_release_hold)
+            bgm_duck_expr = _build_duck_volume_expr(duck_windows, duck_depth_db)
+            if bgm_duck_expr is None:
+                # Silence detection itself failed on every track (not just "no gaps
+                # found") — fall back to a constant duck for the full duration rather
+                # than accidentally leaving BGM unducked throughout.
+                bgm_duck_expr = f'{10 ** (duck_depth_db / 20):.5f}'
+
+        if vo_ready_path:
+            vo_idx = 1 + inputs.index('vo')
+            fc = []
+            # sidechaincompress truncates its ENTIRE output to the shorter of its
+            # two inputs, unconditionally -- confirmed directly against ffmpeg: a
+            # 20s main track fed a 5s key track produces a 5s result even with
+            # amix's duration=first downstream. That's the "trailer length gets
+            # cut to match the VO" bug: any VO shorter than the assembled trailer
+            # silently truncated the whole audio mix (and therefore, via -shortest
+            # on the final mux, the whole video) to the VO's own length.
+            # apad extends the key input with silence to the real trailer length
+            # before it ever reaches sidechaincompress, so ducking still applies
+            # correctly while the VO plays and simply has nothing left to duck
+            # once the VO ends.
+            fc.append(f'[{vo_idx}:a]asplit=2[vo_out][vokey_raw]')
+            fc.append(f'[vokey_raw]apad=whole_dur={assembled_duration:.3f}[vokey1]')
+            # SOT ducked to near-silence under VO (fast attack, low threshold, high
+            # ratio, no makeup — this is meant to sit well below the VO, not just
+            # lower than before). This one stays a live sidechain since "is VO
+            # playing right now" is unambiguous and doesn't need a hold.
+            fc.append('[0:a][vokey1]sidechaincompress=threshold=0.01:ratio=20:attack=5:release=250:makeup=1[sot_ducked]')
+            mix_labels = ['sot_ducked']
+            if bgm_ready_path:
+                bgm_idx = 1 + inputs.index('bgm')
+                fc.append(f"[{bgm_idx}:a]volume=eval=frame:volume='{bgm_duck_expr}'[bgm_ducked]")
+                mix_labels.append('bgm_ducked')
+            mix_labels.append('vo_out')
+            fc.append('[' + ']['.join(mix_labels) + f']amix=inputs={len(mix_labels)}:duration=first:dropout_transition=2:normalize=0[premix]')
+            fc.append(f'[premix]{tail}[outa]')
+            filter_complex = ';'.join(fc)
+        elif bgm_ready_path:
+            # BGM only, no VO — same hold-based duck against SOT, applied directly here
+            # since there's no separate VO-driven filter chain to fold it into.
+            bgm_idx = 1
+            filter_complex = (f"[{bgm_idx}:a]volume=eval=frame:volume='{bgm_duck_expr}'[bgm_ducked];"
+                               f'[0:a][bgm_ducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[premix];'
+                               f'[premix]{tail}[outa]')
+        else:
+            # Neither BGM nor VO — only reached when the broadcast toggle needs
+            # to center the SOT on its own.
+            filter_complex = f'[0:a]{tail}[outa]'
+
+        cmd += ['-filter_complex', filter_complex, '-map', '0:v', '-map', '[outa]',
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', final_mixed]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if os.path.exists(final_mixed) and os.path.getsize(final_mixed) > 0:
+            os.replace(final_mixed, out_path)
+        else:
+            print(f'Final audio mix error: {r.stderr[:500]}')
+        if bgm_ready_path and os.path.exists(bgm_ready_path):
+            os.remove(bgm_ready_path)
+        if vo_ready_path and os.path.exists(vo_ready_path):
+            os.remove(vo_ready_path)
+
+    result = dict(
+        status='ok', trailer_url=f'/uploads/{filename}',
+        orig_name=orig_name,
+        # The resolved source video actually rendered from -- the single
+        # original HIRES file, or the already-combined multi-file result if
+        # Browse Library's multi-select combine was used. Kept separately
+        # from trailer_url (the GENERATED promo) specifically for Send to
+        # destination's csv_video case: the CSV's timecodes describe cuts
+        # into THIS file, not into the generated promo's own, completely
+        # different timeline, so a destination wanting both needs this one
+        # alongside the CSV, not the edited output.
+        source_video_path=path,
+        # True only for a render reached via /api/trailer/render -- i.e.
+        # "Preview the cut" first, with the scene selection actually
+        # reviewed (and possibly edited: scenes dropped/swapped) by a
+        # person before this render ran. False for "Generate without
+        # preview", a direct one-shot render with no review step at all.
+        # preview_total_scenes is only ever set by that one route (see
+        # api_trailer_render), so its presence is a reliable signal of
+        # which path produced this specific result -- used by the frontend
+        # to decide which Send to destination delivery kinds to offer:
+        # csv/csv_video destinations (the CSV describes exactly the
+        # reviewed selection) only for a reviewed render; a plain video
+        # destination only for an unreviewed one.
+        went_through_preview=bool(params.get('preview_total_scenes')),
+        total_scenes=len(scene_list), selected_scenes=len(selected),
+        trailer_duration=round(assembled_duration, 1),
+        scenes_duration=round(total_sel, 1),
+        video_duration=round(video_duration, 1),
+        trailer_length=trailer_length,
+        delivery_format=delivery_format,
+        bgm_source=bgm_source, sfx_source=sfx_source,
+        vo_source=vo_source, vo_error=vo_error, sync_beats=sync_beats,
+        whisper_enhance=whisper_enhance,
+        template_applied=params.get('template_applied'),
+        # A single, complete production summary -- what actually went into
+        # this specific render, not just the edited output itself. Every
+        # value here already existed somewhere in params; this just
+        # collects them into one place a person can actually read after
+        # the fact, since previously reconstructing "what did I use for
+        # this one" meant remembering it or re-opening the original job.
+        # Surviving material paths a later FCP XML package export (see
+        # build_fcpxml_package) can reference -- kept separate from
+        # production_summary above, which only ever holds display-friendly
+        # names/text for a person to read, never a raw filesystem path.
+        # Each entry uses params' own ORIGINAL, untrimmed path (the same
+        # one production_summary's *_orig_name already resolves against),
+        # not any trimmed/muxed working copy made further up during
+        # rendering -- an editor pulling this into an NLE wants the whole
+        # original card/music/VO file to work with, not a pre-cut piece of
+        # it. 'GENERATE' is scoring_audio_path's sentinel for "make ambient
+        # music on the fly" -- no real file exists for that case, so it's
+        # excluded here rather than pointing at nothing.
+        fcpxml_materials=dict(
+            music=(dict(path=params.get('scoring_audio_path'),
+                        orig_name=params.get('scoring_audio_orig_name') or _asset_display_name(params.get('scoring_audio_path')))
+                   if params.get('scoring_audio_path') and params.get('scoring_audio_path') != 'GENERATE' else None),
+            vo=(dict(path=params.get('vo_upload_path'),
+                     orig_name=params.get('vo_upload_orig_name') or _asset_display_name(params.get('vo_upload_path')))
+                if params.get('vo_mode') == 'upload' and params.get('vo_upload_path') else None),
+            card_title=(dict(path=params.get('end_card_path'),
+                              orig_name=params.get('end_card_orig_name') or _asset_display_name(params.get('end_card_path')))
+                        if params.get('end_card_path') else None),
+            card_end=(dict(path=params.get('schedule_card_path'),
+                            orig_name=params.get('schedule_card_orig_name') or _asset_display_name(params.get('schedule_card_path')))
+                      if params.get('schedule_card_path') else None),
+        ),
+        production_summary=dict(
+            transition=params.get('transition'),
+            xfade_dur=params.get('xfade_dur'),
+            transition_matte=_asset_display_name(params.get('transition_matte_path')),
+            title_card=params.get('end_card_orig_name') or _asset_display_name(params.get('end_card_path')),
+            schedule_card=params.get('schedule_card_orig_name') or _asset_display_name(params.get('schedule_card_path')),
+            vo_file=(params.get('vo_upload_orig_name') or _asset_display_name(params.get('vo_upload_path'))) if params.get('vo_mode') == 'upload' else None,
+            vo_text=params.get('vo_text') if params.get('vo_mode') == 'tts' else None,
+            music_file=(params.get('scoring_audio_orig_name') or _asset_display_name(params.get('scoring_audio_path'))) if params.get('scoring_mode') == 'upload' else None,
+            priority_prompt=params.get('priority_prompt') or None,
+            negative_prompt=params.get('negative_prompt') or None,
+            # Count, not the raw cues themselves -- a script can carry many
+            # timecoded lines, and the point here is confirming a script
+            # WAS attached and roughly how much of it mattered, not
+            # reproducing the whole thing a second time in a summary.
+            script_cue_count=len(params.get('script_cues') or []) or None,
+        ),
+        scenes=[{
+            'scene': i+1, 'start': round(s['start'], 1), 'end': round(s['end'], 1),
+            'quality': s['total_score'], 'duration': round(s['selected_dur'], 1),
+            'material': s.get('material'),
+            'script_desc': s.get('script_desc') or None,
+            'description': _scene_desc(s)
+        } for i, s in enumerate(selected)])
+    # library_add() runs BEFORE the job is marked done, not after -- doing it
+    # the other way (mark done, then fix up the result with library_id
+    # afterward) leaves a real window where a client polling progress sees
+    # done=True with no library_id yet, since library_add() does a real file
+    # copy plus a DB insert that takes measurable time. Send to destination
+    # needs a real library_id to target and has no fallback for a missing
+    # one (unlike Download, which already tolerates it via a filename-based
+    # fallback) -- so that window is a real bug, not just a cosmetic gap.
+    # Still wrapped in its own try/except: a failed library save (disk full,
+    # permissions) must not stop the render from being marked done at all --
+    # the user's file is still sitting in UPLOAD_FOLDER and downloadable
+    # either way, just without a permanent library entry.
+    try:
+        result['library_id'] = library_add(filename, result,
+                                            user_id=params.get('user_id'), username=params.get('username'))
+    except Exception as e:
+        print(f'Trailer library save failed (job still succeeded): {e}')
+    job_set(jid, percent=100, step='Done', done=True, result=result)
+    # No ip here -- this runs in the background render thread, well past the
+    # point the original request (which had it) returned. user_id/username
+    # are available because they're already threaded through params for
+    # library_add just above; piping ip through the same way just for this
+    # one log entry wasn't worth the added surface for a lower-stakes event
+    # than the admin actions above that DO capture it.
+    audit_log('trailer_generate', target=params.get('orig_name') or filename,
+               detail=f"{result.get('trailer_duration')}s, {len(selected)} scenes",
+               user_id=params.get('user_id'), username=params.get('username'))
+

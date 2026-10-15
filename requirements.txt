@@ -1,0 +1,58 @@
+# Generated from the actual imports across core.py, auth.py, library_db.py,
+# pipeline.py, main.py. Versions below are what this codebase was tested
+# against in the sandbox that built this modularized split -- verify against
+# whatever's actually running on the production server before trusting these
+# blindly, since that's the environment that matters.
+#
+# librosa/soundfile are lazy-imported inside one function each (beat
+# detection for music sync) rather than at module load, so the app runs
+# without them -- just that one feature degrades if they're missing. Exact
+# versions weren't verified here since neither was installed in the sandbox
+# used to build/test this split.
+
+Flask==3.1.3
+Werkzeug==3.1.7
+python-dotenv>=1.0
+opencv-python==4.13.0.92
+numpy==2.4.4
+requests==2.33.1
+scenedetect==0.7.1
+smbprotocol==1.17.0
+pypdf==5.9.0
+# Position-aware PDF text extraction (word-level bounding boxes) -- used to
+# detect a two-column rundown layout (video timecode left, audio/SOT text
+# right) so a time-of-day mention in the right column can't be misread as a
+# scene-selection timecode. Optional at runtime (extract_script_text falls
+# back to pypdf's plain extraction if this isn't installed), but included
+# here so a fresh install gets the real, working feature by default.
+pdfplumber==0.11.9
+msgpack>=1.0
+# Layered Photoshop files for the Schedule Plug tab (brings Pillow with it).
+# Imported lazily: without it the tab still animates PNG/JPEG/TIFF artwork
+# and says plainly that a .psd needs this package.
+psd-tools>=1.10
+Pillow>=10.3
+waitress>=3.0
+# Two-factor authentication (TOTP). pyotp does the actual verification;
+# qrcode renders the enrolment QR so a phone can scan the secret instead of
+# it being typed by hand. Both are imported lazily in auth.py, so an existing
+# deployment that hasn't reinstalled requirements yet still starts -- 2FA is
+# simply unavailable until they're present, rather than the app failing to
+# boot.
+pyotp>=2.9
+qrcode>=7.4
+librosa>=0.10
+soundfile>=0.12
+
+# Not imported directly, but required at runtime as external programs, not
+# Python packages -- pip can't install these:
+#   ffmpeg / ffprobe   -- the render pipeline shells out to both
+# Also expected reachable at runtime (configurable via env vars, see
+# README.md / .env.example) but not Python dependencies either:
+#   Ollama (vision scoring), Fish Audio TTS, Whisper STT, ACE-Step (music),
+#   Woosh (SFX) -- the app degrades gracefully if any of these are
+#   unreachable, per the fixes made in this session.
+
+# ---- Dev-only: running the test suite (see tests/README.md) ----
+# Not needed to run the app itself, only to run `pytest`.
+pytest>=8.0

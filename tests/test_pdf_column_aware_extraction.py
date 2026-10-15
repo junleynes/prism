@@ -1,0 +1,307 @@
+"""
+Tests for a real, user-reported problem: a two-column PDF rundown (video
+timecode on the left, audio/SOT script text on the right) fed through the
+old, position-blind pypdf extract_text() had no way to tell which column
+any given piece of text came from -- so a time-of-day mention buried in
+the right column's own prose (e.g. "airs at 8:50PM on GMA Prime") could
+get flattened into the extracted text in a form that looked exactly like
+a real left-column video timecode, and be misread as a scene-selection
+cue that was never actually there.
+
+_extract_pdf_video_column_only() detects a genuine two-column layout via
+each word's own real x-position (not the page's content-stream order,
+which is what a naive flatten actually reads) and, only when a clear
+column gutter is found, builds text from the left column's words alone.
+An ordinary single-column script -- the common case -- never triggers
+this at all and reads exactly as it always did, via pypdf, completely
+unaffected.
+"""
+import io
+import os
+import unittest.mock as mock
+
+with mock.patch('requests.post'), mock.patch('requests.get'):
+    import main
+import pipeline
+from werkzeug.datastructures import FileStorage
+
+
+def _build_two_column_pdf(rows):
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    c.setFont("Helvetica", 10)
+    width, height = letter
+    y = height - 100
+    for left, right in rows:
+        c.drawString(50, y, left)
+        c.drawString(250, y, right)
+        y -= 40
+    c.save()
+    return buf.getvalue()
+
+
+def _build_single_column_pdf(lines):
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    c.setFont("Helvetica", 10)
+    width, height = letter
+    y = height - 100
+    for line in lines:
+        c.drawString(60, y, line)
+        y -= 20
+    c.save()
+    return buf.getvalue()
+
+
+def test_two_column_pdf_extracts_left_column_only():
+    raw = _build_two_column_pdf([
+        ("00:03:33:00 M1 -37 HABOL TACKLE", "Reporter walks into the venue and begins narration."),
+        ("00:00:35:00 M2 -12 BUNOT", "This segment airs at 8:50PM on GMA Prime tonight."),
+    ])
+    text, used = pipeline._extract_pdf_video_column_only(raw)
+    assert used is True
+    assert "HABOL TACKLE" in text
+    assert "BUNOT" in text
+    # The exact bug: right-column prose, including its own time-of-day
+    # mention, must never appear in the extracted (video-column) text at all.
+    assert "8:50PM" not in text
+    assert "Reporter" not in text
+    assert "GMA Prime" not in text
+
+
+def test_single_column_pdf_is_not_treated_as_two_column():
+    # No real column gutter anywhere -- must fall back cleanly (None, False)
+    # so extract_script_text uses the ordinary, unaffected pypdf path.
+    raw = _build_single_column_pdf([
+        "00:03:33:00 M1 -37 HABOL TACKLE",
+        "This is an ordinary single-column script with normal prose.",
+        "It happens to mention 8:50PM on GMA Prime, and that's fine here",
+        "since there's no real column layout for it to be confused with.",
+    ])
+    text, used = pipeline._extract_pdf_video_column_only(raw)
+    assert used is False
+    assert text is None
+
+
+def test_full_extract_script_text_entry_point_uses_column_extraction_for_two_column_pdf():
+    raw = _build_two_column_pdf([
+        ("00:03:33:00 M1 -37 HABOL TACKLE", "Reporter walks into the venue and begins narration."),
+        ("00:00:35:00 M2 -12 BUNOT", "This segment airs at 8:50PM on GMA Prime tonight."),
+    ])
+    fs = FileStorage(stream=io.BytesIO(raw), filename="rundown.pdf")
+    text, err = pipeline.extract_script_text(fs)
+    assert err is None
+    assert "HABOL TACKLE" in text
+    assert "8:50PM" not in text
+
+
+def test_full_extract_script_text_entry_point_falls_back_for_single_column_pdf():
+    raw = _build_single_column_pdf([
+        "00:03:33:00 M1 -37 HABOL TACKLE",
+        "Ordinary paragraph text follows, mentioning 8:50PM on GMA Prime.",
+    ])
+    fs = FileStorage(stream=io.BytesIO(raw), filename="script.pdf")
+    text, err = pipeline.extract_script_text(fs)
+    assert err is None
+    # Single-column fallback keeps everything, unaffected by this feature --
+    # this text was never at risk of column confusion in the first place.
+    assert "HABOL TACKLE" in text
+    assert "8:50PM" in text
+
+
+def test_extracted_two_column_text_produces_clean_cues_with_no_spurious_entries():
+    raw = _build_two_column_pdf([
+        ("00:03:33:00 M1 -37 HABOL TACKLE", "Reporter walks into the venue and begins narration."),
+        ("00:03:38:00 M1 -43", "Continued interview footage with the athlete."),
+        ("00:00:35:00 M2 -12 BUNOT", "This segment airs at 8:50PM on GMA Prime tonight."),
+        ("00:00:43:00 M2 -20", "Second telecast will be on GTV at 10:30PM."),
+    ])
+    text, used = pipeline._extract_pdf_video_column_only(raw)
+    assert used is True
+    cues = pipeline.parse_script_cues(text, segment_offsets={1: 0.0, 2: 100.0})
+    assert len(cues) == 4
+    descs = [c['desc'] for c in cues]
+    assert not any('8:50' in d or 'GMA Prime' in d or 'GTV' in d for d in descs)
+
+
+def test_two_column_detection_returns_false_gracefully_without_pdfplumber():
+    raw = _build_two_column_pdf([
+        ("00:03:33:00 M1 -37 HABOL TACKLE", "Reporter walks into the venue."),
+    ])
+    with mock.patch.dict('sys.modules', {'pdfplumber': None}):
+        text, used = pipeline._extract_pdf_video_column_only(raw)
+    assert used is False
+    assert text is None
+
+
+def test_varying_line_lengths_on_a_single_column_page_do_not_false_positive():
+    # Regression guard for a real bug caught during development: an
+    # earlier version of the column-gap detector pooled every word's x0
+    # across the WHOLE page into one list, rather than checking within
+    # each row -- a short first line followed by a much longer second
+    # line left a coincidental gap in that pooled, page-wide list that
+    # looked exactly like a column gutter, even though there's no real
+    # column structure here at all, and truncated the extracted text mid
+    # word. Detection must be per-row (a real gutter recurs at the same
+    # x-position across several rows), not global.
+    raw = _build_single_column_pdf([
+        "00:03:33:00 M1 -37 HABOL TACKLE",
+        "Ordinary paragraph text follows, mentioning 8:50PM on GMA Prime.",
+    ])
+    text, used = pipeline._extract_pdf_video_column_only(raw)
+    assert used is False
+    assert text is None
+
+
+def _build_mixed_pdf(left_lines, right_lines):
+    """Places left_lines and right_lines at fixed row positions (by index,
+    not paired) -- mirrors a real rundown where the two sides don't line
+    up row-for-row, including rows where only one side has any content."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    c.setFont("Helvetica", 10)
+    width, height = letter
+    y = height - 60
+    for line in left_lines:
+        if line:
+            c.drawString(50, y, line)
+        y -= 20
+    y = height - 60
+    for line in right_lines:
+        if line:
+            c.drawString(300, y, line)
+        y -= 20
+    c.save()
+    return buf.getvalue()
+
+
+def test_a_long_left_column_line_is_not_truncated_by_a_shorter_global_split():
+    # Regression guard for a real bug caught during development: the
+    # column split position is computed from several rows' own gaps, but
+    # was then applied as one blind, uniform cutoff to every row. A
+    # left-column line simply longer than the rows used to compute that
+    # split (its own last word landing just past the global cutoff) had
+    # that word silently dropped even though nothing on the right side was
+    # anywhere near it. The real-world case: a promo/schedule line ending
+    # in "10:30 PM" losing exactly the "PM" that made the AM/PM rejection
+    # (see test_script_parsing.py) able to catch it at all.
+    raw = _build_mixed_pdf(
+        left_lines=[
+            "M1 3:33-37 HABOL TACKLE",
+            "M2 00:35-42 BUNOT",
+            "SECOND TELECAST GTV 10:30 PM",
+        ],
+        right_lines=[
+            "Short dialogue line here.",
+            "Another short dialogue line.",
+        ],
+    )
+    text, used = pipeline._extract_pdf_video_column_only(raw)
+    assert used is True
+    assert "SECOND TELECAST GTV 10:30 PM" in text
+
+
+def test_right_column_material_labels_are_always_excluded_even_with_real_timecodes():
+    # Corrected understanding, confirmed directly against the actual
+    # reported document's own real content: the right column is
+    # audio/SOT/dialogue text, full stop. A material tag (M1/M2) appearing
+    # there marks which audio take a line of dialogue was recorded
+    # against -- it is NEVER a video scene-selection point, even though it
+    # carries its own material label and its own genuinely parseable
+    # timecode, and even though it looks exactly like a real cue in
+    # isolation. There is no "but this one looks real" exception for the
+    # right column; it is excluded the same as any other right-column
+    # text. (An earlier version of this function tried to detect this
+    # exact shape and abandon column-splitting entirely when it saw
+    # material-labeled content on the excluded side -- that was the wrong
+    # fix, since it's precisely this shape of document where column
+    # filtering needs to keep working, not back off.)
+    raw = _build_mixed_pdf(
+        left_lines=[
+            "M1 3:33-37 HABOL TACKLE",
+            "M2 00:35-42 BUNOT",
+        ],
+        right_lines=[
+            "(VO TONE: MAANGAS",
+            "M1 3:38-43",
+            "M2 00:12-20",
+        ],
+    )
+    text, used = pipeline._extract_pdf_video_column_only(raw)
+    assert used is True
+    assert "HABOL TACKLE" in text
+    assert "BUNOT" in text
+    assert "3:38-43" not in text
+    assert "00:12-20" not in text
+    assert "MAANGAS" not in text
+
+
+def test_the_actual_reported_document_end_to_end():
+    # As close as reportlab allows to the real, uploaded document's own
+    # layout: M1/M2 cues on the left (the genuine video scene-selection
+    # points), M1/M2-labeled dialogue on the right (audio-take references,
+    # not scene selections), and wall-clock time mentions on both sides.
+    # The correct outcome, confirmed directly against the actual document:
+    # only the 2 left-column cues are kept; the right column's own
+    # material-labeled dialogue and every wall-clock mention are excluded.
+    raw = _build_mixed_pdf(
+        left_lines=[
+            "M1 3:33-37 HABOL TACKLE",
+            "M2 00:35-42 BUNOT",
+            "TASKFORCE FIREWALL",
+            "GMA 8:50 PM",
+            "SECOND TELECAST GTV 10:30 PM",
+        ],
+        right_lines=[
+            "(VO TONE: MAANGAS",
+            "M1 3:38-43",
+            "M2 00:12-20",
+            "M2 00:43-46",
+            "TASKFORCE FIREWALL",
+            "8:50PM ON GMA PRIME",
+        ],
+    )
+    fs = FileStorage(stream=io.BytesIO(raw), filename="rundown.pdf")
+    text, err = pipeline.extract_script_text(fs)
+    assert err is None
+    cues = pipeline.parse_script_cues(text, available_materials={1, 2})
+    assert len(cues) == 2
+    times = sorted(c['time'] for c in cues)
+    assert times == [35.0, 213.0]
+    descs = [c['desc'] for c in cues]
+    assert not any('GMA' in d or 'TELECAST' in d or 'PRIME' in d or 'FIREWALL' in d for d in descs)
+
+
+def test_the_actual_real_pdf_file_end_to_end():
+    # The real, ground-truth document itself (not a reportlab
+    # reconstruction) -- provided directly by the person who originally
+    # reported this bug, after the reportlab-based approximation above had
+    # already been fixed and verified. This is the actual, final proof:
+    # confirmed running this real file through the actual, unmodified
+    # extract_script_text() + parse_script_cues() pipeline produces
+    # exactly the 2 cues confirmed correct (M1 3:33 HABOL TACKLE, M2 0:35
+    # BUNOT), with the right column's own M1 3:38 / M2 0:12 / M2 0:43
+    # dialogue-take references and both wall-clock mentions (GMA 8:50 PM,
+    # SECOND TELECAST GTV 10:30 PM) all correctly excluded -- kept as a
+    # permanent fixture so this exact, real document can never silently
+    # regress again.
+    fixture_path = os.path.join(os.path.dirname(__file__), 'fixtures', 'PVPD_FIREWA_070226_LN015.pdf')
+    with open(fixture_path, 'rb') as f:
+        raw = f.read()
+    fs = FileStorage(stream=io.BytesIO(raw), filename='PVPD_FIREWA_070226_LN015.pdf')
+    text, err = pipeline.extract_script_text(fs)
+    assert err is None
+    cues = pipeline.parse_script_cues(text, available_materials={1, 2})
+    assert len(cues) == 2
+    times = sorted(c['time'] for c in cues)
+    assert times == [35.0, 213.0]  # M2 0:35 (BUNOT) and M1 3:33 (HABOL TACKLE)
+    descs = ' '.join(c['desc'] for c in cues)
+    assert 'HABOL TACKLE' in descs
+    assert 'BUNOT' in descs
+    assert not any(x in descs for x in ('3:38', '00:12', '00:43', 'GMA 8:50', 'TELECAST', 'PRIME'))

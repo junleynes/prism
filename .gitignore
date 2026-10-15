@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.secret_key
+*.db
+trailer_library/
+show_templates/
+branding/
+ai_services_config.json
+branding_config.json
+service_overrides.json
+network_shares.json
+network_folders.json
+.env
+production_defaults.json
+shorts/
+models/
+.pytest_cache/
