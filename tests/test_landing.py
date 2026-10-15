@@ -29,7 +29,7 @@ def test_the_landing_page_is_about_the_whole_suite():
     html = main.app.test_client().get('/').get_data(as_text=True)
     for name in ('Episodic Plug', 'Vertical Shorts', 'Schedule Plug', 'Music, SFX &amp; voice'):
         assert name in html, name
-    assert 'episodic promo</span> production' not in html
+    assert 'AI media processing' in html and 'episodic promo</span> production' not in html
     assert 'id="how"' in html and 'id="features"' in html
     assert 'class="no-landing"' not in html
 
