@@ -14214,9 +14214,7 @@ async function loadNetworkFolders(){
           (row.has_password ? '<div style="font-size:11px;opacity:.65;margin-top:-4px">A password is already saved for this share — leave the field above blank to keep it.</div>' : '') +
           (row.can_in_place ? '<label style="display:flex;gap:8px;align-items:flex-start;font-size:12px;font-weight:400;margin:0;cursor:pointer">' +
             '<input type=checkbox id="net-inplace-' + cat + '"' + (row.in_place ? ' checked' : '') + ' style="margin-top:2px">' +
-            '<span><b>Read files in place</b> &mdash; do not copy ' + (cat === 'hires' ? 'the video' : 'the episode') + ' to the server. It is read straight from the share. ' +
-            'Needs the account PRISM runs under to be able to open this path itself (the login above is only used for browsing); ' +
-            'when it cannot, the file is copied as before. The share must stay reachable while a project is being worked on.</span></label>' : '') +
+            '<span><b>Read files in place</b></span></label>' : '') +
           '<div><button type=button class=btn style="padding:6px 12px;font-size:11px" onclick="saveNetworkFolder(\'' + cat + '\')">Save</button> ' +
           '<span id="net-status-' + cat + '" style="font-size:11px;margin-left:8px"></span></div>' +
         '</div>'
