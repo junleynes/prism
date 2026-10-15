@@ -25,10 +25,12 @@ def _admin():
     return client, {'X-CSRF-Token': 't'}
 
 
-def test_the_landing_page_is_about_the_whole_suite():
+def test_the_landing_page_is_generic_about_ai_media_processing():
     html = main.app.test_client().get('/').get_data(as_text=True)
-    for name in ('Episodic Plug', 'Vertical Shorts', 'Schedule Plug', 'Music, SFX &amp; voice'):
+    for name in ('Understands your media', 'Automated editing', 'Hands-off automation', 'Self-hosted, team-ready'):
         assert name in html, name
+    for tool in ('Episodic Plug', 'Vertical Shorts', 'Schedule Plug'):
+        assert tool not in html, 'the landing page talks about what it does, not which tools are inside'
     assert 'AI media processing' in html and 'episodic promo</span> production' not in html
     assert 'id="how"' in html and 'id="features"' in html
     assert 'class="no-landing"' not in html
