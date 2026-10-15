@@ -13,11 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 with mock.patch('requests.post'), mock.patch('requests.get'):
     import library_db
 
+from tests.dbutil import reset_tables, LIBRARY_TABLES
+
 
 def _use_temp_lib_db(tmp_path, monkeypatch):
-    db_path = str(tmp_path / 'test_library.db')
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', db_path)
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
 
 
 def test_add_then_list(tmp_path, monkeypatch):

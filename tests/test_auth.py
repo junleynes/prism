@@ -1,7 +1,7 @@
 """
 Tests for auth.py's password policy (pure) and the account/TOTP lifecycle
-(backed by a real temp SQLite DB per test, via monkeypatching USERS_DB_PATH --
-these functions genuinely touch the database, so a pure-function test would
+(backed by a real PostgreSQL test database, emptied per test by the users_db
+fixture -- these functions genuinely touch the database, so a pure-function test would
 not actually exercise the real code path).
 """
 import os
@@ -42,7 +42,7 @@ class TestPasswordPolicy:
 
 
 class TestAccountAndTotpLifecycle:
-    """Each test gets its own throwaway users.db via the users_db fixture in
+    """Each test starts with empty account tables via the users_db fixture in
     conftest.py, so these can freely create/modify accounts without any
     cross-test interference or touching a real deployment's data."""
 

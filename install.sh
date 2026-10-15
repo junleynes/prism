@@ -13,7 +13,7 @@
 #      into ./eyan first (via git if available, else a downloaded tarball)
 #      and continues from inside it. Skipped entirely if you already have
 #      the repo and ran this from inside it.
-#   1. Checks for Python 3.10+ (numpy 2.x, which requirements.txt pins,
+#   1. Checks for Python 3.11+ (numpy 2.4.x, which requirements.txt pins,
 #      requires it).
 #   2. Checks for ffmpeg/ffprobe on PATH -- these are external programs the
 #      render pipeline shells out to, not something pip can install. Pass
@@ -32,8 +32,11 @@
 #   - Create the trailer_library/ or show_templates/ storage directories
 #     (library_db.py / pipeline.py os.makedirs() these on import)
 #   - Create a default admin account (auth.py bootstraps one on first boot
-#     if users.db is empty -- see README.md's "Lost the admin password?"
-#     section for recovery if you ever need it)
+#     if the users table is empty -- see README.md's "Lost the admin
+#     password?" section for recovery if you ever need it)
+#   - Install or configure PostgreSQL. The app stores its data there and will
+#     not start until DATABASE_URL is set in .env -- see docs/POSTGRESQL.md
+#     (and docs/INSTALL-LINUX.md for the whole walkthrough).
 set -euo pipefail
 
 WITH_FFMPEG=0
@@ -87,13 +90,13 @@ if [ ! -f "core.py" ] || [ ! -f "requirements.txt" ]; then
 fi
 
 # ---- 1. Python version ----
-info "Checking for Python 3.10+"
+info "Checking for Python 3.11+"
 PYTHON_BIN=""
-for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+for candidate in python3.13 python3.12 python3.11 python3; do
   if command -v "$candidate" >/dev/null 2>&1; then
     ver="$("$candidate" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
     major="${ver%%.*}"; minor="${ver##*.}"
-    if [ "$major" -eq 3 ] && [ "$minor" -ge 10 ]; then
+    if [ "$major" -eq 3 ] && [ "$minor" -ge 11 ]; then
       PYTHON_BIN="$candidate"
       ok "found $candidate (Python $ver)"
       break
@@ -101,7 +104,7 @@ for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
   fi
 done
 if [ -z "$PYTHON_BIN" ]; then
-  fail "No Python 3.10+ found on PATH. numpy 2.x (pinned in requirements.txt) needs 3.10+. Install a newer Python and re-run."
+  fail "No Python 3.11+ found on PATH. numpy 2.4.x (pinned in requirements.txt) needs 3.11+. Install a newer Python and re-run."
 fi
 
 # ---- 2. ffmpeg / ffprobe ----
@@ -179,7 +182,13 @@ echo "To run EYAN:"
 echo "  source venv/bin/activate"
 echo "  python3 main.py"
 echo
-echo "First run with no existing users.db creates a default admin account and"
+echo "BEFORE the first run: PRISM stores its data in PostgreSQL. Create the"
+echo "database, then set DATABASE_URL in .env and check it with:"
+echo "  python database.py"
+echo "See docs/POSTGRESQL.md (migrating from an older SQLite install is covered"
+echo "there too)."
+echo
+echo "First run with an empty database creates a default admin account and"
 echo "prints its username/password once to the console -- watch for it, or set"
 echo "ADMIN_USERNAME/ADMIN_PASSWORD in .env first to choose your own. See"
 echo "README.md for the full rundown (including how to recover a lost admin"

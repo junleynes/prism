@@ -1,130 +1,32 @@
-"""Persistent trailer library (SQLite): saved trailers survive restarts.
+"""Persistent trailer library (PostgreSQL): saved trailers survive restarts.
 
 Split out of the original monolith -- self-contained aside from `app`
-(for the upload folder path) and stdlib.
+(for the upload folder path), `database` (the PostgreSQL pool) and stdlib.
 """
-import os, sqlite3, uuid, time, json, shutil, re
+import os, uuid, time, json, shutil, re
 from core import app
+import database
 
-# ---- Persistent trailer library (SQLite) ----
+# ---- Persistent trailer library ----
 # UPLOAD_FOLDER above is a fresh tempdir every process start, so anything that
 # needs to survive a restart -- completed trailers the user wants to come back
-# to later -- gets copied here instead, with metadata tracked in a small
-# SQLite DB alongside it. Override LIBRARY_DIR to point this at persistent
-# storage (a mounted volume, etc.) in production.
+# to later -- gets copied here instead, with metadata tracked in PostgreSQL
+# (the `trailers` table; schema.sql). Override LIBRARY_DIR to point the files
+# at persistent storage (a mounted volume, etc.) in production.
 LIBRARY_DIR = os.environ.get('LIBRARY_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trailer_library'))
 os.makedirs(LIBRARY_DIR, exist_ok=True)
-LIBRARY_DB_PATH = os.path.join(LIBRARY_DIR, 'library.db')
-
-def _sqlite_connect(db_path):
-    """Opens a SQLite connection tuned for this app's access pattern: several
-    concurrent job threads writing while the monitor endpoint polls for reads.
-
-    The stock settings give a 5-second busy timeout and rollback-journal locking,
-    under which a reader blocks writers and a slow write surfaces as
-    'database is locked'. WAL lets readers and one writer proceed concurrently,
-    and the longer timeout absorbs the rest."""
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA synchronous=NORMAL')
-        conn.execute('PRAGMA busy_timeout=30000')
-    except sqlite3.Error as e:
-        # A network/SMB-mounted DB path can refuse WAL; rollback journal still works.
-        print(f'SQLite pragma setup failed for {db_path} (continuing): {e}')
-    return conn
-
-def _lib_db():
-    return _sqlite_connect(LIBRARY_DB_PATH)
 
 def library_db_init():
-    conn = _lib_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS audit_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at REAL NOT NULL,
-        user_id INTEGER,
-        username TEXT,
-        action TEXT NOT NULL,
-        target TEXT,
-        detail TEXT,
-        ip TEXT
-    )''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS network_favorites (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        category TEXT NOT NULL,
-        path TEXT NOT NULL,
-        label TEXT,
-        created_at REAL NOT NULL,
-        UNIQUE(user_id, category, path)
-    )''')
-    # Multiple named delivery destinations (e.g. "PMC_MAMS_PUBLISHING", a
-    # Vantage watch folder) -- admin-managed, global like the other network
-    # categories, not per-user like favorites above, since a facility's
-    # delivery targets are shared infrastructure everyone renders into.
-    # delivery_kind controls what "Send to <name>" actually writes there:
-    # the rendered video, the scene-list CSV, or both -- some destinations
-    # (a MAM ingest) want the finished file, others (a logging/scheduling
-    # system, or a Vantage EDL-driven workflow) only need the metadata.
-    conn.execute('''CREATE TABLE IF NOT EXISTS network_destinations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        path TEXT NOT NULL,
-        username TEXT,
-        password TEXT,
-        delivery_kind TEXT NOT NULL DEFAULT 'video',
-        created_at REAL NOT NULL,
-        updated_at REAL NOT NULL
-    )''')
-    # Added after the table already existed in the wild -- same ALTER TABLE
-    # guard pattern as trailers' user_id/username below. include_fcpxml was
-    # an earlier, since-removed UI add-on (bolt the FCP XML package onto
-    # whatever delivery_kind already sends) -- the column is kept only so
-    # any value already stored on an existing destination doesn't error out
-    # on load; the 'fcpxml' delivery_kind (see DELIVERY_KINDS below) is now
-    # the only way to get the XML package, with no separate opt-in needed.
-    # fcpxml_audio_tracks is still live: it controls whether that XML
-    # embeds actual audio clipitems for the surviving music/VO/card
-    # materials, or stays a simpler video-only cut with markers -- some
-    # editors want the fuller package, others find extra audio tracks just
-    # noise to strip back out.
-    have_dest = {r[1] for r in conn.execute('PRAGMA table_info(network_destinations)')}
-    if 'include_fcpxml' not in have_dest:
-        conn.execute('ALTER TABLE network_destinations ADD COLUMN include_fcpxml INTEGER NOT NULL DEFAULT 0')
-    if 'fcpxml_audio_tracks' not in have_dest:
-        conn.execute('ALTER TABLE network_destinations ADD COLUMN fcpxml_audio_tracks INTEGER NOT NULL DEFAULT 0')
-    conn.execute('''CREATE TABLE IF NOT EXISTS trailers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        orig_name TEXT,
-        filename TEXT NOT NULL,
-        created_at REAL NOT NULL,
-        trailer_duration REAL,
-        video_duration REAL,
-        trailer_length TEXT,
-        bgm_source TEXT,
-        sfx_source TEXT,
-        vo_source TEXT,
-        result_json TEXT
-    )''')
-    # Added after the table already existed in the wild -- ALTER TABLE guard
-    # rather than baking these into the CREATE above, same pattern used for
-    # show_templates' settings_json column. Existing rows get NULL for both,
-    # which library_list()/ownership checks treat as admin-only (nothing to
-    # honestly attribute them to -- see _owns_or_admin in pipeline.py).
-    have = {r[1] for r in conn.execute('PRAGMA table_info(trailers)')}
-    if 'user_id' not in have:
-        conn.execute('ALTER TABLE trailers ADD COLUMN user_id INTEGER')
-    if 'username' not in have:
-        conn.execute('ALTER TABLE trailers ADD COLUMN username TEXT')
-    conn.commit()
-    conn.close()
+    """Creates every table (schema.sql) if this is a fresh database. The one
+    schema file covers accounts, jobs, chat memory and templates too -- each of
+    those modules also calls this, and it only does the work once."""
+    database.init_schema()
 
 # ---- Audit log ----
 # Deliberately a short, fixed set of columns rather than a free-form blob --
 # action/target/detail are plain strings so the log stays queryable and
-# readable without needing to parse anything, and so a future column can be
-# added the same ALTER TABLE way the trailers table already handles it.
+# readable without needing to parse anything, and so a future column is just
+# an ADD COLUMN IF NOT EXISTS in schema.sql.
 def audit_log(action, target=None, detail=None, user_id=None, username=None, ip=None):
     """Records one audit entry. user_id/username/ip are accepted as explicit
     params rather than this function reaching into `session`/`request`
@@ -132,9 +34,9 @@ def audit_log(action, target=None, detail=None, user_id=None, username=None, ip=
     imported by things that aren't always inside a request), and the
     handful of call sites that DO have session/request access can supply
     them directly."""
-    conn = _lib_db()
+    conn = database.connect()
     conn.execute('INSERT INTO audit_log (created_at, user_id, username, action, target, detail, ip) '
-                 'VALUES (?,?,?,?,?,?,?)',
+                 'VALUES (%s,%s,%s,%s,%s,%s,%s)',
                  (time.time(), user_id, username, action, target, detail, ip))
     conn.commit()
     conn.close()
@@ -147,22 +49,22 @@ def audit_log_list(limit=200, q=None):
 
     Optional ``q`` filters case-insensitively across action, target, detail,
     and username (substring match). Empty/whitespace ``q`` is ignored."""
-    conn = _lib_db()
+    conn = database.connect()
     needle = (q or '').strip()
     if needle:
         like = f'%{needle}%'
         rows = conn.execute(
             'SELECT * FROM audit_log WHERE '
-            'action LIKE ? COLLATE NOCASE OR '
-            'IFNULL(target,\'\') LIKE ? COLLATE NOCASE OR '
-            'IFNULL(detail,\'\') LIKE ? COLLATE NOCASE OR '
-            'IFNULL(username,\'\') LIKE ? COLLATE NOCASE '
-            'ORDER BY created_at DESC LIMIT ?',
+            'action ILIKE %s OR '
+            'COALESCE(target,\'\') ILIKE %s OR '
+            'COALESCE(detail,\'\') ILIKE %s OR '
+            'COALESCE(username,\'\') ILIKE %s '
+            'ORDER BY created_at DESC LIMIT %s',
             (like, like, like, like, limit),
         ).fetchall()
     else:
         rows = conn.execute(
-            'SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?', (limit,)
+            'SELECT * FROM audit_log ORDER BY created_at DESC LIMIT %s', (limit,)
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -176,23 +78,24 @@ def audit_log_list(limit=200, q=None):
 # folder locations, so a shared list would mostly be noise for anyone whose
 # shows aren't in it.
 def network_favorites_list(user_id, category=None):
-    conn = _lib_db()
+    conn = database.connect()
     if category:
-        rows = conn.execute('SELECT * FROM network_favorites WHERE user_id=? AND category=? ORDER BY label COLLATE NOCASE',
+        rows = conn.execute('SELECT * FROM network_favorites WHERE user_id=%s AND category=%s ORDER BY LOWER(label)',
                             (user_id, category)).fetchall()
     else:
-        rows = conn.execute('SELECT * FROM network_favorites WHERE user_id=? ORDER BY category, label COLLATE NOCASE',
+        rows = conn.execute('SELECT * FROM network_favorites WHERE user_id=%s ORDER BY category, LOWER(label)',
                             (user_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 def network_favorite_add(user_id, category, path, label):
     """UNIQUE(user_id, category, path) means re-favoriting an already-saved
-    location is a harmless no-op (INSERT OR IGNORE) rather than a duplicate
+    location is a harmless no-op (ON CONFLICT DO NOTHING) rather than a duplicate
     row or a constraint-violation error the caller would need to handle."""
-    conn = _lib_db()
-    conn.execute('INSERT OR IGNORE INTO network_favorites (user_id, category, path, label, created_at) '
-                 'VALUES (?,?,?,?,?)', (user_id, category, path, label, time.time()))
+    conn = database.connect()
+    conn.execute('INSERT INTO network_favorites (user_id, category, path, label, created_at) '
+                 'VALUES (%s,%s,%s,%s,%s) ON CONFLICT (user_id, category, path) DO NOTHING',
+                 (user_id, category, path, label, time.time()))
     conn.commit()
     conn.close()
 
@@ -200,8 +103,8 @@ def network_favorite_remove(user_id, favorite_id):
     """Scoped to user_id in the WHERE clause, not just the row id -- so one
     account can never remove another's favorite even by guessing/iterating
     ids, without needing a separate ownership check before the delete."""
-    conn = _lib_db()
-    cur = conn.execute('DELETE FROM network_favorites WHERE id=? AND user_id=?', (favorite_id, user_id))
+    conn = database.connect()
+    cur = conn.execute('DELETE FROM network_favorites WHERE id=%s AND user_id=%s', (favorite_id, user_id))
     conn.commit()
     removed = cur.rowcount > 0
     conn.close()
@@ -225,14 +128,14 @@ def network_destinations_list():
     ARE included here deliberately (unlike a public API response) since this
     is only ever read server-side to actually connect; the admin-facing
     config route strips them before sending anything to the browser."""
-    conn = _lib_db()
+    conn = database.connect()
     rows = conn.execute('SELECT * FROM network_destinations ORDER BY created_at ASC').fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 def network_destination_get(dest_id):
-    conn = _lib_db()
-    row = conn.execute('SELECT * FROM network_destinations WHERE id=?', (dest_id,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT * FROM network_destinations WHERE id=%s', (dest_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -241,15 +144,15 @@ def network_destination_add(name, path, username=None, password=None, delivery_k
     if delivery_kind not in DELIVERY_KINDS:
         delivery_kind = 'video'
     now = time.time()
-    conn = _lib_db()
+    conn = database.connect()
     cur = conn.execute(
         'INSERT INTO network_destinations '
         '(name, path, username, password, delivery_kind, include_fcpxml, fcpxml_audio_tracks, created_at, updated_at) '
-        'VALUES (?,?,?,?,?,?,?,?,?)',
+        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
         (name, path, username or None, password or None, delivery_kind,
          int(bool(include_fcpxml)), int(bool(fcpxml_audio_tracks)), now, now))
+    new_id = cur.fetchone()['id']
     conn.commit()
-    new_id = cur.lastrowid
     conn.close()
     return new_id
 
@@ -264,10 +167,10 @@ def network_destination_update(dest_id, name=None, path=None, username=None, pas
         return False
     if delivery_kind is not None and delivery_kind not in DELIVERY_KINDS:
         delivery_kind = existing['delivery_kind']
-    conn = _lib_db()
+    conn = database.connect()
     conn.execute(
-        'UPDATE network_destinations SET name=?, path=?, username=?, password=?, delivery_kind=?, '
-        'include_fcpxml=?, fcpxml_audio_tracks=?, updated_at=? WHERE id=?',
+        'UPDATE network_destinations SET name=%s, path=%s, username=%s, password=%s, delivery_kind=%s, '
+        'include_fcpxml=%s, fcpxml_audio_tracks=%s, updated_at=%s WHERE id=%s',
         (name if name is not None else existing['name'],
          path if path is not None else existing['path'],
          username if username is not None else existing['username'],
@@ -281,8 +184,8 @@ def network_destination_update(dest_id, name=None, path=None, username=None, pas
     return True
 
 def network_destination_remove(dest_id):
-    conn = _lib_db()
-    cur = conn.execute('DELETE FROM network_destinations WHERE id=?', (dest_id,))
+    conn = database.connect()
+    cur = conn.execute('DELETE FROM network_destinations WHERE id=%s', (dest_id,))
     conn.commit()
     removed = cur.rowcount > 0
     conn.close()
@@ -291,7 +194,7 @@ def network_destination_remove(dest_id):
 def library_add(upload_filename, result, user_id=None, username=None):
     """Copies the just-finished trailer (currently sitting in the ephemeral
     UPLOAD_FOLDER as `upload_filename`) into LIBRARY_DIR under a permanent
-    name, records it in SQLite, and returns the new row id. The saved
+    name, records it in PostgreSQL, and returns the new row id. The saved
     result_json has its trailer_url rewritten to the persistent /library/
     route so re-opening it later (even after a restart) works regardless of
     whether the original UPLOAD_FOLDER file still exists."""
@@ -300,16 +203,16 @@ def library_add(upload_filename, result, user_id=None, username=None):
     src = os.path.join(app.config['UPLOAD_FOLDER'], upload_filename)
     dst = os.path.join(LIBRARY_DIR, persist_name)
     shutil.copy2(src, dst)
-    conn = _lib_db()
+    conn = database.connect()
     cur = conn.execute(
         'INSERT INTO trailers (orig_name, filename, created_at, trailer_duration, video_duration, trailer_length, bgm_source, sfx_source, vo_source, result_json, user_id, username) '
-        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
         (result.get('orig_name'), persist_name, time.time(), result.get('trailer_duration'), result.get('video_duration'),
          result.get('trailer_length'), result.get('bgm_source'), result.get('sfx_source'), result.get('vo_source'), None,
          user_id, username))
-    tid = cur.lastrowid
+    tid = cur.fetchone()['id']
     saved_result = dict(result, trailer_url=f'/library/{tid}/file', library_id=tid)
-    conn.execute('UPDATE trailers SET result_json=? WHERE id=?', (json.dumps(saved_result), tid))
+    conn.execute('UPDATE trailers SET result_json=%s WHERE id=%s', (json.dumps(saved_result), tid))
     conn.commit()
     conn.close()
     return tid
@@ -322,7 +225,7 @@ def library_stats():
     breakdown, potentially large), neither of which this needs. All this
     needs is every filename, to total their real size with os.path.getsize
     rather than trusting a stored size that could drift from the actual file."""
-    conn = _lib_db()
+    conn = database.connect()
     rows = conn.execute('SELECT filename FROM trailers').fetchall()
     conn.close()
     total_bytes = 0
@@ -341,21 +244,21 @@ def library_list(limit=50, user_id=None, is_admin=False):
     (user_id IS NULL, from before this app had accounts, or a save that
     somehow didn't capture one) are admin-only, same reasoning as
     _owns_or_admin in pipeline.py."""
-    conn = _lib_db()
+    conn = database.connect()
     if is_admin:
         rows = conn.execute(
             'SELECT id, orig_name, filename, created_at, trailer_duration, video_duration, trailer_length, bgm_source, sfx_source, vo_source, user_id, username '
-            'FROM trailers ORDER BY created_at DESC LIMIT ?', (limit,)).fetchall()
+            'FROM trailers ORDER BY created_at DESC LIMIT %s', (limit,)).fetchall()
     else:
         rows = conn.execute(
             'SELECT id, orig_name, filename, created_at, trailer_duration, video_duration, trailer_length, bgm_source, sfx_source, vo_source, user_id, username '
-            'FROM trailers WHERE user_id=? ORDER BY created_at DESC LIMIT ?', (user_id, limit)).fetchall()
+            'FROM trailers WHERE user_id=%s ORDER BY created_at DESC LIMIT %s', (user_id, limit)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 def library_get_row(tid):
-    conn = _lib_db()
-    row = conn.execute('SELECT * FROM trailers WHERE id=?', (tid,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT * FROM trailers WHERE id=%s', (tid,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -374,8 +277,8 @@ def library_delete(tid):
                 os.remove(os.path.join(LIBRARY_DIR, f))
             except OSError:
                 pass
-    conn = _lib_db()
-    conn.execute('DELETE FROM trailers WHERE id=?', (tid,))
+    conn = database.connect()
+    conn.execute('DELETE FROM trailers WHERE id=%s', (tid,))
     conn.commit()
     conn.close()
     return True

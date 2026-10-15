@@ -1,14 +1,16 @@
 """User accounts, login/logout, and the /admin/users management page.
 
 Depends on: core (app, rate limiter, dummy-hash, default password) and
-library_db (LIBRARY_DIR, _sqlite_connect) for where users.db lives.
+database (the PostgreSQL connection pool; accounts live in the `users`,
+`groups` and `group_permissions` tables -- see schema.sql).
 """
-import os, time, sqlite3, functools, secrets
+import os, time, functools, secrets
 from flask import request, session, redirect, jsonify, render_template
 from markupsafe import escape
 from werkzeug.security import generate_password_hash, check_password_hash
 from core import app, _client_ip, _login_limiter, _DUMMY_PW_HASH, ensure_csrf_token
-from library_db import LIBRARY_DIR, _sqlite_connect, load_branding, audit_log
+from library_db import load_branding, audit_log
+import database
 
 def _safe_next(dest):
     """Only ever redirect to a path on this app -- an absolute or
@@ -260,14 +262,10 @@ def api_2fa_disable():
     return jsonify(ok=True)
 
 
-# ---- User accounts (SQLite) ----
+# ---- User accounts (PostgreSQL) ----
 # Simple username/password accounts with an admin/user role, replacing the
-# old shared passphrase. Stored in its own DB file alongside the trailer
-# library so it survives restarts the same way.
-USERS_DB_PATH = os.path.join(LIBRARY_DIR, 'users.db')
-
-def _users_db():
-    return _sqlite_connect(USERS_DB_PATH)
+# old shared passphrase. Stored in the same PostgreSQL database as everything
+# else (users, groups, group_permissions -- see schema.sql).
 
 # Every permission a group can be granted, one per gated tab. Deliberately
 # does NOT include Docs (informational, no access implications), or
@@ -296,68 +294,22 @@ AVAILABLE_PERMISSIONS = [
 _PERMISSION_KEYS = {k for k, _ in AVAILABLE_PERMISSIONS}
 
 def users_db_init():
-    conn = _users_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL UNIQUE,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'user',
-        is_active INTEGER NOT NULL DEFAULT 1,
-        created_at REAL NOT NULL,
-        last_login REAL
-    )''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS groups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        created_at REAL NOT NULL
-    )''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS group_permissions (
-        group_id INTEGER NOT NULL,
-        permission TEXT NOT NULL,
-        PRIMARY KEY (group_id, permission)
-    )''')
-    # Added after `users` already existed in the wild -- ALTER TABLE guard,
-    # same pattern as the earlier user_id/username columns on trailers.
-    # NULL (the default for every existing account) means "no group
-    # assigned" -- see user_can() below for why that means unrestricted
-    # rather than locked out. Restricting an account is an opt-in action an
-    # admin takes (create a group, check only the permissions it should
-    # have, assign the account to it), not something that silently happens
-    # to existing accounts when this feature is deployed.
+    # The tables themselves come from schema.sql. Notes on columns that live
+    # there, kept here because the behaviour is this module's:
     #
-    # No REFERENCES/FOREIGN KEY clause here on purpose: this app never runs
-    # `PRAGMA foreign_keys = ON` (see _sqlite_connect), so a FK constraint
-    # here would be silently inert -- SQLite accepts the syntax but enforces
-    # nothing without that pragma, including any ON DELETE behavior. Group
-    # deletion's cleanup (clearing group_id off members, removing the
-    # group's permission rows) is therefore done explicitly in
-    # group_delete() below rather than relied on at the schema level.
-    have = {r[1] for r in conn.execute('PRAGMA table_info(users)')}
-    if 'group_id' not in have:
-        conn.execute('ALTER TABLE users ADD COLUMN group_id INTEGER')
-    # ---- Two-factor authentication (TOTP, Google Authenticator compatible) ----
-    # totp_secret holds the base32 shared secret; totp_enabled is only set to 1
-    # AFTER the user has proved they can generate a valid code from it, so an
-    # interrupted enrolment can never lock someone out of their own account with
-    # a secret they never successfully scanned. totp_backup_codes holds
-    # newline-separated HASHES of one-time recovery codes -- hashed rather than
-    # stored plainly for the same reason passwords are: a database read
-    # shouldn't hand over a working second factor.
-    if 'totp_secret' not in have:
-        conn.execute('ALTER TABLE users ADD COLUMN totp_secret TEXT')
-    if 'totp_enabled' not in have:
-        conn.execute('ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0')
-    if 'totp_backup_codes' not in have:
-        conn.execute('ALTER TABLE users ADD COLUMN totp_backup_codes TEXT')
-    if 'failed_logins' not in have:
-        # Per-ACCOUNT failure tracking, alongside the existing per-IP rate
-        # limit. The IP limiter alone is bypassed entirely by a distributed
-        # attempt (many IPs, one target account), which is exactly the shape
-        # a public-facing deployment attracts.
-        conn.execute('ALTER TABLE users ADD COLUMN failed_logins INTEGER NOT NULL DEFAULT 0')
-    if 'locked_until' not in have:
-        conn.execute('ALTER TABLE users ADD COLUMN locked_until REAL')
-    conn.commit()
+    # users.group_id is NULL for every account that has no group, which
+    # user_can() below treats as "unrestricted" rather than locked out.
+    # Restricting an account is an opt-in action an admin takes (create a
+    # group, check only the permissions it should have, assign the account to
+    # it), not something that silently happens to existing accounts.
+    #
+    # There is no FOREIGN KEY from users.group_id / group_permissions.group_id
+    # to groups, matching the SQLite schema this replaced (which never enforced
+    # one). Group deletion's cleanup -- clearing group_id off members and
+    # removing the group's permission rows -- is done explicitly in
+    # group_delete() below.
+    database.init_schema()
+    conn = database.connect()
     count = conn.execute('SELECT COUNT(*) AS c FROM users').fetchone()['c']
     if count == 0:
         # Bootstrap: no accounts exist yet, so create a default admin rather
@@ -367,7 +319,7 @@ def users_db_init():
         username = (os.environ.get('ADMIN_USERNAME', '').strip() or 'admin')
         password = os.environ.get('ADMIN_PASSWORD', '').strip() or secrets.token_urlsafe(12)
         conn.execute(
-            'INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (?,?,?,1,?)',
+            'INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (%s,%s,%s,1,%s)',
             (username, generate_password_hash(password), 'admin', time.time()))
         conn.commit()
         print('=' * 64)
@@ -382,29 +334,29 @@ def users_db_init():
 def user_get_by_username(username):
     if not username:
         return None
-    conn = _users_db()
-    row = conn.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT * FROM users WHERE username=%s', (username,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 def user_get(uid):
-    conn = _users_db()
-    row = conn.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT * FROM users WHERE id=%s', (uid,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 def user_list():
-    conn = _users_db()
+    conn = database.connect()
     rows = conn.execute(
         'SELECT u.id, u.username, u.role, u.is_active, u.created_at, u.last_login, u.group_id, '
         'u.totp_enabled, g.name AS group_name '
-        'FROM users u LEFT JOIN groups g ON g.id = u.group_id ORDER BY u.username COLLATE NOCASE'
+        'FROM users u LEFT JOIN groups g ON g.id = u.group_id ORDER BY LOWER(u.username)'
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 def user_count_active_admins(exclude_id=None):
-    conn = _users_db()
+    conn = database.connect()
     rows = conn.execute("SELECT id FROM users WHERE role='admin' AND is_active=1").fetchall()
     conn.close()
     return len([r for r in rows if r['id'] != exclude_id])
@@ -441,14 +393,14 @@ def user_create(username, password, role='user', active=True):
         return False, why
     if role not in ('admin', 'user'):
         role = 'user'
-    conn = _users_db()
+    conn = database.connect()
     try:
         conn.execute(
-            'INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (?,?,?,?,?)',
+            'INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (%s,%s,%s,%s,%s)',
             (username, generate_password_hash(password), role, 1 if active else 0, time.time()))
         conn.commit()
         return True, None
-    except sqlite3.IntegrityError:
+    except database.IntegrityError:
         return False, 'That username is already taken.'
     finally:
         conn.close()
@@ -457,8 +409,8 @@ def user_set_password(uid, password):
     ok, why = _password_policy_error(password)
     if not ok:
         return False, why
-    conn = _users_db()
-    conn.execute('UPDATE users SET password_hash=? WHERE id=?', (generate_password_hash(password), uid))
+    conn = database.connect()
+    conn.execute('UPDATE users SET password_hash=%s WHERE id=%s', (generate_password_hash(password), uid))
     conn.commit()
     conn.close()
     return True, None
@@ -470,8 +422,8 @@ def user_set_role(uid, role):
         target = user_get(uid)
         if target and target['role'] == 'admin' and target['is_active']:
             return False, "Can't remove the last active admin."
-    conn = _users_db()
-    conn.execute('UPDATE users SET role=? WHERE id=?', (role, uid))
+    conn = database.connect()
+    conn.execute('UPDATE users SET role=%s WHERE id=%s', (role, uid))
     conn.commit()
     conn.close()
     return True, None
@@ -481,8 +433,8 @@ def user_set_active(uid, active):
         target = user_get(uid)
         if target and target['role'] == 'admin':
             return False, "Can't disable the last active admin."
-    conn = _users_db()
-    conn.execute('UPDATE users SET is_active=? WHERE id=?', (1 if active else 0, uid))
+    conn = database.connect()
+    conn.execute('UPDATE users SET is_active=%s WHERE id=%s', (1 if active else 0, uid))
     conn.commit()
     conn.close()
     return True, None
@@ -491,18 +443,18 @@ def user_delete(uid):
     target = user_get(uid)
     if target and target['role'] == 'admin' and target['is_active'] and user_count_active_admins(exclude_id=uid) == 0:
         return False, "Can't delete the last active admin."
-    conn = _users_db()
-    conn.execute('DELETE FROM users WHERE id=?', (uid,))
+    conn = database.connect()
+    conn.execute('DELETE FROM users WHERE id=%s', (uid,))
     conn.commit()
     conn.close()
     return True, None
 
 def user_touch_login(uid):
-    conn = _users_db()
+    conn = database.connect()
     # A successful sign-in clears any accumulated failure count and lockout --
     # otherwise a user who fumbled their password a few times would stay one
     # mistake away from a lockout indefinitely.
-    conn.execute('UPDATE users SET last_login=?, failed_logins=0, locked_until=NULL WHERE id=?',
+    conn.execute('UPDATE users SET last_login=%s, failed_logins=0, locked_until=NULL WHERE id=%s',
                  (time.time(), uid))
     conn.commit()
     conn.close()
@@ -516,14 +468,14 @@ def user_note_failed_login(uid):
     once the threshold is hit. The existing per-IP limiter can't see a
     distributed attempt (many source IPs, one target account), which is the
     realistic shape of an attack on a public-facing login."""
-    conn = _users_db()
-    row = conn.execute('SELECT failed_logins FROM users WHERE id=?', (uid,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT failed_logins FROM users WHERE id=%s', (uid,)).fetchone()
     fails = (row['failed_logins'] if row else 0) + 1
     locked_until = None
     if fails >= LOGIN_MAX_FAILURES:
         locked_until = time.time() + LOGIN_LOCKOUT_MINUTES * 60
         fails = 0   # reset the counter so the next lockout needs a fresh run of failures
-    conn.execute('UPDATE users SET failed_logins=?, locked_until=? WHERE id=?', (fails, locked_until, uid))
+    conn.execute('UPDATE users SET failed_logins=%s, locked_until=%s WHERE id=%s', (fails, locked_until, uid))
     conn.commit()
     conn.close()
     return locked_until
@@ -557,10 +509,10 @@ def user_totp_begin_enrolment(uid):
     if not pyotp:
         return None, None
     secret = pyotp.random_base32()
-    conn = _users_db()
-    row = conn.execute('SELECT username FROM users WHERE id=?', (uid,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT username FROM users WHERE id=%s', (uid,)).fetchone()
     username = row['username'] if row else 'user'
-    conn.execute('UPDATE users SET totp_secret=?, totp_enabled=0 WHERE id=?', (secret, uid))
+    conn.execute('UPDATE users SET totp_secret=%s, totp_enabled=0 WHERE id=%s', (secret, uid))
     conn.commit()
     conn.close()
     try:
@@ -581,8 +533,8 @@ def user_totp_confirm(uid, code):
     pyotp = _totp_lib()
     if not pyotp:
         return None, '2FA support is not installed on this server (pip install pyotp).'
-    conn = _users_db()
-    row = conn.execute('SELECT totp_secret FROM users WHERE id=?', (uid,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT totp_secret FROM users WHERE id=%s', (uid,)).fetchone()
     if not row or not row['totp_secret']:
         conn.close()
         return None, 'Start setup again -- no pending 2FA secret for this account.'
@@ -594,7 +546,7 @@ def user_totp_confirm(uid, code):
         return None, 'That code was not correct. Check your phone and try again.'
     codes = [secrets.token_hex(4).upper() for _ in range(10)]
     hashed = '\n'.join(_hash_backup_code(c) for c in codes)
-    conn.execute('UPDATE users SET totp_enabled=1, totp_backup_codes=? WHERE id=?', (hashed, uid))
+    conn.execute('UPDATE users SET totp_enabled=1, totp_backup_codes=%s WHERE id=%s', (hashed, uid))
     conn.commit()
     conn.close()
     return codes, None
@@ -613,16 +565,16 @@ def user_totp_verify(user, code):
     for h in stored:
         if h and check_password_hash(h, code.upper()):
             remaining = '\n'.join(x for x in stored if x != h)
-            conn = _users_db()
-            conn.execute('UPDATE users SET totp_backup_codes=? WHERE id=?', (remaining, user['id']))
+            conn = database.connect()
+            conn.execute('UPDATE users SET totp_backup_codes=%s WHERE id=%s', (remaining, user['id']))
             conn.commit()
             conn.close()
             return True
     return False
 
 def user_totp_disable(uid):
-    conn = _users_db()
-    conn.execute('UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_backup_codes=NULL WHERE id=?', (uid,))
+    conn = database.connect()
+    conn.execute('UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_backup_codes=NULL WHERE id=%s', (uid,))
     conn.commit()
     conn.close()
 
@@ -630,13 +582,13 @@ def user_set_group(uid, group_id):
     """group_id=None (or 0/'') clears the assignment -- back to unrestricted,
     same as an account that's never been assigned one."""
     group_id = group_id or None
-    conn = _users_db()
+    conn = database.connect()
     if group_id is not None:
-        exists = conn.execute('SELECT 1 FROM groups WHERE id=?', (group_id,)).fetchone()
+        exists = conn.execute('SELECT 1 FROM groups WHERE id=%s', (group_id,)).fetchone()
         if not exists:
             conn.close()
             return False, 'No such group.'
-    conn.execute('UPDATE users SET group_id=? WHERE id=?', (group_id, uid))
+    conn.execute('UPDATE users SET group_id=%s WHERE id=%s', (group_id, uid))
     conn.commit()
     conn.close()
     return True, None
@@ -645,23 +597,23 @@ def user_set_group(uid, group_id):
 def group_list():
     """Every group with its permission set and member count, for the
     Groups admin panel."""
-    conn = _users_db()
-    groups = [dict(r) for r in conn.execute('SELECT id, name, created_at FROM groups ORDER BY name COLLATE NOCASE')]
+    conn = database.connect()
+    groups = [dict(r) for r in conn.execute('SELECT id, name, created_at FROM groups ORDER BY LOWER(name)')]
     for g in groups:
-        perms = conn.execute('SELECT permission FROM group_permissions WHERE group_id=?', (g['id'],)).fetchall()
+        perms = conn.execute('SELECT permission FROM group_permissions WHERE group_id=%s', (g['id'],)).fetchall()
         g['permissions'] = sorted(p['permission'] for p in perms)
-        g['member_count'] = conn.execute('SELECT COUNT(*) AS c FROM users WHERE group_id=?', (g['id'],)).fetchone()['c']
+        g['member_count'] = conn.execute('SELECT COUNT(*) AS c FROM users WHERE group_id=%s', (g['id'],)).fetchone()['c']
     conn.close()
     return groups
 
 def group_get(gid):
-    conn = _users_db()
-    row = conn.execute('SELECT id, name, created_at FROM groups WHERE id=?', (gid,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT id, name, created_at FROM groups WHERE id=%s', (gid,)).fetchone()
     if not row:
         conn.close()
         return None
     g = dict(row)
-    perms = conn.execute('SELECT permission FROM group_permissions WHERE group_id=?', (gid,)).fetchall()
+    perms = conn.execute('SELECT permission FROM group_permissions WHERE group_id=%s', (gid,)).fetchall()
     g['permissions'] = sorted(p['permission'] for p in perms)
     conn.close()
     return g
@@ -670,12 +622,14 @@ def group_create(name):
     name = (name or '').strip()
     if not name:
         return False, 'Enter a name for the group.', None
-    conn = _users_db()
+    conn = database.connect()
     try:
-        cur = conn.execute('INSERT INTO groups (name, created_at) VALUES (?,?)', (name, time.time()))
+        cur = conn.execute('INSERT INTO groups (name, created_at) VALUES (%s,%s) RETURNING id',
+                           (name, time.time()))
+        gid = cur.fetchone()['id']
         conn.commit()
-        return True, None, cur.lastrowid
-    except sqlite3.IntegrityError:
+        return True, None, gid
+    except database.IntegrityError:
         return False, 'A group with that name already exists.', None
     finally:
         conn.close()
@@ -686,12 +640,12 @@ def group_set_permissions(gid, permissions):
     than rejected outright, so a stale checkbox from a future/past version
     of this list can't wedge the save)."""
     perms = sorted(set(permissions or []) & _PERMISSION_KEYS)
-    conn = _users_db()
-    if not conn.execute('SELECT 1 FROM groups WHERE id=?', (gid,)).fetchone():
+    conn = database.connect()
+    if not conn.execute('SELECT 1 FROM groups WHERE id=%s', (gid,)).fetchone():
         conn.close()
         return False, 'No such group.'
-    conn.execute('DELETE FROM group_permissions WHERE group_id=?', (gid,))
-    conn.executemany('INSERT INTO group_permissions (group_id, permission) VALUES (?,?)',
+    conn.execute('DELETE FROM group_permissions WHERE group_id=%s', (gid,))
+    conn.executemany('INSERT INTO group_permissions (group_id, permission) VALUES (%s,%s)',
                       [(gid, p) for p in perms])
     conn.commit()
     conn.close()
@@ -701,12 +655,12 @@ def group_rename(gid, name):
     name = (name or '').strip()
     if not name:
         return False, 'Enter a name for the group.'
-    conn = _users_db()
+    conn = database.connect()
     try:
-        conn.execute('UPDATE groups SET name=? WHERE id=?', (name, gid))
+        conn.execute('UPDATE groups SET name=%s WHERE id=%s', (name, gid))
         conn.commit()
         return True, None
-    except sqlite3.IntegrityError:
+    except database.IntegrityError:
         return False, 'A group with that name already exists.'
     finally:
         conn.close()
@@ -717,13 +671,13 @@ def group_delete(gid):
     longer exists. Done explicitly here (not via a DB-level FK cascade,
     which this app doesn't have enabled -- see users_db_init's comment on
     the users.group_id column) so it happens reliably regardless of that."""
-    conn = _users_db()
-    if not conn.execute('SELECT 1 FROM groups WHERE id=?', (gid,)).fetchone():
+    conn = database.connect()
+    if not conn.execute('SELECT 1 FROM groups WHERE id=%s', (gid,)).fetchone():
         conn.close()
         return False, 'No such group.'
-    conn.execute('UPDATE users SET group_id=NULL WHERE group_id=?', (gid,))
-    conn.execute('DELETE FROM group_permissions WHERE group_id=?', (gid,))
-    conn.execute('DELETE FROM groups WHERE id=?', (gid,))
+    conn.execute('UPDATE users SET group_id=NULL WHERE group_id=%s', (gid,))
+    conn.execute('DELETE FROM group_permissions WHERE group_id=%s', (gid,))
+    conn.execute('DELETE FROM groups WHERE id=%s', (gid,))
     conn.commit()
     conn.close()
     return True, None
@@ -740,12 +694,12 @@ def user_can(user_id, role, *permissions):
         return True
     if not user_id:
         return False
-    conn = _users_db()
-    row = conn.execute('SELECT group_id FROM users WHERE id=?', (user_id,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT group_id FROM users WHERE id=%s', (user_id,)).fetchone()
     if not row or not row['group_id']:
         conn.close()
         return True
-    granted = conn.execute('SELECT permission FROM group_permissions WHERE group_id=?',
+    granted = conn.execute('SELECT permission FROM group_permissions WHERE group_id=%s',
                            (row['group_id'],)).fetchall()
     conn.close()
     granted = {p['permission'] for p in granted}
@@ -759,12 +713,12 @@ def user_permissions(user_id, role):
     actually restricted."""
     if role == 'admin' or not user_id:
         return set(_PERMISSION_KEYS) if role == 'admin' else set()
-    conn = _users_db()
-    row = conn.execute('SELECT group_id FROM users WHERE id=?', (user_id,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT group_id FROM users WHERE id=%s', (user_id,)).fetchone()
     if not row or not row['group_id']:
         conn.close()
         return set(_PERMISSION_KEYS)
-    granted = conn.execute('SELECT permission FROM group_permissions WHERE group_id=?',
+    granted = conn.execute('SELECT permission FROM group_permissions WHERE group_id=%s',
                            (row['group_id'],)).fetchall()
     conn.close()
     return {p['permission'] for p in granted}
@@ -792,7 +746,7 @@ def require_permission(*permissions):
 
 def admin_reset_if_requested():
     """Recovery path for a lost admin password, independent of whatever's
-    already in users.db -- set RESET_ADMIN=1 (plus optionally ADMIN_USERNAME/
+    already in the users table -- set RESET_ADMIN=1 (plus optionally ADMIN_USERNAME/
     ADMIN_PASSWORD) and restart. Unlike the first-run bootstrap in
     users_db_init(), this runs every startup and always takes effect when the
     flag is set, whether or not accounts already exist: if the named account
@@ -804,13 +758,13 @@ def admin_reset_if_requested():
     username = (os.environ.get('ADMIN_USERNAME', '').strip() or 'admin')
     password = os.environ.get('ADMIN_PASSWORD', '').strip() or secrets.token_urlsafe(12)
     existing = user_get_by_username(username)
-    conn = _users_db()
+    conn = database.connect()
     if existing:
-        conn.execute('UPDATE users SET password_hash=?, role=?, is_active=1 WHERE id=?',
+        conn.execute('UPDATE users SET password_hash=%s, role=%s, is_active=1 WHERE id=%s',
                      (generate_password_hash(password), 'admin', existing['id']))
     else:
         conn.execute(
-            'INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (?,?,?,1,?)',
+            'INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (%s,%s,%s,1,%s)',
             (username, generate_password_hash(password), 'admin', time.time()))
     conn.commit()
     conn.close()

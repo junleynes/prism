@@ -7421,7 +7421,7 @@ function closeTrailerResult(){
 // Close button was ever clicked at all.
 window.closeTrailerResult = closeTrailerResult;
 
-// ---- Trailer history — every completed trailer is saved to a small SQLite
+// ---- Trailer history — every completed trailer is saved to the PostgreSQL-backed
 // library on the server (survives restarts), shown here as a collapsible
 // list. Click a row to view/download it again without regenerating; click
 // the x to delete it permanently (removes the row and the saved file).
@@ -13589,7 +13589,7 @@ This is [emphasis] the one you cannot miss.</pre>
       <p>Rail controls: light / dark / auto (follows OS). Stored in <code>aimp_theme</code> localStorage per browser.</p>
       <h3>Access control</h3>
       <ul style="line-height:1.8;padding-left:20px">
-        <li>Per-user accounts in <code>users.db</code>; admins manage users under Config.</li>
+        <li>Per-user accounts in the PostgreSQL <code>users</code> table; admins manage users under Config.</li>
         <li>First-run default admin can be overridden with <code>ADMIN_USERNAME</code> / <code>ADMIN_PASSWORD</code>.</li>
         <li><code>RESET_ADMIN=1</code> resets the admin password on boot — remove after use.</li>
         <li>Login and file-route rate limits protect against brute force and enumeration.</li>

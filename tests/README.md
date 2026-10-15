@@ -2,8 +2,14 @@
 
 ```
 pip install pytest --break-system-packages
+createdb prism_test        # a scratch database -- the tests empty its tables
+export TEST_DATABASE_URL=postgresql://prism:PASSWORD@localhost:5432/prism_test
 pytest
 ```
+
+The tests need a real PostgreSQL database and read **only** `TEST_DATABASE_URL`
+(never `DATABASE_URL`), because they `TRUNCATE` tables. Without it pytest stops
+immediately with an explanation.
 
 Covers the pure/near-pure logic that's easy to silently get wrong and
 expensive to catch by hand:
@@ -21,8 +27,8 @@ expensive to catch by hand:
   rather than silently corrupting the deployment-wide delivery spec.
 - `test_auth.py` — password policy, the TOTP enrollment lifecycle (not
   enabled until confirmed, backup codes genuinely single-use), and
-  per-account lockout. Uses a real throwaway SQLite DB per test (see the
-  `users_db` fixture in `conftest.py`), not mocks, since this logic
+  per-account lockout. Uses the real PostgreSQL test database, emptied per test
+  (see the `users_db` fixture in `conftest.py`), not mocks, since this logic
   actually depends on the database round-trip.
 
 - `test_shorts_core.py` — the Vertical Shorts decisions with no services
@@ -35,6 +41,11 @@ expensive to catch by hand:
   faster-whisper stood in for. Decodes the rendered shorts to check that
   each shot's crop switches on exactly the frame the picture does, that SD
   sources are converted to BT.709, and that captions are burned in.
+- `test_database_schema.py` / `test_migrate_sqlite_to_postgres.py` — the schema
+  file covers every template slot and creates idempotently, an unreachable
+  database fails with a clear message that never leaks the password, and the
+  SQLite → PostgreSQL migration keeps ids, advances sequences and refuses to
+  overwrite existing data.
 
 Not covered yet: the full render pipeline (scene detection through ffmpeg
 assembly) isn't unit-testable as-is — it's one large function mixing I/O,

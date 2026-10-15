@@ -52,7 +52,13 @@ cd eyan
 # optional: ./install.sh --with-ffmpeg
 ```
 
-**Requirements:** Python 3.10+, ffmpeg/ffprobe, Git (or a downloaded copy of the repo).
+**Requirements:** Python 3.11+, PostgreSQL 13+, ffmpeg/ffprobe, Git (or a downloaded copy of the repo).
+
+**Database:** PRISM stores accounts, the trailer library index, audit log, jobs, chat memory and show templates in **PostgreSQL**. Create a database and set `DATABASE_URL` in `.env` before the first run — the app will not start without it. Walkthroughs:
+
+- [Windows Server 2022](docs/INSTALL-WINDOWS.md) — Python, ffmpeg, PostgreSQL, run as a service
+- [Linux](docs/INSTALL-LINUX.md) — Ubuntu/Debian and RHEL-family, systemd
+- [PostgreSQL setup and connecting](docs/POSTGRESQL.md) — roles, `DATABASE_URL`, remote access, TLS, backups, and moving an existing SQLite install across with `migrate_sqlite_to_postgres.py`
 
 **Run**
 
@@ -66,7 +72,7 @@ venv\Scripts\Activate.ps1
 python main.py
 ```
 
-Open **http://localhost:5000**. On first run (no `users.db`), a default admin account is created and its credentials are printed once to the console. Set `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env` beforehand to choose them yourself.
+Open **http://localhost:5000**. On first run (empty database), a default admin account is created and its credentials are printed once to the console. Set `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env` beforehand to choose them yourself.
 
 Production traffic is served by waitress by default (single-process, multi-threaded). Set `DEV_SERVER=1` only for local troubleshooting.
 

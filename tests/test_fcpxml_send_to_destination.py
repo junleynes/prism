@@ -30,6 +30,7 @@ import pytest
 import library_db
 import pipeline
 import core
+from tests.dbutil import reset_tables, LIBRARY_TABLES
 
 with mock.patch('requests.post'), mock.patch('requests.get'):
     import main
@@ -44,8 +45,7 @@ def _ffmpeg_available():
 # ---- include_fcpxml / fcpxml_audio_tracks CRUD ----
 
 def test_destination_add_defaults_fcpxml_flags_off(tmp_path, monkeypatch):
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', str(tmp_path / 'lib.db'))
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
     dest_id = library_db.network_destination_add('D', '\\\\x\\y')
     dest = library_db.network_destination_get(dest_id)
     assert dest['include_fcpxml'] == 0
@@ -53,8 +53,7 @@ def test_destination_add_defaults_fcpxml_flags_off(tmp_path, monkeypatch):
 
 
 def test_destination_add_with_fcpxml_flags_on(tmp_path, monkeypatch):
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', str(tmp_path / 'lib.db'))
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
     dest_id = library_db.network_destination_add('D', '\\\\x\\y', include_fcpxml=True, fcpxml_audio_tracks=True)
     dest = library_db.network_destination_get(dest_id)
     assert dest['include_fcpxml'] == 1
@@ -62,8 +61,7 @@ def test_destination_add_with_fcpxml_flags_on(tmp_path, monkeypatch):
 
 
 def test_destination_update_fcpxml_flags_only_touches_passed_fields(tmp_path, monkeypatch):
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', str(tmp_path / 'lib.db'))
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
     dest_id = library_db.network_destination_add('D', '\\\\x\\y', include_fcpxml=True)
     library_db.network_destination_update(dest_id, name='D2')  # fcpxml flags not passed
     dest = library_db.network_destination_get(dest_id)
@@ -72,8 +70,7 @@ def test_destination_update_fcpxml_flags_only_touches_passed_fields(tmp_path, mo
 
 
 def test_api_add_destination_accepts_fcpxml_flags(tmp_path, monkeypatch):
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', str(tmp_path / 'lib.db'))
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
     app = main.app
     client = app.test_client()
     csrf_token = 'test-csrf-fcpxml-add'

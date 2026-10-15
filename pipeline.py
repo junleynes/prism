@@ -14,7 +14,7 @@ safer done incrementally against a real render on the actual server, where
 the AI services, ffmpeg, and real footage can actually be exercised --
 not blind in a sandbox that has none of those available.
 """
-import os, cv2, numpy as np, tempfile, threading, time, pathlib, base64, json, requests, subprocess, shutil, re, sqlite3, uuid, secrets, io, mimetypes, hashlib
+import os, cv2, numpy as np, tempfile, threading, time, pathlib, base64, json, requests, subprocess, shutil, re, uuid, secrets, io, mimetypes, hashlib
 from xml.sax.saxutils import escape as xml_escape
 from concurrent.futures import ThreadPoolExecutor
 from scenedetect import open_video, SceneManager, FrameTimecode
@@ -30,7 +30,7 @@ from core import app, ALLOWED_EXTENSIONS, _job_submit_limiter, _client_ip, _Rate
 import cutcraft
 import scriptbrief
 from schedule_core import IMAGE_EXTENSIONS as SCHEDULE_IMAGE_EXTENSIONS
-from library_db import (LIBRARY_DIR, _sqlite_connect, library_add, library_list, library_stats, library_get_row, library_delete,
+from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, library_get_row, library_delete,
     audit_log, audit_log_list, network_favorites_list, network_favorite_add, network_favorite_remove,
     load_branding, save_branding_text, save_branding_color, save_branding_logo, save_branding_favicon,
     clear_branding_logo, clear_branding_favicon, clear_branding_color, BRANDING_DIR,
@@ -39,8 +39,9 @@ from library_db import (LIBRARY_DIR, _sqlite_connect, library_add, library_list,
     network_destinations_list, network_destination_get, network_destination_add,
     network_destination_update, network_destination_remove)
 from auth import require_permission
+import database
 
-# ---- Per-show asset templates (SQLite) ----
+# ---- Per-show asset templates (PostgreSQL `show_templates` table) ----
 # A "template" is a named bundle of the reusable assets a specific show always
 # uses -- its background music bed, SFX one-shot, VO track, title card and end
 # card (each card with an optional card VO + in/out points). Picking a template
@@ -55,7 +56,6 @@ from auth import require_permission
 # card-VO files it is handed once it's finished with them.
 TEMPLATES_DIR = os.environ.get('TEMPLATES_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'show_templates'))
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
-TEMPLATES_DB_PATH = os.path.join(TEMPLATES_DIR, 'templates.db')
 
 # Each slot maps a template asset to the form field the trailer form already uses
 # for it. Note the two legacy field names: 'end_card_video' is really the *title*
@@ -100,36 +100,12 @@ TEMPLATE_SETTING_FIELDS = [
 # recorded as off rather than left at whatever the previous value was.
 TEMPLATE_BOOL_FIELDS = {'beat_match', 'broadcast_stereo', 'sync_beats', 'whisper_enhance'}
 
-def _tpl_db():
-    return _sqlite_connect(TEMPLATES_DB_PATH)
-
 def templates_db_init():
-    cols = []
-    for slot in TEMPLATE_SLOT_KEYS:
-        cols.append(f'{slot}_file TEXT')   # stored filename inside TEMPLATES_DIR
-        cols.append(f'{slot}_name TEXT')   # original filename, for display only
-    conn = _tpl_db()
-    conn.execute('CREATE TABLE IF NOT EXISTS show_templates ('
-                 'id INTEGER PRIMARY KEY AUTOINCREMENT,'
-                 'name TEXT NOT NULL UNIQUE,'
-                 'notes TEXT,'
-                 'created_at REAL NOT NULL,'
-                 'updated_at REAL NOT NULL,'
-                 'genre TEXT,'
-                 'transition TEXT,'
-                 'xfade_dur REAL,'
-                 'settings_json TEXT,'
-                 'vo_start REAL, vo_volume REAL, vo_trim_start REAL, vo_trim_end REAL,'
-                 'title_card_vo_start REAL, title_card_vo_end REAL,'
-                 'end_card_vo_start REAL, end_card_vo_end REAL,'
-                 + ','.join(cols) + ')')
-    # Migration for databases created before settings_json existed.
-    have = {r[1] for r in conn.execute('PRAGMA table_info(show_templates)')}
-    if 'settings_json' not in have:
-        conn.execute('ALTER TABLE show_templates ADD COLUMN settings_json TEXT')
-        print('show_templates: added settings_json column (existing templates keep their assets).')
-    conn.commit()
-    conn.close()
+    # show_templates is created by schema.sql: one <slot>_file (stored filename
+    # inside TEMPLATES_DIR) and <slot>_name (original filename, display only)
+    # column per entry in TEMPLATE_SLOTS. tests/test_database_schema.py fails if
+    # a slot is added above without the matching columns there.
+    database.init_schema()
 
 def template_settings(row):
     """The saved form configuration for a template, as a plain dict."""
@@ -156,20 +132,20 @@ def _template_public(row):
     return out
 
 def template_list():
-    conn = _tpl_db()
-    rows = conn.execute('SELECT * FROM show_templates ORDER BY name COLLATE NOCASE').fetchall()
+    conn = database.connect()
+    rows = conn.execute('SELECT * FROM show_templates ORDER BY LOWER(name)').fetchall()
     conn.close()
     return [_template_public(dict(r)) for r in rows]
 
 def template_get(tid):
-    conn = _tpl_db()
-    row = conn.execute('SELECT * FROM show_templates WHERE id=?', (tid,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT * FROM show_templates WHERE id=%s', (tid,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 def template_get_by_name(name):
-    conn = _tpl_db()
-    row = conn.execute('SELECT * FROM show_templates WHERE name=? COLLATE NOCASE', (name,)).fetchone()
+    conn = database.connect()
+    row = conn.execute('SELECT * FROM show_templates WHERE LOWER(name)=LOWER(%s)', (name,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -219,8 +195,8 @@ def template_delete(tid):
         return False
     for slot in TEMPLATE_SLOT_KEYS:
         template_delete_asset_file(row, slot)
-    conn = _tpl_db()
-    conn.execute('DELETE FROM show_templates WHERE id=?', (tid,))
+    conn = database.connect()
+    conn.execute('DELETE FROM show_templates WHERE id=%s', (tid,))
     conn.commit()
     conn.close()
     return True
@@ -1535,15 +1511,14 @@ def fish_audio_delete_reference(voice_id, timeout=15):
     return True, None
 
 # ---- Background job tracking (progress reporting for long-running trailer jobs) ----
-# Backed by SQLite (a dedicated jobs.db, not shared with the trailers/branding
-# library.db, so job churn never risks contending with or corrupting that
-# file) rather than an in-memory dict. The in-memory version lost every
+# Backed by PostgreSQL (the `jobs` table -- its own table, so job churn never
+# touches the trailers/accounts data) rather than an in-memory dict. The
+# in-memory version lost every
 # running job's entire history on any restart -- crash, deploy, OOM -- with
 # no trace it had ever existed; the frontend's progress poll would just start
 # 404ing with no explanation. Every function here keeps its EXACT original
 # name and signature so none of the ~10 call sites elsewhere in this file
 # needed to change, only what happens inside these functions did.
-JOBS_DB_PATH = os.path.join(LIBRARY_DIR, 'jobs.db')
 JOBS_LOCK = threading.Lock()
 JOB_TTL = 60 * 60  # drop finished jobs after an hour so the table doesn't grow forever
 # Which feature a job belongs to. Every feature's jobs share this one table
@@ -1551,35 +1526,10 @@ JOB_TTL = 60 * 60  # drop finished jobs after an hour so the table doesn't grow 
 # asks for its kind, and only the admin view shows them all.
 JOB_KINDS = ('promo', 'shorts', 'schedule')
 
-def _jobs_db():
-    return _sqlite_connect(JOBS_DB_PATH)
-
 def jobs_db_init():
-    conn = _jobs_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
-        id TEXT PRIMARY KEY,
-        percent INTEGER NOT NULL DEFAULT 0,
-        step TEXT,
-        done INTEGER NOT NULL DEFAULT 0,
-        error TEXT,
-        status TEXT,
-        result_json TEXT,
-        cancel_requested INTEGER NOT NULL DEFAULT 0,
-        created REAL NOT NULL,
-        user_id INTEGER,
-        username TEXT,
-        orig_name TEXT,
-        kind TEXT
-    )''')
-    # A table from before jobs had a kind: add the column, and file what is
-    # already in it. Until then every job was listed as an episodic plug;
-    # the other two features have always labelled theirs, so those are told
-    # apart by the label and anything else is what it was listed as.
-    if 'kind' not in [r[1] for r in conn.execute('PRAGMA table_info(jobs)')]:
-        conn.execute('ALTER TABLE jobs ADD COLUMN kind TEXT')
-        conn.execute("UPDATE jobs SET kind='shorts' WHERE orig_name LIKE '%(vertical shorts: %'")
-        conn.execute("UPDATE jobs SET kind='schedule' WHERE orig_name LIKE '%(schedule plug, %'")
-        conn.execute("UPDATE jobs SET kind='promo' WHERE kind IS NULL")
+    # The jobs table (including `kind`) comes from schema.sql.
+    database.init_schema()
+    conn = database.connect()
     # Anything still marked "not done" at startup was, by definition, being
     # rendered by a process that no longer exists -- the whole point of
     # persisting this at all is to tell the truth about that instead of
@@ -1614,15 +1564,15 @@ def job_new(user_id=None, username=None, kind='promo'):
     random_suffix = secrets.token_hex(3)
     jid = f'{int(time.time()*1000)}_{threading.get_ident()}_{random_suffix}'
     with JOBS_LOCK:
-        conn = _jobs_db()
+        conn = database.connect()
         conn.execute(
             'INSERT INTO jobs (id, percent, step, done, error, status, result_json, '
             'cancel_requested, created, user_id, username, orig_name, kind) '
-            'VALUES (?,0,?,0,NULL,?,NULL,0,?,?,?,NULL,?)',
+            'VALUES (%s,0,%s,0,NULL,%s,NULL,0,%s,%s,%s,NULL,%s)',
             (jid, 'Queued', 'queued', time.time(), user_id, username, kind))
         # Same TTL cleanup the in-memory version did, just as a DELETE instead
         # of a dict-pop loop.
-        conn.execute('DELETE FROM jobs WHERE done=1 AND created < ?', (time.time() - JOB_TTL,))
+        conn.execute('DELETE FROM jobs WHERE done=1 AND created < %s', (time.time() - JOB_TTL,))
         conn.commit()
         conn.close()
     return jid
@@ -1630,26 +1580,32 @@ def job_new(user_id=None, username=None, kind='promo'):
 def job_set(jid, percent=None, step=None, error=None, done=None, result=None, status=None):
     cancel_now = False
     with JOBS_LOCK:
-        conn = _jobs_db()
-        row = conn.execute('SELECT cancel_requested FROM jobs WHERE id=?', (jid,)).fetchone()
+        conn = database.connect()
+        row = conn.execute('SELECT cancel_requested FROM jobs WHERE id=%s', (jid,)).fetchone()
         if not row:
             conn.close()
             return
         updates, args = [], []
         if percent is not None:
-            updates.append('percent=?'); args.append(percent)
+            updates.append('percent=%s'); args.append(percent)
         if step is not None:
-            updates.append('step=?'); args.append(step)
+            updates.append('step=%s'); args.append(step)
         if status is not None:
-            updates.append('status=?'); args.append(status)
+            updates.append('status=%s'); args.append(status)
         if error is not None:
-            updates.append('error=?'); args.append(error)
+            updates.append('error=%s'); args.append(error)
             updates.append('done=1')
-            updates.append("status='error'")
+            # An error means status 'error' unless the caller named one (a
+            # cancellation passes status='cancelled', which the Monitor tab
+            # shows as a Cancelled badge). The column can only be assigned once
+            # per UPDATE; SQLite quietly let this default overwrite the caller's
+            # status, so cancelled jobs used to be stored as 'error'.
+            if status is None:
+                updates.append("status='error'")
         if done is not None:
-            updates.append('done=?'); args.append(1 if done else 0)
+            updates.append('done=%s'); args.append(1 if done else 0)
         if result is not None:
-            updates.append('result_json=?'); args.append(json.dumps(result))
+            updates.append('result_json=%s'); args.append(json.dumps(result))
         # Deliberately never touches the cancel_requested column here -- that
         # column belongs to job_cancel()'s own narrow UPDATE. Keeping each
         # function's UPDATE scoped to only the columns IT manages means a
@@ -1658,7 +1614,7 @@ def job_set(jid, percent=None, step=None, error=None, done=None, result=None, st
         # without needing an explicit cross-function transaction to prevent it.
         if updates:
             args.append(jid)
-            conn.execute(f'UPDATE jobs SET {", ".join(updates)} WHERE id=?', args)
+            conn.execute(f'UPDATE jobs SET {", ".join(updates)} WHERE id=%s', args)
             conn.commit()
         conn.close()
         # Any progress update after a cancellation request raises, so the running
@@ -1674,12 +1630,12 @@ def job_cancel(jid):
     from the wait line immediately; running jobs unwind at their next progress
     checkpoint (best-effort — an in-flight ffmpeg/API call still finishes first)."""
     with JOBS_LOCK:
-        conn = _jobs_db()
-        row = conn.execute('SELECT done FROM jobs WHERE id=?', (jid,)).fetchone()
+        conn = database.connect()
+        row = conn.execute('SELECT done FROM jobs WHERE id=%s', (jid,)).fetchone()
         if not row or row['done']:
             conn.close()
             return False
-        conn.execute('UPDATE jobs SET cancel_requested=1 WHERE id=?', (jid,))
+        conn.execute('UPDATE jobs SET cancel_requested=1 WHERE id=%s', (jid,))
         conn.commit()
         conn.close()
     with JOB_QUEUE_LOCK:
@@ -1690,8 +1646,8 @@ def job_cancel(jid):
 
 def job_get(jid):
     with JOBS_LOCK:
-        conn = _jobs_db()
-        row = conn.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+        conn = database.connect()
+        row = conn.execute('SELECT * FROM jobs WHERE id=%s', (jid,)).fetchone()
         conn.close()
     if not row:
         return None
@@ -1712,8 +1668,8 @@ def job_set_orig_name(jid, orig_name):
     function for the same reason job_set's UPDATE stays narrowly scoped --
     a dedicated single-column write can't collide with anything else."""
     with JOBS_LOCK:
-        conn = _jobs_db()
-        conn.execute('UPDATE jobs SET orig_name=? WHERE id=?', (orig_name, jid))
+        conn = database.connect()
+        conn.execute('UPDATE jobs SET orig_name=%s WHERE id=%s', (orig_name, jid))
         conn.commit()
         conn.close()
 
@@ -1724,7 +1680,7 @@ def job_list_all():
     this function deliberately doesn't take a dependency on, so it stays
     exactly where it already lived rather than duplicating it in here."""
     with JOBS_LOCK:
-        conn = _jobs_db()
+        conn = database.connect()
         rows = conn.execute('SELECT * FROM jobs').fetchall()
         conn.close()
     out = {}
@@ -5734,30 +5690,15 @@ def api_vision_models():
 CHAT_TIMEOUT = int(os.environ.get('CHAT_TIMEOUT', 180))
 CHAT_MAX_HISTORY = int(os.environ.get('CHAT_MAX_HISTORY', 60))  # messages, not turns
 
-# ---- Per-user chat memory (SQLite) ----
+# ---- Per-user chat memory (PostgreSQL `chat_messages` table) ----
 # The chat used to live only in the page -- reloading or coming back later
 # started completely fresh. This persists each account's conversation
 # server-side, scoped strictly to that account: deliberately no admin
 # bypass the way job/library ownership has one elsewhere in this app, since
 # a chat history is closer to a personal scratchpad than operational data
 # an admin would legitimately need to see across accounts.
-CHAT_MEMORY_DB_PATH = os.path.join(LIBRARY_DIR, 'chat_memory.db')
-
-def _chat_memory_db():
-    return _sqlite_connect(CHAT_MEMORY_DB_PATH)
-
 def chat_memory_db_init():
-    conn = _chat_memory_db()
-    conn.execute('CREATE TABLE IF NOT EXISTS chat_messages ('
-                 'id INTEGER PRIMARY KEY AUTOINCREMENT,'
-                 'user_id INTEGER NOT NULL,'
-                 'role TEXT NOT NULL,'
-                 'content TEXT NOT NULL,'
-                 'images TEXT,'
-                 'created_at REAL NOT NULL)')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_messages_user ON chat_messages(user_id, id)')
-    conn.commit()
-    conn.close()
+    database.init_schema()     # chat_messages + its (user_id, id) index: schema.sql
 
 def chat_memory_append(user_id, role, content, images=None):
     """Records one message and prunes that user's history back down to
@@ -5766,11 +5707,11 @@ def chat_memory_append(user_id, role, content, images=None):
     grow unbounded. Runs the prune every append rather than periodically:
     simpler, and the cost is one indexed DELETE against a table that's
     never more than CHAT_MAX_HISTORY+1 rows deep per user to begin with."""
-    conn = _chat_memory_db()
-    conn.execute('INSERT INTO chat_messages (user_id, role, content, images, created_at) VALUES (?,?,?,?,?)',
+    conn = database.connect()
+    conn.execute('INSERT INTO chat_messages (user_id, role, content, images, created_at) VALUES (%s,%s,%s,%s,%s)',
                  (user_id, role, content, json.dumps(images) if images else None, time.time()))
-    conn.execute('DELETE FROM chat_messages WHERE user_id=? AND id NOT IN '
-                 '(SELECT id FROM chat_messages WHERE user_id=? ORDER BY id DESC LIMIT ?)',
+    conn.execute('DELETE FROM chat_messages WHERE user_id=%s AND id NOT IN '
+                 '(SELECT id FROM chat_messages WHERE user_id=%s ORDER BY id DESC LIMIT %s)',
                  (user_id, user_id, CHAT_MAX_HISTORY))
     conn.commit()
     conn.close()
@@ -5780,8 +5721,8 @@ def chat_memory_load(user_id):
     {role, content, images?} entries the frontend already keeps in its own
     chatHistory array -- so restoring on page load is just 'use this as the
     starting array' with no reshaping needed."""
-    conn = _chat_memory_db()
-    rows = conn.execute('SELECT role, content, images FROM chat_messages WHERE user_id=? ORDER BY id ASC',
+    conn = database.connect()
+    rows = conn.execute('SELECT role, content, images FROM chat_messages WHERE user_id=%s ORDER BY id ASC',
                         (user_id,)).fetchall()
     conn.close()
     out = []
@@ -5796,8 +5737,8 @@ def chat_memory_load(user_id):
     return out
 
 def chat_memory_clear(user_id):
-    conn = _chat_memory_db()
-    conn.execute('DELETE FROM chat_messages WHERE user_id=?', (user_id,))
+    conn = database.connect()
+    conn.execute('DELETE FROM chat_messages WHERE user_id=%s', (user_id,))
     conn.commit()
     conn.close()
 
@@ -9652,17 +9593,17 @@ def api_template_save():
         fields['transition'] = None
 
     now = time.time()
-    conn = _tpl_db()
+    conn = database.connect()
     try:
         if existing:
             tid = existing['id']
-            conn.execute('UPDATE show_templates SET ' + ','.join(f'{k}=?' for k in fields) + ', updated_at=? WHERE id=?',
+            conn.execute('UPDATE show_templates SET ' + ','.join(f'{k}=%s' for k in fields) + ', updated_at=%s WHERE id=%s',
                          list(fields.values()) + [now, tid])
         else:
             cols = list(fields.keys()) + ['created_at', 'updated_at']
-            cur = conn.execute(f'INSERT INTO show_templates ({",".join(cols)}) VALUES ({",".join("?" * len(cols))})',
+            cur = conn.execute(f'INSERT INTO show_templates ({",".join(cols)}) VALUES ({",".join(["%s"] * len(cols))}) RETURNING id',
                                list(fields.values()) + [now, now])
-            tid = cur.lastrowid
+            tid = cur.fetchone()['id']
 
         for slot, meta in TEMPLATE_SLOTS.items():
             if slot in incoming:
@@ -9670,12 +9611,12 @@ def api_template_save():
                     template_delete_asset_file(existing, slot)  # replace: drop the old master
                 stored, disp = template_store_asset(incoming[slot], slot,
                                                     _upload_display_name(meta['field']))
-                conn.execute(f'UPDATE show_templates SET {slot}_file=?, {slot}_name=? WHERE id=?', (stored, disp, tid))
+                conn.execute(f'UPDATE show_templates SET {slot}_file=%s, {slot}_name=%s WHERE id=%s', (stored, disp, tid))
             elif existing and request.form.get(f'clear_{slot}') in ('1', 'on', 'true'):
                 template_delete_asset_file(existing, slot)
-                conn.execute(f'UPDATE show_templates SET {slot}_file=NULL, {slot}_name=NULL WHERE id=?', (tid,))
+                conn.execute(f'UPDATE show_templates SET {slot}_file=NULL, {slot}_name=NULL WHERE id=%s', (tid,))
         conn.commit()
-    except sqlite3.IntegrityError:
+    except database.IntegrityError:
         conn.close()
         return jsonify(ok=False, error=f'A template named "{name}" already exists.'), 409
     finally:

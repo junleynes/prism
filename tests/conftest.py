@@ -12,15 +12,29 @@ import os
 import sys
 import unittest.mock as mock
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault('LIBRARY_DIR', '/tmp/prism_test_library')
 os.environ.setdefault('SECRET_KEY_FILE', '/tmp/prism_test_library/.secret_key')
 
+# The suite runs against a real PostgreSQL database and TRUNCATEs tables, so it
+# only ever uses TEST_DATABASE_URL -- never DATABASE_URL, which on a developer
+# or server machine points at real data. Create a scratch database first:
+#     createdb prism_test
+#     export TEST_DATABASE_URL=postgresql://prism:PASSWORD@localhost:5432/prism_test
+_test_db = os.environ.get('TEST_DATABASE_URL', '').strip()
+if not _test_db:
+    pytest.exit('TEST_DATABASE_URL is not set. The tests run against a real PostgreSQL '
+                'database and empty its tables, so point it at a scratch database, e.g.\n'
+                '    postgresql://prism:PASSWORD@localhost:5432/prism_test', returncode=2)
+os.environ['DATABASE_URL'] = _test_db      # core.py's load_dotenv() never overrides a set variable
+
 with mock.patch('requests.post'), mock.patch('requests.get'):
     import pipeline  # noqa: F401 -- imported once here so every test module can just `import pipeline`
 
-import pytest
+from tests.dbutil import reset_tables, USER_TABLES
 
 
 @pytest.fixture(autouse=True)
@@ -44,20 +58,17 @@ def _assume_ai_services_reachable(monkeypatch):
 
 
 @pytest.fixture
-def users_db(tmp_path, monkeypatch):
-    """A throwaway users.db for one test, so account/TOTP/lockout tests can
-    freely create and modify accounts with no risk of touching a real
-    deployment's data and no cross-test interference. Points auth.py's
-    module-level USERS_DB_PATH at a temp file, then runs the real schema
-    init against it -- exercising the actual init path (including its
-    bootstrap-admin-if-empty behavior) rather than hand-building a schema
-    that could drift from the real one."""
+def users_db(monkeypatch):
+    """Empty account tables for one test, so account/TOTP/lockout tests can
+    freely create and modify accounts with no cross-test interference. Runs the
+    real users_db_init() afterwards -- exercising the actual init path
+    (including its bootstrap-admin-if-empty behavior) rather than hand-building
+    rows that could drift from it."""
     with mock.patch('requests.post'), mock.patch('requests.get'):
         import auth
-    db_path = str(tmp_path / 'test_users.db')
-    monkeypatch.setattr(auth, 'USERS_DB_PATH', db_path)
+    reset_tables(*USER_TABLES)
     monkeypatch.setenv('ADMIN_USERNAME', 'admin')
     monkeypatch.setenv('ADMIN_PASSWORD', 'TestBootstrapPass123')
     auth.users_db_init()
-    yield db_path
+    yield
 

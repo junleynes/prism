@@ -34,6 +34,7 @@ import pytest
 import library_db
 import pipeline
 import core
+from tests.dbutil import reset_tables, LIBRARY_TABLES
 
 with mock.patch('requests.post'), mock.patch('requests.get'):
     import main
@@ -44,8 +45,7 @@ def test_destination_no_longer_a_single_network_category():
 
 
 def test_destination_add_get_list(tmp_path, monkeypatch):
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', str(tmp_path / 'lib.db'))
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
     dest_id = library_db.network_destination_add('PMC_MAMS_PUBLISHING', '\\\\vantage\\ingest',
                                                    username='svc', password='secret', delivery_kind='video')
     got = library_db.network_destination_get(dest_id)
@@ -57,15 +57,13 @@ def test_destination_add_get_list(tmp_path, monkeypatch):
 
 
 def test_destination_invalid_delivery_kind_falls_back_to_video(tmp_path, monkeypatch):
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', str(tmp_path / 'lib.db'))
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
     dest_id = library_db.network_destination_add('X', '\\\\a\\b', delivery_kind='not_a_real_kind')
     assert library_db.network_destination_get(dest_id)['delivery_kind'] == 'video'
 
 
 def test_destination_update_only_touches_passed_fields(tmp_path, monkeypatch):
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', str(tmp_path / 'lib.db'))
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
     dest_id = library_db.network_destination_add('Name1', '\\\\a\\b', username='u1', password='p1', delivery_kind='video')
     library_db.network_destination_update(dest_id, name='Name2')
     got = library_db.network_destination_get(dest_id)
@@ -77,8 +75,7 @@ def test_destination_update_only_touches_passed_fields(tmp_path, monkeypatch):
 
 
 def test_destination_remove(tmp_path, monkeypatch):
-    monkeypatch.setattr(library_db, 'LIBRARY_DB_PATH', str(tmp_path / 'lib.db'))
-    library_db.library_db_init()
+    reset_tables(*LIBRARY_TABLES)
     dest_id = library_db.network_destination_add('X', '\\\\a\\b')
     assert library_db.network_destination_remove(dest_id) is True
     assert library_db.network_destination_get(dest_id) is None

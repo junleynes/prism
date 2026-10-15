@@ -14,7 +14,7 @@
      into .\eyan first (via git if available, else a downloaded ZIP) and
      continues from inside it. Skipped entirely if you already have the
      repo and ran this from inside it.
-  1. Checks for Python 3.10+ (numpy 2.x, pinned in requirements.txt, needs it).
+  1. Checks for Python 3.11+ (numpy 2.4.x, pinned in requirements.txt, needs it).
   2. Checks for ffmpeg/ffprobe on PATH -- external programs the render
      pipeline shells out to, not something pip can install. Pass
      -WithFFmpeg (or, when piping to iex where switches can't be passed
@@ -33,8 +33,12 @@
     - Create the trailer_library\ or show_templates\ storage directories
       (library_db.py / pipeline.py create these on import)
     - Create a default admin account (auth.py bootstraps one on first
-      boot if users.db is empty -- see README.md's "Lost the admin
+      boot if the users table is empty -- see README.md's "Lost the admin
       password?" section for recovery if you ever need it)
+    - Install or configure PostgreSQL. The app stores its data there and
+      will not start until DATABASE_URL is set in .env -- see
+      docs\POSTGRESQL.md (and docs\INSTALL-WINDOWS.md for the whole
+      walkthrough, written for Windows Server 2022).
 
 .PARAMETER WithFFmpeg
   Also install ffmpeg via winget if it isn't already on PATH. Only usable
@@ -85,7 +89,7 @@ if (-not (Test-Path "core.py") -or -not (Test-Path "requirements.txt")) {
 }
 
 # ---- 1. Python version ----
-Write-Info "Checking for Python 3.10+"
+Write-Info "Checking for Python 3.11+"
 $PythonCmd = $null
 foreach ($candidate in @('py', 'python', 'python3')) {
     $cmdInfo = Get-Command $candidate -ErrorAction SilentlyContinue
@@ -104,7 +108,7 @@ foreach ($candidate in @('py', 'python', 'python3')) {
     if (-not $verOutput) { continue }
     $parts = $verOutput.Trim().Split('.')
     $major = [int]$parts[0]; $minor = [int]$parts[1]
-    if ($major -eq 3 -and $minor -ge 10) {
+    if ($major -eq 3 -and $minor -ge 11) {
         $PythonCmd = $candidate
         $PythonArgs = $launchArgs
         Write-Ok "found $candidate $launchArgs (Python $verOutput)"
@@ -112,7 +116,7 @@ foreach ($candidate in @('py', 'python', 'python3')) {
     }
 }
 if (-not $PythonCmd) {
-    Write-Fail "No Python 3.10+ found on PATH. numpy 2.x (pinned in requirements.txt) needs 3.10+. Install a newer Python (python.org or 'winget install Python.Python.3.12') and re-run."
+    Write-Fail "No Python 3.11+ found on PATH. numpy 2.4.x (pinned in requirements.txt) needs 3.11+. Install a newer Python (python.org, or 'winget install Python.Python.3.12' where winget exists -- it does not on Windows Server 2022) and re-run."
 }
 
 # ---- 2. ffmpeg / ffprobe ----
@@ -184,7 +188,13 @@ Write-Host " as Administrator once and 'Set-ExecutionPolicy RemoteSigned -Scope"
 Write-Host " CurrentUser', or just skip activation and run venv\Scripts\python.exe"
 Write-Host " main.py directly -- same effect.)"
 Write-Host ""
-Write-Host "First run with no existing users.db creates a default admin account and"
+Write-Host "BEFORE the first run: PRISM stores its data in PostgreSQL. Create the"
+Write-Host "database, then set DATABASE_URL in .env and check it with:"
+Write-Host "  python database.py"
+Write-Host "See docs\POSTGRESQL.md (migrating from an older SQLite install is"
+Write-Host "covered there too)."
+Write-Host ""
+Write-Host "First run with an empty database creates a default admin account and"
 Write-Host "prints its username/password once to the console -- watch for it, or set"
 Write-Host "ADMIN_USERNAME/ADMIN_PASSWORD in .env first to choose your own. See"
 Write-Host "README.md for the full rundown (including how to recover a lost admin"

@@ -1,11 +1,10 @@
 """
 Tests for job_new/job_set/job_get/job_cancel/job_list_all/job_set_orig_name --
-the SQLite-backed job tracking that replaced an in-memory dict. The whole
+the PostgreSQL-backed job tracking that replaced an in-memory dict. The whole
 point of this layer is durability across a restart, so that's the behavior
 most worth protecting with a real test, alongside the basic CRUD lifecycle.
 """
 import re
-import sqlite3
 import time
 import unittest.mock as mock
 
@@ -14,10 +13,11 @@ import pytest
 with mock.patch('requests.post'), mock.patch('requests.get'):
     import main
 import pipeline
+from tests.dbutil import reset_tables
 
 
 def _use_temp_jobs_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(pipeline, 'JOBS_DB_PATH', str(tmp_path / 'test_jobs.db'))
+    reset_tables('jobs')
     pipeline.jobs_db_init()
 
 
@@ -101,35 +101,6 @@ def test_a_job_says_which_feature_it_belongs_to(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         pipeline.job_new(user_id=1, kind='trailer')
     assert len(pipeline.job_list_all()) == 3, 'and a job of no known kind is not created'
-
-
-def test_a_jobs_table_from_before_kinds_is_filed_by_its_labels(tmp_path, monkeypatch):
-    """On the server this is deployed to, the table already exists and holds
-    the last hour's jobs. Left unfiled they would all still count as
-    episodic plugs, and the fix would look like it had not worked."""
-    path = str(tmp_path / 'old_jobs.db')
-    conn = sqlite3.connect(path)
-    conn.execute('CREATE TABLE jobs (id TEXT PRIMARY KEY, percent INTEGER NOT NULL DEFAULT 0, step TEXT, '
-                 'done INTEGER NOT NULL DEFAULT 0, error TEXT, status TEXT, result_json TEXT, '
-                 'cancel_requested INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, user_id INTEGER, '
-                 'username TEXT, orig_name TEXT)')
-    rows = [('a', 'EP101.mov'), ('b', 'EP101.mov (vertical shorts: analysis)'),
-            ('c', 'EP101.mov (vertical shorts: 20 to render)'), ('d', 'EP101.mov (vertical shorts: analysis + render)'),
-            ('e', 'Week 42.psd (schedule plug, 15s)'), ('f', None)]
-    conn.executemany("INSERT INTO jobs (id, done, created, user_id, orig_name) VALUES (?, 1, ?, 7, ?)",
-                     [(jid, time.time(), name) for jid, name in rows])
-    conn.commit()
-    conn.close()
-    monkeypatch.setattr(pipeline, 'JOBS_DB_PATH', path)
-    pipeline.jobs_db_init()
-    kinds = {jid: j['kind'] for jid, j in pipeline.job_list_all().items()}
-    assert kinds == {'a': 'promo', 'b': 'shorts', 'c': 'shorts', 'd': 'shorts', 'e': 'schedule', 'f': 'promo'}
-    # Filed once, on the upgrade: a later start leaves what jobs say they are alone.
-    plug = pipeline.job_new(user_id=7, kind='promo')
-    pipeline.job_set_orig_name(plug, 'My Show (schedule plug, special).mov')
-    pipeline.jobs_db_init()
-    assert pipeline.job_get(plug)['kind'] == 'promo' and pipeline.job_get('e')['kind'] == 'schedule'
-    assert pipeline.job_get(pipeline.job_new(user_id=7, kind='shorts'))['kind'] == 'shorts'
 
 
 def _session(user_id=7, role='user', username='ana'):
@@ -217,6 +188,15 @@ class TestCancellation:
         finally:
             if jid in pipeline.JOB_QUEUE:
                 pipeline.JOB_QUEUE.remove(jid)
+
+    def test_a_cancelled_job_is_reported_as_cancelled_not_as_an_error(self, tmp_path, monkeypatch):
+        """The Monitor tab badges status == 'cancelled'. The status a caller
+        names must survive the 'error implies status error' default."""
+        _use_temp_jobs_db(tmp_path, monkeypatch)
+        jid = pipeline.job_new()
+        pipeline.job_set(jid, error='Cancelled', status='cancelled')
+        j = pipeline.job_get(jid)
+        assert (j['status'], j['error'], j['done']) == ('cancelled', 'Cancelled', True)
 
     def test_cancelling_a_running_job_raises_on_its_next_progress_update(self, tmp_path, monkeypatch):
         _use_temp_jobs_db(tmp_path, monkeypatch)

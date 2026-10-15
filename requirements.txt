@@ -33,6 +33,10 @@ msgpack>=1.0
 psd-tools>=1.10
 Pillow>=10.3
 waitress>=3.0
+# PostgreSQL driver + connection pool (database.py). The [binary] extra bundles
+# libpq, so no PostgreSQL client libraries need installing on the host -- on
+# Windows or Linux. Needs Python 3.10+.
+psycopg[binary,pool]>=3.2,<4
 # Two-factor authentication (TOTP). pyotp does the actual verification;
 # qrcode renders the enrolment QR so a phone can scan the secret instead of
 # it being typed by hand. Both are imported lazily in auth.py, so an existing

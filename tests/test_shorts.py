@@ -35,6 +35,7 @@ with mock.patch('requests.post'), mock.patch('requests.get'):
     import core
     import auth
 import shorts_core as sc
+from tests.dbutil import reset_tables
 
 
 pytestmark = pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg not available')
@@ -1388,7 +1389,7 @@ def test_the_place_badge_on_a_short_does_not_share_a_class_with_the_number_boxes
 
 
 def test_a_shorts_job_is_filed_as_a_shorts_job_and_kept_out_of_the_episodic_list(env, monkeypatch, tmp_path):
-    monkeypatch.setattr(pipeline, 'JOBS_DB_PATH', str(tmp_path / 'jobs.db'))
+    reset_tables('jobs')
     pipeline.jobs_db_init()
     Services(monkeypatch)
     client, headers = _client()
