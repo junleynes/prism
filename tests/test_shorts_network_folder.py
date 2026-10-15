@@ -27,7 +27,7 @@ with mock.patch('requests.post'), mock.patch('requests.get'):
 import library_db
 import pipeline
 
-HIRES = {'path': r'\\10.0.1.130\media\HIRES', 'username': 'promo', 'password': 'p1'}
+HIRES = {'path': r'\\fileserver\media\HIRES', 'username': 'promo', 'password': 'p1'}
 SHORTS = {'path': '//10.0.1.140/archive/Episodes', 'username': 'shorts', 'password': 'p2'}
 
 
@@ -60,7 +60,7 @@ def test_blank_reads_the_hires_folder_with_the_hires_login(folders):
     assert pipeline._network_share_root('shorts') == HIRES['path']
     with mock.patch.object(pipeline.smbclient, 'register_session') as reg:
         pipeline._network_session('shorts')
-    reg.assert_called_once_with('10.0.1.130', username='promo', password='p1', connection_timeout=10)
+    reg.assert_called_once_with('fileserver', username='promo', password='p1', connection_timeout=10)
     # A login typed in without a path is not a folder of its own yet.
     library_db.save_network_folder('shorts', {'username': 'someone', 'password': 'x'})
     assert pipeline._network_folder_row('shorts') == HIRES
