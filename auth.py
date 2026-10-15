@@ -290,6 +290,7 @@ AVAILABLE_PERMISSIONS = [
     ('scene_detection', 'Scene Detection'),
     ('ai_chat', 'AI Chat'),
     ('player', 'Player'),
+    ('docs', 'Docs'),
 ]
 _PERMISSION_KEYS = {k for k, _ in AVAILABLE_PERMISSIONS}
 
@@ -681,6 +682,15 @@ def group_delete(gid):
     conn.commit()
     conn.close()
     return True, None
+
+def group_membership():
+    """({user id: group id or None}, {group id: group name}) in two queries,
+    for code that decides what a group may see across many records at once."""
+    conn = database.connect()
+    users = {r['id']: r['group_id'] for r in conn.execute('SELECT id, group_id FROM users').fetchall()}
+    groups = {r['id']: r['name'] for r in conn.execute('SELECT id, name FROM groups').fetchall()}
+    conn.close()
+    return users, groups
 
 def user_can(user_id, role, *permissions):
     """True if the session identified by (user_id, role) may use a feature

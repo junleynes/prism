@@ -1224,7 +1224,9 @@ var CURRENT_USERNAME = {{ current_username|tojson }}
     {% if current_role == 'admin' %}
     <div class="tab{{ ' active' if default_tab == 'p-api' else '' }}" onclick="switchTab('p-api',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 8 4 12l4 4"/><path d="m16 8 4 4-4 4"/><path d="m14 6-4 12"/></svg></span><span class=tab-text>API</span></div>
     {% endif %}
+    {% if current_role == 'admin' or 'docs' in current_permissions %}
     <div class="tab{{ ' active' if default_tab == 'p-docs' else '' }}" onclick="switchTab('p-docs',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h10l4 4v12H5z"/><path d="M15 4v4h4"/><path d="M8 12h8M8 16h6"/></svg></span><span class=tab-text>Docs</span></div>
+    {% endif %}
     {% if current_role == 'admin' %}
     <div class="tab{{ ' active' if default_tab == 'p-jobs' else '' }}" onclick="switchTab('p-jobs',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v5"/><path d="m8 14 2.5 2.5L15 12"/></svg></span><span class=tab-text>Jobs</span></div>
     <div class="tab{{ ' active' if default_tab == 'p-config' else '' }}" onclick="switchTab('p-config',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></span><span class=tab-text>Config</span></div>
@@ -7784,6 +7786,8 @@ document.getElementById('vf').addEventListener('submit', async function(e){
         <select id=sh-pf-status class=input-box><option value=new selected>New</option><option value=in_progress>In Progress</option><option value=ready_review>Ready For Review</option><option value=review_in_progress>Review In Progress</option><option value=ready_export>Ready To Export</option><option value=complete>Complete</option></select></div>
       <div><label for=sh-pf-assign>Assigned to:</label>
         <select id=sh-pf-assign class=input-box><option value="">Unassigned</option></select></div>
+      {% if current_role == 'admin' %}<div><label for=sh-pf-group>Group:</label>
+        <select id=sh-pf-group class=input-box title="Only this group's members (and admins) see the project and its shorts"><option value="">No group</option></select></div>{% endif %}
       <div><label for=sh-pf-hasdue style="display:flex;gap:8px;align-items:center;cursor:pointer"><input type=checkbox id=sh-pf-hasdue onchange="shDueToggle()"> Has a Deadline</label>
         <div id=sh-pf-due style="display:none;margin-top:6px"><label for=sh-pf-duedate>Due Date:</label>
           <input type=date id=sh-pf-duedate class=input-box>
@@ -10905,10 +10909,13 @@ function shDueToggle(){
 }
 
 // The accounts a project can be assigned to; a name no longer on the list is kept so editing does not drop it.
-async function shLoadAssignees(current){
-  var sel = shEl('sh-pf-assign'), names = SH.assignees
+// Who can be assigned depends on the project's group, so the list is asked for per project.
+async function shLoadAssignees(current, pid){
+  var sel = shEl('sh-pf-assign'), key = pid || ''
+  SH.assignees = SH.assignees || {}
+  var names = SH.assignees[key]
   if(!names){
-    try{ var d = await (await fetch('/api/shorts/assignees')).json(); names = SH.assignees = d.ok ? d.items : [] }
+    try{ var d = await (await fetch('/api/shorts/assignees' + (pid ? '?project_id=' + encodeURIComponent(pid) : ''))).json(); names = SH.assignees[key] = d.ok ? d.items : [] }
     catch(e){ names = [] }
   }
   var all = names.slice()
@@ -10924,6 +10931,7 @@ function shProjectLine(p){
   if(p.artists) bits.push(escapeHtmlLite(p.artists))
   if(p.air_date) bits.push('airs ' + escapeHtmlLite(shDate(p.air_date)))
   if(p.assigned_to) bits.push('assigned to ' + escapeHtmlLite(p.assigned_to))
+  if(IS_ADMIN) bits.push(p.group_name ? 'group ' + escapeHtmlLite(p.group_name) : 'no group')
   var due = shDueText(p)
   if(due) bits.push(due)
   return bits.join(' &middot; ')
@@ -11001,6 +11009,7 @@ async function shortsLoadProjects(){
   try{
     var d = await (await fetch('/api/shorts/projects')).json()
     SH.projects = d.ok ? d.items : []
+    if(d.groups) SH.groups = d.groups
   }catch(e){
     SH.projects = SH.projects || []
     grid.innerHTML = '<div class=no-data><span style="color:var(--amber)">Could not load the projects: ' + escapeHtmlLite(String(e)) + '</span></div>'
@@ -11316,7 +11325,13 @@ function shProjectForm(p, hide){
   shEl('sh-pf-artists').value = p ? (p.artists || '') : ''
   shEl('sh-pf-air').value = p ? (p.air_date || '') : ''
   shEl('sh-pf-status').value = p ? (p.status || 'new') : 'new'
-  shLoadAssignees(p ? p.assigned_to : '')
+  shLoadAssignees(p ? p.assigned_to : '', p ? p.project_id : '')
+  var grp = shEl('sh-pf-group')
+  if(grp){
+    grp.innerHTML = '<option value="">No group</option>' + (SH.groups || []).map(function(x){
+      return '<option value="' + x.id + '">' + escapeHtmlLite(x.name) + '</option>' }).join('')
+    grp.value = p && p.group_id != null ? String(p.group_id) : ''
+  }
   var dl = p && p.deadline ? p.deadline.split('T') : null
   shEl('sh-pf-hasdue').checked = !!dl
   shEl('sh-pf-duedate').value = dl ? dl[0] : ''
@@ -11347,6 +11362,7 @@ async function shProjectSave(){
   fd.append('air_date', shEl('sh-pf-air').value)
   fd.append('status', shEl('sh-pf-status').value)
   fd.append('assigned_to', shEl('sh-pf-assign').value)
+  if(shEl('sh-pf-group')) fd.append('group_id', shEl('sh-pf-group').value)
   if(shEl('sh-pf-hasdue').checked){
     if(!shEl('sh-pf-duedate').value){ note.textContent = 'Choose the due date, or turn off Has a Deadline.'; shEl('sh-pf-duedate').focus(); return }
     fd.append('has_deadline', '1')
@@ -13235,6 +13251,7 @@ job. Configured via env vars:
 </div>
 </div>
 
+{% if current_role == 'admin' or 'docs' in current_permissions %}
 <div id="p-docs" class="panel{{ ' active' if default_tab == 'p-docs' else '' }}">
 <h2>Docs</h2>
 <div class="sub-tabs">
@@ -13414,7 +13431,7 @@ job. Configured via env vars:
       <p>Anyone who can see a batch can read its captions; changing them is for whoever rendered it and admins, like deleting it.</p>
       <h3>Projects</h3>
       <p>Shorts are filed by project: the episode they are cut from. A project records the <strong>programme title</strong>, <strong>episode</strong>, <strong>air date</strong>, a <strong>description</strong> and a <strong>thumbnail</strong> (JPEG, PNG or WebP up to 8 MB; until one is given the project shows a frame of its newest short). A project is the only way in: choose <strong>New project</strong>, or open one, and its page has two views &mdash; <strong>Shorts in this project</strong>, every batch rendered for it, and <strong>Create shorts</strong>, the form that makes more. There is no way to start a job outside a project, so nothing is saved loose. A new project opens on <strong>Create shorts</strong>. Jobs are <strong>queued</strong>: start <strong>Preview the cut</strong>, <strong>Generate without preview</strong> or <strong>Render</strong> again while another is running and it is added to the <strong>Queue</strong> under the buttons, each with its own progress and <strong>Cancel</strong>. The server runs as many at once as its job limit allows (the same limit as Episodic Plug) and the rest show <em>Waiting</em>. A finished cut opens by itself only if no cut is open for that project; otherwise the queue offers <strong>Open the review</strong> or <strong>Show the shorts</strong>, going to its project first. Every cut is also kept under <em>Earlier cuts</em>. The queue lives in the page: reloading it forgets the list (the jobs go on, see Jobs), so reopen finished cuts from Earlier cuts.</p>
-      <p>Everyone with access to Vertical Shorts sees every project and can play, download and send what is in it. Deleting a batch, or moving it to another project, is for whoever rendered it and admins. A project can be deleted by whoever created it or an admin, and only once it is empty: deleting a project never deletes shorts. Shorts rendered before projects existed are listed under <strong>Not in a project</strong> for their maker, with <strong>Move to</strong> to file them.</p>
+      <p>A project belongs to a group: the group of whoever created it. Everyone in that group with access to Vertical Shorts sees the project and can play, download and send what is in it; other groups do not see it at all. Accounts with no group share the projects that have no group. Admins see every project and can move one to another group (<strong>Group</strong>, when editing it). Deleting a batch, or moving it to another project, is for whoever rendered it and admins. A project can be deleted by whoever created it or an admin, and only once it is empty: deleting a project never deletes shorts. Shorts rendered before projects existed are listed under <strong>Not in a project</strong> for their maker, with <strong>Move to</strong> to file them.</p>
       <h3>Limits worth knowing</h3>
       <ul style="line-height:1.8;padding-left:20px">
         <li>Candidates are proposals. A local model can misjudge what stands alone &mdash; preview before rendering.</li>
@@ -13610,6 +13627,7 @@ function switchDocs(btn){
 }
 </script>
 </div>
+{% endif %}
 
 <div id="p-jobs" class="panel{{ ' active' if default_tab == 'p-jobs' else '' }}">
 <h2>Jobs</h2>

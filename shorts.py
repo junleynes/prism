@@ -46,12 +46,12 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 import requests
-from flask import request, jsonify, session, send_file, send_from_directory
+from flask import request, jsonify, session, send_file, send_from_directory, has_request_context, g as _req
 from werkzeug.utils import secure_filename
 
 from core import app, _job_submit_limiter, _client_ip, _RateLimiter
 from library_db import LIBRARY_DIR, audit_log, network_destination_get
-from auth import require_permission
+from auth import require_permission, group_membership
 import captionfile
 import pipeline
 import shorts_core as sc
@@ -614,12 +614,54 @@ def _may_change(m):
         return True
 
 
+def _groups():
+    """({user id: group id}, {group id: name}), read once per request."""
+    if has_request_context():
+        if not hasattr(_req, '_sh_groups'):
+            _req._sh_groups = group_membership()
+        return _req._sh_groups
+    return group_membership()
+
+
+def _project_group(proj):
+    """The group a project belongs to: the one it was filed under, or for a project made before projects had
+    groups, its creator's. None for no group, and for a group that has since been deleted (whose members are
+    back to no group too)."""
+    users, groups = _groups()
+    gid = proj['group_id'] if 'group_id' in proj else users.get(proj.get('user_id'))
+    return gid if gid in groups else None
+
+
+def _viewer_group():
+    return _groups()[0].get(session.get('user_id'))
+
+
+def _may_see_project(proj):
+    """A project is its group's: everyone in that group with Vertical Shorts sees it, its batches and what is
+    running in it; other groups do not. Accounts with no group share the projects that have no group.
+    Admins see every project."""
+    if not has_request_context():           # a job thread: whoever started it was allowed to
+        return True
+    if session.get('role') == 'admin':
+        return True
+    if session.get('user_id') is None:
+        return False
+    return _project_group(proj) == _viewer_group()
+
+
+def _visible_project(pid):
+    """The project, or None when there is none or the caller's group may not see it (the same answer either
+    way, so another group's project ids reveal nothing)."""
+    proj = sp.load(SHORTS_PROJECTS_DIR, pid) if pid else None
+    return proj if proj and _may_see_project(proj) else None
+
+
 def _may_see(m):
-    """A batch filed under a project is the team's: anyone with access to
-    Vertical Shorts can play, download and send it. One that is not (made
-    before projects, or its project has gone) is its maker's and an admin's,
-    as every batch used to be."""
-    if m.get('project_id') and sp.load(SHORTS_PROJECTS_DIR, m['project_id']):
+    """A batch filed under a project is the project's group's: anyone in it with access to Vertical Shorts can
+    play, download and send it. Its maker and admins always can. One that is not filed (made before projects,
+    or its project has gone) is its maker's and an admin's, as every batch used to be."""
+    proj = sp.load(SHORTS_PROJECTS_DIR, m['project_id']) if m.get('project_id') else None
+    if proj and _may_see_project(proj):
         return True
     return _may_change(m)
 
@@ -2291,7 +2333,7 @@ def api_shorts_analyze():
         return jsonify(error='The maximum length must be at least 5 seconds more than the minimum.'), 400
     # Before the source too, for the same reason: shorts are filed under a
     # project, and without one there is nowhere for them to go.
-    project = sp.load(SHORTS_PROJECTS_DIR, (request.form.get('project_id') or '').strip())
+    project = _visible_project((request.form.get('project_id') or '').strip())
     if not project:
         return jsonify(error='Choose the project these shorts are for first, or create one under Projects.'), 400
     srcs, orig_name, err = _resolve_sources()
@@ -3304,7 +3346,8 @@ def _project_public(proj, counts=None, jobs=None):
             # Its own picture, or until it has one, a frame of its newest short.
             'thumb_url': own or c['poster'],
             'batches': c['batches'], 'shorts': c['shorts'], 'last_activity': c['last'] or proj.get('created'),
-            'can_delete': _may_change(proj), 'jobs': (jobs or {}).get(pid) or []}
+            'can_delete': _may_change(proj), 'jobs': (jobs or {}).get(pid) or [],
+            'group_id': _project_group(proj), 'group_name': _groups()[1].get(_project_group(proj))}
 
 
 def _project_counts():
@@ -3323,6 +3366,23 @@ def _project_counts():
             if first.get('thumb'):
                 c['poster'] = f"/api/shorts/file/{m['batch_id']}/{first['thumb']}"
     return counts
+
+
+def _requested_group(default):
+    """The group a project is filed under: `default`, or for an admin the group_id sent with the form (blank:
+    no group). Anyone else cannot choose: a project is always their own group's."""
+    if session.get('role') != 'admin' or 'group_id' not in request.form:
+        return default
+    raw = (request.form.get('group_id') or '').strip()
+    if not raw:
+        return None
+    try:
+        gid = int(raw)
+    except ValueError:
+        gid = None
+    if gid not in _groups()[1]:
+        raise sp.ProjectError('That group no longer exists. Pick another.')
+    return gid
 
 
 def _project_thumb_upload():
@@ -3345,13 +3405,21 @@ def _project_thumb_upload():
 def api_shorts_projects():
     """The projects, most recently changed first (GET), or a new one (POST:
     title, episode, air_date, description and an optional thumbnail file).
-    Everyone with access to Vertical Shorts sees and can add to all of them."""
+    Each project belongs to a group (see _may_see_project): a new one to its
+    creator's, or for an admin, the group_id sent. Everyone sees and can add
+    to their own group's projects only; admins see all of them, and also get
+    the list of groups to file a project under."""
     if request.method == 'GET':
         counts, jobs = _project_counts(), _project_jobs()
-        return jsonify(ok=True, items=[_project_public(p, counts, jobs) for p in sp.list_all(SHORTS_PROJECTS_DIR)])
+        items = [_project_public(p, counts, jobs) for p in sp.list_all(SHORTS_PROJECTS_DIR) if _may_see_project(p)]
+        extra = {}
+        if session.get('role') == 'admin':
+            extra['groups'] = [{'id': k, 'name': v} for k, v in sorted(_groups()[1].items(), key=lambda kv: kv[1].lower())]
+        return jsonify(ok=True, items=items, **extra)
     try:
         fields = sp.clean_fields(request.form)
         thumb = _project_thumb_upload()
+        fields['group_id'] = _requested_group(_viewer_group())
     except sp.ProjectError as e:
         return jsonify(ok=False, error=str(e)), 400
     proj = sp.create(SHORTS_PROJECTS_DIR, fields, user_id=session.get('user_id'), username=session.get('username'),
@@ -3364,24 +3432,34 @@ def api_shorts_projects():
 @app.route('/api/shorts/assignees')
 @require_permission('vertical_shorts')
 def api_shorts_assignees():
-    """Who a project can be assigned to: the active accounts that may use Vertical Shorts."""
+    """Who a project can be assigned to: the active accounts that may use Vertical Shorts and can see it --
+    the caller's own group (admins too, who see every project). ?project_id= for an existing project's group;
+    an admin without it gets everyone."""
     from auth import user_list, user_can
+    proj = _visible_project((request.args.get('project_id') or '').strip())
+    if proj:
+        gid, every = _project_group(proj), False
+    else:
+        gid, every = _viewer_group(), session.get('role') == 'admin'
     names = [u['username'] for u in user_list()
-             if u.get('is_active') and user_can(u['id'], u.get('role'), 'vertical_shorts')]
+             if u.get('is_active') and user_can(u['id'], u.get('role'), 'vertical_shorts')
+             and (every or u.get('role') == 'admin' or u.get('group_id') == gid)]
     return jsonify(ok=True, items=names)
 
 
 @app.route('/api/shorts/projects/activity')
 @require_permission('vertical_shorts')
 def api_shorts_projects_activity():
-    """What is running or waiting in each project: {project id: [jobs]}. Light enough to ask every few seconds."""
-    return jsonify(ok=True, jobs=_project_jobs())
+    """What is running or waiting in each project the caller may see: {project id: [jobs]}. Light enough to ask
+    every few seconds."""
+    jobs = _project_jobs()
+    return jsonify(ok=True, jobs={pid: j for pid, j in jobs.items() if _visible_project(pid)})
 
 
 @app.route('/api/shorts/projects/<pid>', methods=['GET', 'POST', 'DELETE'])
 @require_permission('vertical_shorts')
 def api_shorts_project(pid):
-    proj = sp.load(SHORTS_PROJECTS_DIR, pid)
+    proj = _visible_project(pid)
     if not proj:
         return jsonify(ok=False, error='That project no longer exists.'), 404
     if request.method == 'GET':
@@ -3401,6 +3479,8 @@ def api_shorts_project(pid):
     try:
         fields = sp.clean_fields(request.form)
         thumb = _project_thumb_upload()
+        if 'group_id' in request.form and session.get('role') == 'admin':
+            fields['group_id'] = _requested_group(_project_group(proj))
     except sp.ProjectError as e:
         return jsonify(ok=False, error=str(e)), 400
     proj = sp.update(SHORTS_PROJECTS_DIR, pid, fields, thumb_jpeg=thumb,
@@ -3462,7 +3542,7 @@ def api_shorts_project_selections(pid):
     """GET: what was saved, with every library pick made usable again (a name staged before a restart is staged
     anew from where it came from). POST {values, files}: save them. Files picked from the library are kept
     by where they live on the share; a file uploaded straight from the computer cannot be kept."""
-    proj = sp.load(SHORTS_PROJECTS_DIR, pid)
+    proj = _visible_project(pid)
     if not proj:
         return jsonify(ok=False, error='That project no longer exists.'), 404
     if request.method == 'POST':
@@ -3590,7 +3670,7 @@ def api_shorts_template(tid):
 @app.route('/api/shorts/projects/<pid>/thumb')
 @require_permission('vertical_shorts')
 def api_shorts_project_thumb(pid):
-    proj = sp.load(SHORTS_PROJECTS_DIR, pid)
+    proj = _visible_project(pid)
     if not proj or not proj.get('thumb'):
         return jsonify(ok=False, error='Not found'), 404
     resp = send_from_directory(sp.project_dir(SHORTS_PROJECTS_DIR, pid), 'thumb.jpg', conditional=True)
@@ -3606,7 +3686,7 @@ def api_shorts_batch_move(bid):
     m, err = _batch_or_error(bid, change=True)
     if err:
         return err
-    proj = sp.load(SHORTS_PROJECTS_DIR, (request.get_json(silent=True) or {}).get('project_id'))
+    proj = _visible_project((request.get_json(silent=True) or {}).get('project_id'))
     if not proj:
         return jsonify(ok=False, error='That project no longer exists -- pick another.'), 400
     if m.get('status') == 'rendering':

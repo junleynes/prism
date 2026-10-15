@@ -47,7 +47,7 @@ def index():
         ('p-music', 'music_generation'),
         ('p-sfx', 'text_to_sfx'), ('p-fish', 'text_to_speech'),
         ('p-stt', 'speech_to_text'), ('p-vision', 'scene_detection'),
-        ('p-chat', 'ai_chat'), ('p-tools', 'player'), ('p-docs', None),
+        ('p-chat', 'ai_chat'), ('p-tools', 'player'), ('p-docs', 'docs'),
     ]
     default_tab = 'p-dashboard'
     for tab_id, perm in tab_order:
