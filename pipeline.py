@@ -21,6 +21,7 @@ from scenedetect import open_video, SceneManager, FrameTimecode
 from scenedetect.detectors import ContentDetector, AdaptiveDetector
 from flask import request, jsonify, redirect, Response, send_from_directory, send_file, session
 import zipfile
+import itertools
 import math
 from werkzeug.utils import secure_filename
 import smbclient  # pip install smbprotocol -- lets the upload panels browse a Windows/SMB network share directly
@@ -1639,9 +1640,12 @@ def job_cancel(jid):
         conn.commit()
         conn.close()
     with JOB_QUEUE_LOCK:
-        if jid in JOB_QUEUE:
-            JOB_QUEUE.remove(jid)
-            job_set(jid, error='Cancelled', status='cancelled')
+        waiting = jid in JOB_QUEUE
+    if waiting:
+        _queue_remove(jid)
+        job_set(jid, error='Cancelled', status='cancelled')
+        with GATE.cond:
+            GATE.cond.notify_all()
     return True
 
 def job_get(jid):
@@ -1743,8 +1747,85 @@ AI_NUM_PREDICT = int(os.environ.get('AI_NUM_PREDICT', 400))
 AI_STRUCTURED_OK = True
 AI_NEUTRAL_SCORE = 3  # mid-range prior (on the 1-5 vision scale) for scenes that weren't or couldn't be scored
 GATE = JobGate(MAX_CONCURRENT_JOBS)
-JOB_QUEUE = []  # job_ids waiting for a free slot, in submission order
+JOB_QUEUE = []  # job_ids waiting for a free slot, in the order they will start (see _queue_sort)
 JOB_QUEUE_LOCK = threading.Lock()
+
+# ---- Queue priority ----
+# The concurrency limit is shared by every feature, so when it is full the
+# order of the wait line decides who goes next. It is by priority, then by
+# submission order within one priority. A job starts at its feature's default
+# (JOB_KIND_PRIORITY: an on-air plug is time-critical, a batch of social
+# shorts can wait) and an admin can move a waiting job to another level from
+# Config > Jobs. Running jobs are never interrupted: priority only orders the
+# wait line.
+PRIORITY_LEVELS = ('urgent', 'high', 'normal', 'low')
+PRIORITY_LABELS = {'urgent': 'Urgent', 'high': 'High', 'normal': 'Normal', 'low': 'Low'}
+_PRIORITY_RANK = {p: i for i, p in enumerate(PRIORITY_LEVELS)}
+
+
+def _kind_priorities():
+    """Each feature's default level. JOB_KIND_PRIORITY=promo:high,schedule:high,shorts:normal overrides."""
+    out = {'promo': 'high', 'schedule': 'high', 'shorts': 'normal'}
+    for part in os.environ.get('JOB_KIND_PRIORITY', '').split(','):
+        kind, _, level = part.partition(':')
+        kind, level = kind.strip().lower(), level.strip().lower()
+        if kind in out and level in _PRIORITY_RANK:
+            out[kind] = level
+    return out
+
+
+JOB_KIND_PRIORITY = _kind_priorities()
+JOB_QUEUE_META = {}   # job id -> {'priority', 'seq', 'manual'}, while it waits
+_QUEUE_SEQ = itertools.count()
+
+
+def _queue_key(jid):
+    m = JOB_QUEUE_META.get(jid) or {}
+    return (_PRIORITY_RANK.get(m.get('priority'), _PRIORITY_RANK['normal']), m.get('seq', float('inf')))
+
+
+def _queue_sort():
+    """Caller holds JOB_QUEUE_LOCK."""
+    JOB_QUEUE.sort(key=_queue_key)
+
+
+def _queue_add(jid, kind=None):
+    with JOB_QUEUE_LOCK:
+        JOB_QUEUE_META[jid] = {'priority': JOB_KIND_PRIORITY.get(kind, 'normal'), 'seq': next(_QUEUE_SEQ),
+                               'manual': False}
+        JOB_QUEUE.append(jid)
+        _queue_sort()
+
+
+def _queue_remove(jid):
+    with JOB_QUEUE_LOCK:
+        if jid in JOB_QUEUE:
+            JOB_QUEUE.remove(jid)
+        JOB_QUEUE_META.pop(jid, None)
+
+
+def job_priority(jid):
+    """(level, set by hand?) for a waiting job; (None, False) for any other."""
+    with JOB_QUEUE_LOCK:
+        m = JOB_QUEUE_META.get(jid) if jid in JOB_QUEUE else None
+    return (m['priority'], m['manual']) if m else (None, False)
+
+
+def job_set_priority(jid, level):
+    """Moves a waiting job to another priority level. It keeps its place
+    among the jobs already at that level that were submitted before it.
+    False when the job is not waiting (already started, finished, unknown)."""
+    if level not in _PRIORITY_RANK:
+        raise ValueError(f'unknown priority {level!r}')
+    with JOB_QUEUE_LOCK:
+        if jid not in JOB_QUEUE:
+            return False
+        m = JOB_QUEUE_META.setdefault(jid, {'seq': next(_QUEUE_SEQ)})
+        m['priority'], m['manual'] = level, True
+        _queue_sort()
+    with GATE.cond:
+        GATE.cond.notify_all()
+    return True
 
 def run_trailer_job_gated(jid, params, runner=None):
     """Entry point used for every submitted job: waits for a free concurrency
@@ -1758,24 +1839,29 @@ def run_trailer_job_gated(jid, params, runner=None):
     limit instead of each feature keeping its own: MAX_CONCURRENT_JOBS is a
     cap on what the server can run at once, and a second, separate gate would
     quietly let twice as many ffmpeg/GPU jobs run as that setting says."""
-    with JOB_QUEUE_LOCK:
-        JOB_QUEUE.append(jid)
+    job = job_get(jid)
+    _queue_add(jid, (job or {}).get('kind'))
     acquired_slot = False
     try:
         with GATE.cond:
-            while GATE.running >= GATE.limit:
+            # A free slot goes to the front of the wait line (see _queue_sort),
+            # not to whichever waiting thread happens to wake first: with N slots
+            # free, the first N in line may start.
+            while True:
                 with JOB_QUEUE_LOCK:
                     if jid not in JOB_QUEUE:  # cancelled while waiting
                         return
                     ahead = JOB_QUEUE.index(jid)
+                if ahead < GATE.limit - GATE.running:
+                    break
                 job_set(jid, step=(f'Queued — {ahead} job(s) ahead' if ahead else 'Queued — starting shortly'),
                         percent=0, status='queued')
                 GATE.cond.wait(timeout=2)
             GATE.running += 1
             acquired_slot = True
-        with JOB_QUEUE_LOCK:
-            if jid in JOB_QUEUE:
-                JOB_QUEUE.remove(jid)
+        _queue_remove(jid)
+        with GATE.cond:
+            GATE.cond.notify_all()            # the next in line may now be within reach of a free slot
         job_set(jid, step='Starting', percent=1, status='running')
         (runner or run_trailer_job)(jid, params)
     finally:
@@ -1797,9 +1883,9 @@ def run_trailer_job_gated(jid, params, runner=None):
             with GATE.cond:
                 GATE.running = max(0, GATE.running - 1)
                 GATE.cond.notify_all()
-        with JOB_QUEUE_LOCK:
-            if jid in JOB_QUEUE:
-                JOB_QUEUE.remove(jid)
+        _queue_remove(jid)
+        with GATE.cond:
+            GATE.cond.notify_all()
 
 GENRE_PROMPTS = {
     'action': 'Epic cinematic action trailer score, 150 BPM, powerful orchestral percussion, aggressive taiko drums, bold brass stabs, driving string ostinatos, rising tension, heroic energy, blockbuster soundtrack, high impact dynamics, instrumental only, no vocals',
@@ -9178,9 +9264,11 @@ def _monitor_snapshot(filter_user_id=None, include_username=False, kind=None):
     for i, jid in enumerate(queued_ids):
         if jid not in snapshot:
             continue
+        level, manual = job_priority(jid)
         entry = {'job_id': jid, 'position': i,
                  'orig_name': snapshot[jid].get('orig_name'),
-                 'user_id': snapshot[jid].get('user_id'), 'kind': snapshot[jid].get('kind')}
+                 'user_id': snapshot[jid].get('user_id'), 'kind': snapshot[jid].get('kind'),
+                 'priority': level, 'priority_label': PRIORITY_LABELS.get(level), 'priority_manual': manual}
         if include_username:
             entry['username'] = snapshot[jid].get('username')
         queued.append(entry)
@@ -9240,7 +9328,9 @@ def api_admin_jobs():
     active, queued, finished = _monitor_snapshot(filter_user_id=None, include_username=True)
     gate = GATE.status()
     return jsonify(ok=True, active=active, queued=queued, finished=finished[:50],
-                   limit=gate['limit'], running=gate['running'])
+                   limit=gate['limit'], running=gate['running'],
+                   priorities=[{'value': p, 'label': PRIORITY_LABELS[p]} for p in PRIORITY_LEVELS],
+                   kind_priority=JOB_KIND_PRIORITY)
 
 
 @app.route('/api/admin/jobs/<job_id>/cancel', methods=['POST'])
@@ -9263,6 +9353,26 @@ def api_admin_job_cancel(job_id):
               user_id=session.get('user_id'), username=session.get('username'),
               ip=_client_ip())
     return jsonify(ok=True, cancelled=True, job_id=job_id)
+
+@app.route('/api/admin/jobs/<job_id>/priority', methods=['POST'])
+def api_admin_job_priority(job_id):
+    """Admin-only: move a waiting job to another priority level ({"priority": "urgent"|"high"|"normal"|"low"})."""
+    if session.get('role') != 'admin':
+        return jsonify(ok=False, error='Admin access required.'), 403
+    level = str((request.get_json(silent=True) or {}).get('priority') or request.form.get('priority') or '').strip().lower()
+    if level not in PRIORITY_LEVELS:
+        return jsonify(ok=False, error='Priority must be one of: ' + ', '.join(PRIORITY_LEVELS) + '.'), 400
+    j = job_get(job_id)
+    if not j:
+        return jsonify(ok=False, error='Unknown job id'), 404
+    if not job_set_priority(job_id, level):
+        return jsonify(ok=False, error='Only a job that is still waiting can be reprioritised.'), 409
+    audit_log('job_priority', target=j.get('orig_name') or job_id, detail=f'priority={level}',
+              user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    with JOB_QUEUE_LOCK:
+        position = JOB_QUEUE.index(job_id) if job_id in JOB_QUEUE else None
+    return jsonify(ok=True, job_id=job_id, priority=level, position=position)
+
 
 @app.route('/api/queue/status')
 def api_queue_status():

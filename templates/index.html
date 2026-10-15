@@ -13632,6 +13632,7 @@ function switchDocs(btn){
 <div id="p-jobs" class="panel{{ ' active' if default_tab == 'p-jobs' else '' }}">
 <h2>Jobs</h2>
 <p style="margin-top:6px;color:var(--ink-dim)">All jobs across every account and every feature &mdash; episodic plugs, Vertical Shorts and Schedule Plugs share one queue. Cancel active or queued work from here.</p>
+<p style="margin-top:-4px;color:var(--ink-dim);font-size:12px">When every slot is busy, waiting jobs start by <b>priority</b>, then in the order they came in. Episodic plugs and Schedule Plugs start at <b>High</b>, Vertical Shorts at <b>Normal</b>; change a waiting job&rsquo;s priority from its menu under <em>Queued</em> (<b>Urgent</b> puts it first). A job already running is never stopped for another.</p>
 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
   <button type="button" class="btn" onclick="loadAdminJobs()">Refresh</button>
   <span id="config-jobs-summary" style="font-size:12px;opacity:.7"></span>
@@ -14449,7 +14450,7 @@ async function loadAuditLog(){
       user_disable: 'Disabled account', user_2fa_reset: 'Reset 2FA', user_password_reset: 'Reset password',
       user_delete: 'Deleted account', trailer_delete: 'Deleted plug', trailer_generate: 'Generated promo',
       network_folder_change: 'Changed network folder', production_defaults_change: 'Changed production defaults',
-      branding_change: 'Changed branding', job_cancel: 'Cancelled job'
+      branding_change: 'Changed branding', job_cancel: 'Cancelled job', job_priority: 'Changed job priority'
     }
     var rows = d.items.map(function(it){
       var when = new Date(it.created_at * 1000).toLocaleString()
@@ -14477,6 +14478,8 @@ async function loadAdminJobs(){
   var finishedEl = document.getElementById('config-jobs-finished')
   var summaryEl = document.getElementById('config-jobs-summary')
   if(!activeEl) return
+  // Redrawing the list closes an open priority menu: wait until it is closed.
+  if(document.activeElement && document.activeElement.hasAttribute && document.activeElement.hasAttribute('data-admin-priority')) return
   try{
     var r = await fetch('/api/admin/jobs')
     var d = await r.json()
@@ -14506,15 +14509,36 @@ async function loadAdminJobs(){
         '<span class="m-pct">' + pct + '%</span>' + cancelling +
       '</div>'
     }).join('')
+    // Waiting jobs start in this order: priority first, then the order they came in.
+    function prioritySel(j){
+      var opts = (d.priorities || []).map(function(p){
+        return '<option value="' + p.value + '"' + (p.value === j.priority ? ' selected' : '') + '>' + escapeHtmlLite(p.label) + '</option>' }).join('')
+      return '<select class="input-box" data-admin-priority="' + j.job_id + '" title="' +
+        (j.priority_manual ? 'Set by an admin' : 'Default for this kind of job') +
+        '" style="width:auto;margin:0;padding:2px 6px;font-size:11px;height:auto' + (j.priority_manual ? ';border-color:var(--amber)' : '') + '">' + opts + '</select>'
+    }
     if(!d.queued.length) queuedEl.innerHTML = empty('Nothing waiting.')
     else queuedEl.innerHTML = d.queued.map(function(j){
       var who = j.username ? ' · ' + escapeHtmlLite(j.username) : ''
       return '<div class="monitor-row">' +
         kindTag(j) + '<span class="m-name">' + escapeHtmlLite(j.orig_name || 'Untitled') + who + '</span>' +
-        '<span class="m-pos">' + (j.position === 0 ? 'starting shortly' : j.position + ' ahead') + '</span>' +
-        cancelBtn(j.job_id) +
+        '<span class="m-pos">' + (j.position === 0 ? 'next in line' : j.position + ' ahead') + '</span>' +
+        prioritySel(j) + cancelBtn(j.job_id) +
       '</div>'
     }).join('')
+    queuedEl.querySelectorAll('[data-admin-priority]').forEach(function(sel){
+      sel.addEventListener('change', async function(){
+        var jid = sel.getAttribute('data-admin-priority')
+        sel.disabled = true
+        try{
+          var pd = await (await fetch('/api/admin/jobs/' + encodeURIComponent(jid) + '/priority', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify({priority: sel.value})})).json()
+          if(!pd.ok) alert(pd.error || 'Could not change the priority.')
+        }catch(e){ alert('Could not change the priority: ' + e) }
+        sel.blur()
+        loadAdminJobs()
+      })
+    })
     if(!d.finished.length) finishedEl.innerHTML = empty('Nothing finished recently.')
     else finishedEl.innerHTML = d.finished.map(function(j){
       var badge = j.status === 'cancelled' ? '<span class="monitor-badge cancel">Cancelled</span>'
