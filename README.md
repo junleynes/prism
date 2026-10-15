@@ -27,58 +27,135 @@ Self-hosted toolkit for producing broadcast episodic promos end to end — from 
 
 ## Install
 
-**Quick install**
+**Requirements**
+
+| | |
+|---|---|
+| Python | 3.11 or newer (3.12 recommended) |
+| PostgreSQL | 13 or newer, on this server or another one |
+| ffmpeg / ffprobe | on the system PATH |
+| Git | or a downloaded copy of the repo |
+
+PRISM keeps accounts, groups, the trailer library index, the audit log, jobs, AI chat memory and show templates in **PostgreSQL**. Media (renders, uploads, template files) stays on disk under `LIBRARY_DIR` / `TEMPLATES_DIR`. The app will not start until it can reach the database.
+
+Full walkthroughs, including running PRISM as a service:
+
+- [Windows Server 2022](docs/INSTALL-WINDOWS.md): Python, ffmpeg, PostgreSQL, NSSM service, firewall
+- [Linux](docs/INSTALL-LINUX.md): Ubuntu/Debian and RHEL family, systemd, nginx
+- [PostgreSQL setup and connecting](docs/POSTGRESQL.md): roles, connection strings, remote server, TLS, backups, troubleshooting
+
+The short version follows.
+
+### 1. Install PostgreSQL and create the database
+
+**Linux (Ubuntu / Debian)**
+
+```bash
+sudo apt install -y postgresql
+sudo -u postgres psql -c "CREATE ROLE prism LOGIN PASSWORD 'CHOOSE_A_PASSWORD'" -c "CREATE DATABASE prism OWNER prism"
+```
+
+**Windows**: install PostgreSQL with the EDB installer (<https://www.enterprisedb.com/downloads/postgres-postgresql-downloads>), keep port `5432`, then in PowerShell (adjust `16` to your version):
+
+```powershell
+& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -h localhost -c "CREATE ROLE prism LOGIN PASSWORD 'CHOOSE_A_PASSWORD'" -c "CREATE DATABASE prism OWNER prism"
+```
+
+The `prism` role owns the database, so PRISM creates its own tables on first start. It needs no superuser rights.
+
+### 2. Get the code and Python packages
+
+**Quick install** (clones the repo into `./prism`, creates `venv`, installs requirements, copies `.env.example` to `.env`):
 
 ```bash
 # Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/junleynes/eyan/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/junleynes/prism/main/install.sh | bash
 # optional: also install ffmpeg
-curl -fsSL https://raw.githubusercontent.com/junleynes/eyan/main/install.sh | bash -s -- --with-ffmpeg
+curl -fsSL https://raw.githubusercontent.com/junleynes/prism/main/install.sh | bash -s -- --with-ffmpeg
 ```
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/junleynes/eyan/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/junleynes/prism/main/install.ps1 | iex
 # optional: also install ffmpeg
-$env:EYAN_WITH_FFMPEG = '1'; irm https://raw.githubusercontent.com/junleynes/eyan/main/install.ps1 | iex
+$env:PRISM_WITH_FFMPEG = '1'; irm https://raw.githubusercontent.com/junleynes/prism/main/install.ps1 | iex
 ```
 
 **Manual**
 
 ```bash
-git clone https://github.com/junleynes/eyan.git
-cd eyan
-./install.sh          # or install.ps1 on Windows
+git clone https://github.com/junleynes/prism.git
+cd prism
+./install.sh          # or .\install.ps1 on Windows
 # optional: ./install.sh --with-ffmpeg
 ```
 
-**Requirements:** Python 3.11+, PostgreSQL 13+, ffmpeg/ffprobe, Git (or a downloaded copy of the repo).
+The scripts do not install or configure PostgreSQL (step 1).
 
-**Database:** PRISM stores accounts, the trailer library index, audit log, jobs, chat memory and show templates in **PostgreSQL**. Create a database and set `DATABASE_URL` in `.env` before the first run — the app will not start without it. Walkthroughs:
+### 3. Connect PRISM to PostgreSQL
 
-- [Windows Server 2022](docs/INSTALL-WINDOWS.md) — Python, ffmpeg, PostgreSQL, run as a service
-- [Linux](docs/INSTALL-LINUX.md) — Ubuntu/Debian and RHEL-family, systemd
-- [PostgreSQL setup and connecting](docs/POSTGRESQL.md) — roles, `DATABASE_URL`, remote access, TLS, backups, and moving an existing SQLite install across with `migrate_sqlite_to_postgres.py`
+Edit `.env` in the app folder and add, uncommented:
 
-**Run**
+```
+DATABASE_URL=postgresql://prism:CHOOSE_A_PASSWORD@localhost:5432/prism
+```
+
+Format: `postgresql://USER:PASSWORD@HOST:PORT/DATABASE`. For a database on another server, use its host name; add `?sslmode=require` to encrypt the connection. Characters such as `@ : / ? # %` in the password must be percent-encoded (`@` becomes `%40`), or use the `PGHOST` / `PGPORT` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` variables instead, which need no encoding. Pool sizes, timeouts and DBA-managed schemas: [docs/POSTGRESQL.md](docs/POSTGRESQL.md).
+
+Check the connection before starting the app:
 
 ```bash
-# Linux / macOS
-source venv/bin/activate
-python3 main.py
+venv/bin/python database.py            # Linux / macOS
+.\venv\Scripts\python.exe database.py   # Windows
+```
 
-# Windows
-venv\Scripts\Activate.ps1
-python main.py
+```
+OK: connected to database "prism" as "prism"
+PostgreSQL 16.x ...
+Schema is in place.
+```
+
+On failure it prints the reason and the `user@host:port/database` it tried (never the password). Common causes are in the [troubleshooting table](docs/POSTGRESQL.md#8-troubleshooting).
+
+**Upgrading an install that used SQLite** (`users.db`, `library.db`, `chat_memory.db`, `templates.db`)? Stop the old app, then before the first start:
+
+```bash
+venv/bin/python migrate_sqlite_to_postgres.py --dry-run   # count only
+venv/bin/python migrate_sqlite_to_postgres.py             # copy
+```
+
+It copies everything except the job history, keeps ids, runs in one transaction and leaves the `.db` files untouched. Details: [docs/POSTGRESQL.md, section 6](docs/POSTGRESQL.md#6-moving-an-existing-sqlite-install-across).
+
+### 4. Run
+
+```bash
+venv/bin/python main.py                # Linux / macOS
+.\venv\Scripts\python.exe main.py       # Windows
 ```
 
 Open **http://localhost:5000**. On first run (empty database), a default admin account is created and its credentials are printed once to the console. Set `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env` beforehand to choose them yourself.
+
+To start PRISM with the server, run it as a service: systemd on Linux, NSSM on Windows (see the walkthroughs above).
 
 Production traffic is served by waitress by default (single-process, multi-threaded). Set `DEV_SERVER=1` only for local troubleshooting.
 
 **Reset admin password:** set `RESET_ADMIN=1` in `.env` (optionally with new `ADMIN_USERNAME` / `ADMIN_PASSWORD`), restart, then remove `RESET_ADMIN`.
 
-Copy `.env.example` → `.env` and uncomment only the variables you want to override with real values. Leaving a line blank after `=` is not the same as leaving it commented out.
+**Configuration:** `.env.example` lists every setting, all commented out. Uncomment only the ones you want to change. Leaving a line blank after `=` is not the same as leaving it commented out.
+
+### Backups
+
+Back up the database and the media folders together; the database indexes the files.
+
+```bash
+pg_dump -h localhost -U prism -Fc -f prism.dump prism
+```
+
+Also copy `LIBRARY_DIR`, `TEMPLATES_DIR`, `.env`, `.secret_key` and the `*.json` config files in the app folder. Restore and scheduling: [docs/POSTGRESQL.md, section 7](docs/POSTGRESQL.md#7-backup-and-restore).
+
+### Tests
+
+The test suite needs its own empty database: set `TEST_DATABASE_URL` (see [tests/README.md](tests/README.md)).
 
 ## Security
 

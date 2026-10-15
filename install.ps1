@@ -1,24 +1,24 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  EYAN install script (Windows). Two ways to run it:
+  PRISM install script (Windows). Two ways to run it:
 
     Already have the repo:
       .\install.ps1
 
     Don't have it yet -- fetches the repo itself, then installs:
-      irm https://raw.githubusercontent.com/junleynes/eyan/main/install.ps1 | iex
+      irm https://raw.githubusercontent.com/junleynes/prism/main/install.ps1 | iex
 
 .DESCRIPTION
   0. If core.py isn't found in the current directory, clones the repo
-     into .\eyan first (via git if available, else a downloaded ZIP) and
+     into .\prism first (via git if available, else a downloaded ZIP) and
      continues from inside it. Skipped entirely if you already have the
      repo and ran this from inside it.
   1. Checks for Python 3.11+ (numpy 2.4.x, pinned in requirements.txt, needs it).
   2. Checks for ffmpeg/ffprobe on PATH -- external programs the render
      pipeline shells out to, not something pip can install. Pass
      -WithFFmpeg (or, when piping to iex where switches can't be passed
-     through, set $env:EYAN_WITH_FFMPEG = '1' first) to have this script
+     through, set $env:PRISM_WITH_FFMPEG = '1' first) to have this script
      install them via winget; otherwise it just tells you how.
   3. Creates a venv\ virtual environment and installs requirements.txt
      into it.
@@ -43,14 +43,14 @@
 .PARAMETER WithFFmpeg
   Also install ffmpeg via winget if it isn't already on PATH. Only usable
   when running this as a real .ps1 file, not through `irm | iex` (iex
-  can't receive parameters) -- use $env:EYAN_WITH_FFMPEG = '1' for that.
+  can't receive parameters) -- use $env:PRISM_WITH_FFMPEG = '1' for that.
 #>
 param(
     [switch]$WithFFmpeg
 )
 
 $ErrorActionPreference = 'Stop'
-if ($env:EYAN_WITH_FFMPEG -eq '1') { $WithFFmpeg = $true }
+if ($env:PRISM_WITH_FFMPEG -eq '1' -or $env:EYAN_WITH_FFMPEG -eq '1') { $WithFFmpeg = $true }
 
 function Write-Info  { param($msg) Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok    { param($msg) Write-Host "  ok $msg" -ForegroundColor Green }
@@ -62,12 +62,12 @@ function Write-Fail  { param($msg) Write-Host "  error $msg" -ForegroundColor Re
 # script lives" -- that's only a real file path when run as .\install.ps1.
 # Piped in via `irm | iex`, there is no script file on disk at all, so
 # everything below works off the current directory instead, and
-# self-bootstraps by cloning the repo into .\eyan when core.py isn't
+# self-bootstraps by cloning the repo into .\prism when core.py isn't
 # already here.
 if (-not (Test-Path "core.py") -or -not (Test-Path "requirements.txt")) {
-    Write-Info "core.py not found here -- fetching the EYAN repo first"
-    $RepoUrl = "https://github.com/junleynes/eyan.git"
-    $RepoDir = "eyan"
+    Write-Info "core.py not found here -- fetching the PRISM repo first"
+    $RepoUrl = "https://github.com/junleynes/prism.git"
+    $RepoDir = "prism"
     if (Test-Path $RepoDir) {
         Write-Ok "$RepoDir\ already exists, using it"
     } elseif (Get-Command git -ErrorAction SilentlyContinue) {
@@ -75,10 +75,10 @@ if (-not (Test-Path "core.py") -or -not (Test-Path "requirements.txt")) {
         Write-Ok "cloned into $RepoDir\"
     } else {
         Write-Warn2 "git not found -- downloading a ZIP instead"
-        $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) "eyan-main.zip"
-        Invoke-WebRequest -Uri "https://github.com/junleynes/eyan/archive/refs/heads/main.zip" -OutFile $zipPath
+        $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) "prism-main.zip"
+        Invoke-WebRequest -Uri "https://github.com/junleynes/prism/archive/refs/heads/main.zip" -OutFile $zipPath
         Expand-Archive -Path $zipPath -DestinationPath "." -Force
-        Rename-Item -Path "eyan-main" -NewName $RepoDir
+        Rename-Item -Path "prism-main" -NewName $RepoDir
         Remove-Item $zipPath
         Write-Ok "downloaded into $RepoDir\"
     }
@@ -135,7 +135,7 @@ if ($missingFFmpeg) {
         Write-Info "Installing ffmpeg (-WithFFmpeg was passed)"
         if (Get-Command winget -ErrorAction SilentlyContinue) {
             winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements
-            Write-Warn2 "winget finished -- you may need to open a NEW terminal for the updated PATH to take effect before running EYAN."
+            Write-Warn2 "winget finished -- you may need to open a NEW terminal for the updated PATH to take effect before running PRISM."
         } else {
             Write-Fail "winget isn't available. Install ffmpeg manually from https://ffmpeg.org/download.html and add it to PATH, then re-run."
         }
@@ -179,7 +179,7 @@ if (Test-Path ".env") {
 Write-Host ""
 Write-Host "Install complete." -ForegroundColor Green
 Write-Host ""
-Write-Host "To run EYAN:"
+Write-Host "To run PRISM:"
 Write-Host "  venv\Scripts\Activate.ps1"
 Write-Host "  python main.py"
 Write-Host ""

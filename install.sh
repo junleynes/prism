@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# EYAN install script (Linux). Two ways to run it:
+# PRISM install script (Linux). Two ways to run it:
 #
 #   Already have the repo:
 #     ./install.sh
 #
 #   Don't have it yet -- fetches the repo itself, then installs:
-#     curl -fsSL https://raw.githubusercontent.com/junleynes/eyan/main/install.sh | bash
-#     curl -fsSL https://raw.githubusercontent.com/junleynes/eyan/main/install.sh | bash -s -- --with-ffmpeg
+#     curl -fsSL https://raw.githubusercontent.com/junleynes/prism/main/install.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/junleynes/prism/main/install.sh | bash -s -- --with-ffmpeg
 #
 # What this does:
 #   0. If core.py isn't found in the current directory, clones the repo
-#      into ./eyan first (via git if available, else a downloaded tarball)
+#      into ./prism first (via git if available, else a downloaded tarball)
 #      and continues from inside it. Skipped entirely if you already have
 #      the repo and ran this from inside it.
 #   1. Checks for Python 3.11+ (numpy 2.4.x, which requirements.txt pins,
@@ -67,11 +67,11 @@ fail()  { echo "${RED}  error${RESET} $1"; exit 1; }
 # that only points to a real file when run as ./install.sh. Piped in via
 # `curl | bash`, there is no script file on disk at all, so everything below
 # works off the current directory instead, and self-bootstraps by cloning
-# the repo into ./eyan when core.py isn't already here.
+# the repo into ./prism when core.py isn't already here.
 if [ ! -f "core.py" ] || [ ! -f "requirements.txt" ]; then
-  info "core.py not found here -- fetching the EYAN repo first"
-  REPO_URL="https://github.com/junleynes/eyan.git"
-  REPO_DIR="eyan"
+  info "core.py not found here -- fetching the PRISM repo first"
+  REPO_URL="https://github.com/junleynes/prism.git"
+  REPO_DIR="prism"
   if [ -d "$REPO_DIR" ]; then
     ok "$REPO_DIR/ already exists, using it"
   elif command -v git >/dev/null 2>&1; then
@@ -79,8 +79,8 @@ if [ ! -f "core.py" ] || [ ! -f "requirements.txt" ]; then
     ok "cloned into $REPO_DIR/"
   else
     warn "git not found -- downloading a tarball instead"
-    curl -fsSL "https://github.com/junleynes/eyan/archive/refs/heads/main.tar.gz" | tar -xz
-    mv "eyan-main" "$REPO_DIR"
+    curl -fsSL "https://github.com/junleynes/prism/archive/refs/heads/main.tar.gz" | tar -xz
+    mv "prism-main" "$REPO_DIR"
     ok "downloaded into $REPO_DIR/"
   fi
   cd "$REPO_DIR"
@@ -178,7 +178,7 @@ fi
 echo
 echo "${BOLD}${GREEN}Install complete.${RESET}"
 echo
-echo "To run EYAN:"
+echo "To run PRISM:"
 echo "  source venv/bin/activate"
 echo "  python3 main.py"
 echo
