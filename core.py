@@ -82,8 +82,12 @@ _API_PREFIXES = ('/api/', '/uploads/', '/library/', '/download/')
 _ADMIN_PREFIX = '/admin/'
 
 def _client_ip():
-    fwd = request.headers.get('X-Forwarded-For', '')
-    return (fwd.split(',')[0].strip() if fwd else None) or request.remote_addr or 'unknown'
+    """The address rate limits and the audit log go by. With
+    TRUST_PROXY_HEADERS on, ProxyFix (above) has already set remote_addr from
+    the hops the proxy added; anything else in X-Forwarded-For was written by
+    the client, so it is never read here -- otherwise anyone could dodge the
+    login and download limits by sending a different address each time."""
+    return request.remote_addr or 'unknown'
 
 class _RateLimiter:
     def __init__(self, limit, window):

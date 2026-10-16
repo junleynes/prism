@@ -57,6 +57,25 @@ def _assume_ai_services_reachable(monkeypatch):
                         lambda name, url, path='/', timeout=3: {'name': name, 'url': url, 'status': 'up'})
 
 
+@pytest.fixture(autouse=True)
+def _sessions_for_made_up_accounts(request, monkeypatch):
+    """Most tests sign in by writing a session by hand for a made-up account
+    (user 1 'admin', user 7 'ana'...) that has no row in the users table, or
+    whose id belongs to some other row a previous test left. Production checks
+    every request against the account (auth._revalidate_session); that check
+    is off for those tests. Tests marked real_sessions -- the ones about
+    sessions -- get the production rule."""
+    if request.node.get_closest_marker('real_sessions'):
+        return
+    with mock.patch('requests.post'), mock.patch('requests.get'):
+        import auth
+    monkeypatch.setattr(auth, 'SESSION_REVALIDATE', False)
+
+
+def pytest_configure(config):
+    config.addinivalue_line('markers', 'real_sessions: sessions must belong to an existing account, as in production')
+
+
 @pytest.fixture
 def users_db(monkeypatch):
     """Empty account tables for one test, so account/TOTP/lockout tests can

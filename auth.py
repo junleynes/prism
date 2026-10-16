@@ -4,7 +4,7 @@ Depends on: core (app, rate limiter, dummy-hash, default password) and
 database (the PostgreSQL connection pool; accounts live in the `users`,
 `groups` and `group_permissions` tables -- see schema.sql).
 """
-import os, time, functools, secrets
+import os, re, time, functools, secrets
 from flask import request, session, redirect, jsonify, render_template
 from markupsafe import escape
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -31,6 +31,7 @@ def _establish_session(user):
     session['user_id'] = user['id']
     session['username'] = user['username']
     session['role'] = user['role']
+    session['sv'] = user.get('session_version') or 0
     # Fresh CSRF token per sign-in, and only after every factor has passed --
     # so a token handed out during the half-authenticated 2FA step can't be
     # reused against the fully-authenticated session.
@@ -44,6 +45,48 @@ def _establish_session(user):
     # this immediately, so it only applies to this one login.
     session['just_logged_in'] = True
     user_touch_login(user['id'])
+
+# Set to False only by the test suite (see tests/conftest.py), whose tests
+# mostly hand-write sessions for made-up accounts with no row in the users
+# table, or one that does not match it.
+SESSION_REVALIDATE = True
+
+def _revalidate_session():
+    """Every request from a signed-in session is checked against the account
+    as it is now, not as it was at sign-in (a Flask session is a signed
+    cookie, so nothing in it can be revoked by itself): the account must
+    still exist and be active, and its session_version must be the one the
+    session started with. The role and username are refreshed from the
+    database, so a demoted admin stops being an admin on their next click."""
+    if not SESSION_REVALIDATE or not session.get('authed') or request.path.startswith('/static/'):
+        return None
+    uid = session.get('user_id')
+    row = None
+    if uid is not None:
+        conn = database.connect()
+        try:
+            row = conn.execute('SELECT username, role, is_active, session_version FROM users WHERE id=%s',
+                               (uid,)).fetchone()
+        finally:
+            conn.close()
+    if row is None or not row['is_active'] or (row['session_version'] or 0) != (session.get('sv') or 0):
+        session.clear()
+        if request.path.startswith(('/api/', '/admin/', '/uploads/', '/library/', '/download/')):
+            return jsonify(error='Your session has ended. Sign in again.'), 401
+        return redirect('/')
+    session['role'] = row['role']
+    session['username'] = row['username']
+    return None
+
+# Before core.py's CSRF and access checks, which trust session['role'].
+app.before_request_funcs.setdefault(None, []).insert(0, _revalidate_session)
+
+def end_sessions(uid):
+    """Signs the account out everywhere: every existing session stops working."""
+    conn = database.connect()
+    conn.execute('UPDATE users SET session_version = session_version + 1 WHERE id=%s', (uid,))
+    conn.commit()
+    conn.close()
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -261,6 +304,8 @@ def api_2fa_disable():
     if not user_totp_verify(user, data.get('code')):
         return jsonify(ok=False, error='Enter a current code from your authenticator app (or a backup code) to turn 2FA off.'), 400
     user_totp_disable(session['user_id'])
+    # Other sessions end (see user_totp_disable); this one, which just proved the code, carries on.
+    session['sv'] = (user_get(session['user_id']) or {}).get('session_version') or 0
     return jsonify(ok=True)
 
 
@@ -295,6 +340,10 @@ AVAILABLE_PERMISSIONS = [
     ('docs', 'Docs'),
 ]
 _PERMISSION_KEYS = {k for k, _ in AVAILABLE_PERMISSIONS}
+# Any tab that works with media. The network shares, the staged-file folder
+# (/uploads/) and the probe/convert helpers serve all of them, so they need one
+# of these -- not AI Chat or Docs alone.
+MEDIA_PERMISSIONS = tuple(k for k, _ in AVAILABLE_PERMISSIONS if k not in ('ai_chat', 'docs'))
 
 def users_db_init():
     # The tables themselves come from schema.sql. Notes on columns that live
@@ -393,6 +442,8 @@ def _password_policy_error(password):
         return False, 'That password is too common -- pick something less guessable.'
     return True, None
 
+_USERNAME_OK = re.compile(r'^[A-Za-z0-9._@-]+$')
+
 def user_create(username, password, role='user', active=True):
     """Create an account. `active=False` is used for self-registration (pending admin approval)."""
     username = (username or '').strip()
@@ -402,6 +453,10 @@ def user_create(username, password, role='user', active=True):
         return False, 'Username must be at least 3 characters.'
     if len(username) > 64:
         return False, 'Username is too long.'
+    if not _USERNAME_OK.match(username):
+        # Usernames are shown all over the app and in the audit log; markup
+        # characters in one are never legitimate.
+        return False, 'Use only letters, digits, dots, dashes, underscores or @ in a username.'
     ok, why = _password_policy_error(password)
     if not ok:
         return False, why
@@ -424,7 +479,8 @@ def user_set_password(uid, password):
     if not ok:
         return False, why
     conn = database.connect()
-    conn.execute('UPDATE users SET password_hash=%s WHERE id=%s', (generate_password_hash(password), uid))
+    conn.execute('UPDATE users SET password_hash=%s, session_version = session_version + 1 WHERE id=%s',
+                 (generate_password_hash(password), uid))
     conn.commit()
     conn.close()
     return True, None
@@ -448,7 +504,8 @@ def user_set_active(uid, active):
         if target and target['role'] == 'admin':
             return False, "Can't disable the last active admin."
     conn = database.connect()
-    conn.execute('UPDATE users SET is_active=%s WHERE id=%s', (1 if active else 0, uid))
+    conn.execute('UPDATE users SET is_active=%s, session_version = session_version + %s WHERE id=%s',
+                 (1 if active else 0, 0 if active else 1, uid))
     conn.commit()
     conn.close()
     return True, None
@@ -588,8 +645,10 @@ def user_totp_verify(user, code):
     return False
 
 def user_totp_disable(uid):
+    """Also ends the account's sessions: a reset is for a lost or stolen phone."""
     conn = database.connect()
-    conn.execute('UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_backup_codes=NULL WHERE id=%s', (uid,))
+    conn.execute('UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_backup_codes=NULL, '
+                 'session_version = session_version + 1 WHERE id=%s', (uid,))
     conn.commit()
     conn.close()
 
@@ -842,339 +901,19 @@ users_db_init()
 admin_reset_if_requested()
 
 # ---- Admin: user management ----
-# Simple server-rendered page; only reachable by an authenticated admin (see
-# _access_control's _ADMIN_PREFIX check). Anyone else gets a redirect/403.
-
-def _twofa_cell(u):
-    """The 2FA column for one row: status, plus a Reset button when it's on.
-    Reset is the lost-phone escape hatch -- an admin can clear someone's 2FA
-    but never enrol it for them (see admin_users_2fa_reset)."""
-    if not u['totp_enabled']:
-        return '<span style="opacity:.5;font-size:11px">off</span>'
-    return (f'<span class=you style="font-size:11px">on</span> '
-            f'<form method=post action="/admin/users/{u["id"]}/2fa/reset" class=inline-form '
-            f'onsubmit="return confirm(\'Clear 2FA for {escape(u["username"])}? '
-            f'They will sign in with just their password until they set it up again.\')">'
-            f'<button type=submit class="btn-sm btn-danger" style="padding:3px 7px;font-size:10px">Reset</button></form>')
-
-def _admin_users_page(error=None, notice=None):
-    # This page's forms post to state-changing routes, so they need the
-    # session's CSRF token (see _csrf_protect in core.py). ensure_csrf_token
-    # rather than reading session directly, so a session predating the CSRF
-    # feature gets one here instead of being unable to submit anything.
-    csrf_js = ensure_csrf_token()
-    users = user_list()
-    groups = group_list()
-    brand = load_branding()
-    brand_name = escape(brand['name'])
-    theme = brand['theme_colors']
-    rows = ''
-    for u in users:
-        created = time.strftime('%Y-%m-%d', time.localtime(u['created_at'])) if u['created_at'] else '—'
-        last_login = time.strftime('%Y-%m-%d %H:%M', time.localtime(u['last_login'])) if u['last_login'] else 'never'
-        is_you = (u['id'] == session.get('user_id'))
-        this_groups = escape(', '.join(u['group_names'])) if u['group_names'] else '<span style="opacity:.6">no group</span>'
-        rows += f'''<tr>
-<td>{u['username']}{' <span class="you">(you)</span>' if is_you else ''}</td>
-<td>
-  <form method=post action="/admin/users/{u['id']}/role" class=inline-form>
-    <select name=role onchange="this.form.submit()" {'disabled' if is_you else ''}>
-      <option value=user {'selected' if u['role']=='user' else ''}>user</option>
-      <option value=admin {'selected' if u['role']=='admin' else ''}>admin</option>
-    </select>
-  </form>
-</td>
-<td title="Change groups in Config &gt; Users">{this_groups}</td>
-<td>{'active' if u['is_active'] else 'pending / disabled'}</td>
-<td>{_twofa_cell(u)}</td>
-<td>{created}</td>
-<td>{last_login}</td>
-<td class=actions>
-  <form method=post action="/admin/users/{u['id']}/toggle" class=inline-form>
-    <button type=submit class=btn-sm {'disabled' if is_you else ''}>{'Disable' if u['is_active'] else 'Enable'}</button>
-  </form>
-  <form method=post action="/admin/users/{u['id']}/password" class=inline-form pw-form>
-    <input type=password name=password placeholder="New password" minlength=12 required>
-    <button type=submit class=btn-sm>Set</button>
-  </form>
-  <form method=post action="/admin/users/{u['id']}/delete" class=inline-form
-        onsubmit="return confirm('Delete user {u['username']}? This cannot be undone.')">
-    <button type=submit class="btn-sm btn-danger" {'disabled' if is_you else ''}>Delete</button>
-  </form>
-</td>
-</tr>'''
-
-    group_rows = ''
-    for g in groups:
-        checks = ''.join(
-            f'<label class=perm-check><input type=checkbox name=permission value={key} '
-            f'{"checked" if key in g["permissions"] else ""}> {label}</label>'
-            for key, label in AVAILABLE_PERMISSIONS)
-        group_rows += f'''<div class=group-card>
-<form method=post action="/admin/groups/{g['id']}/permissions">
-  <div class=group-head>
-    <strong>{g['name']}</strong>
-    <span class=group-meta>{g['member_count']} member{'s' if g['member_count'] != 1 else ''}</span>
-    <button type=submit class="btn-sm primary-sm">Save</button>
-    <button type=submit form=delgroup-{g['id']} class="btn-sm btn-danger"
-            onclick="return confirm('Delete group {g['name']}? Its members keep their other groups.')">Delete</button>
-  </div>
-  <div class=perm-grid>{checks}</div>
-</form>
-<form id=delgroup-{g['id']} method=post action="/admin/groups/{g['id']}/delete"></form>
-</div>'''
-    if not groups:
-        group_rows = '<p style="font-size:12px;opacity:.7;margin:4px 0 0">No groups yet. Accounts in no group see only the Dashboard and Docs.</p>'
-
-    return f'''<!doctype html><html><head><meta charset="utf-8">
-<title>Manage users &mdash; {brand_name}</title>
-<link rel="icon" href="/branding/favicon">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-:root{{
-  --bg:{theme['bg_dark']}; --panel:{theme['panel_dark']}; --panel-2:{theme['panel_2_dark']};
-  --elevated:{theme['elevated_dark']}; --line:#263149; --ink:#e7edf6; --ink-dim:#8b98ad;
-  --phosphor:{theme['phosphor']}; --amber:{theme['amber']}; --tally:{theme['tally']}; --accent:{theme['accent']};
-  --rail-bg:{theme['rail_bg_dark']};
-}}
-*{{box-sizing:border-box}}
-body{{
-  font-family:'IBM Plex Sans',system-ui,-apple-system,sans-serif; margin:0; color:var(--ink);
-  background:
-    radial-gradient(ellipse 900px 480px at 12% -12%, color-mix(in srgb, var(--phosphor) 7%, transparent), transparent 60%),
-    radial-gradient(ellipse 700px 420px at 100% 0%, color-mix(in srgb, var(--amber) 5%, transparent), transparent 55%),
-    var(--bg);
-  display:flex; min-height:100vh; -webkit-font-smoothing:antialiased;
-}}
-/* ---- Left rail -- same structural role as the main app's sidebar (brand
-   identity up top, a short nav, signed-in-as at the bottom), so this admin
-   page reads as part of the app rather than a separate unstyled backend
-   screen you can only leave via the browser's Back button. Not a byte-for-
-   byte copy of the real one (that's SPA-tab-driven; this is a handful of
-   plain links), but the same visual weight and position. ---- */
-.rail{{
-  width:220px; flex-shrink:0; background:var(--rail-bg); backdrop-filter:blur(12px);
-  border-right:1px solid var(--line); padding:20px 16px; display:flex; flex-direction:column;
-  position:sticky; top:0; height:100vh; overflow-y:auto;
-}}
-.rail-brand{{display:flex; align-items:center; gap:10px; margin-bottom:22px}}
-.rail-logo{{width:28px; height:28px; border-radius:7px; object-fit:contain; flex-shrink:0}}
-.rail-name{{font-family:'JetBrains Mono',monospace; font-size:14px; font-weight:700;
-  letter-spacing:.04em; text-transform:uppercase; line-height:1.2}}
-.rail-tagline{{font-family:'JetBrains Mono',monospace; font-size:9px; color:var(--ink-dim);
-  letter-spacing:.02em; margin-top:2px}}
-.rail-nav{{display:flex; flex-direction:column; gap:2px}}
-.rail-link{{
-  font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:.03em;
-  color:var(--ink-dim); text-decoration:none; padding:9px 10px; border-radius:7px;
-  display:flex; align-items:center; gap:8px; transition:background .15s,color .15s;
-}}
-.rail-link:hover{{background:var(--wash-4,rgba(255,255,255,.06)); color:var(--ink)}}
-.rail-link.active{{background:color-mix(in srgb, var(--phosphor) 12%, transparent); color:var(--phosphor)}}
-.rail-sep{{height:1px; background:var(--line); margin:12px 0; opacity:.6}}
-.rail-foot{{margin-top:auto; padding-top:16px; font-size:11px; color:var(--ink-dim); line-height:1.6}}
-.rail-foot a{{color:var(--ink-dim)}}
-.main{{flex:1; padding:32px 40px; min-width:0}}
-.wrap{{max-width:960px}}
-h1{{font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:600; text-transform:uppercase;
-  letter-spacing:.06em; margin:0 0 4px; color:var(--ink-dim); display:flex; align-items:center; gap:8px}}
-h1::before{{content:'\u25b6'; color:var(--phosphor); font-size:11px}}
-h2{{font-family:'JetBrains Mono',monospace; font-size:12px; text-transform:uppercase; letter-spacing:.05em;
-  color:var(--ink-dim); margin:0}}
-.card{{background:var(--elevated); border:1px solid var(--line); border-radius:12px; padding:20px; margin-top:20px}}
-table{{width:100%; border-collapse:collapse; font-size:13px}}
-th,td{{text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:middle}}
-th{{color:var(--ink-dim); font-family:'JetBrains Mono',monospace; font-weight:600; font-size:10px;
-  text-transform:uppercase; letter-spacing:.05em}}
-.you{{color:var(--phosphor); font-size:11px}}
-.inline-form{{display:inline-flex; gap:4px; align-items:center; margin:0 4px 0 0}}
-.actions{{display:flex; flex-wrap:wrap; gap:4px; align-items:center}}
-.pw-form input{{width:110px}}
-select,input{{background:var(--panel); border:1px solid var(--line); color:var(--ink);
-  border-radius:7px; padding:6px 8px; font-size:12px; font-family:inherit}}
-.btn-sm{{background:transparent; border:1px solid var(--phosphor); color:var(--phosphor);
-  font-family:'JetBrains Mono',monospace; text-transform:uppercase; letter-spacing:.03em;
-  border-radius:7px; padding:6px 10px; font-size:11px; cursor:pointer; transition:background .15s}}
-.btn-sm:hover{{background:color-mix(in srgb, var(--phosphor) 12%, transparent)}}
-.btn-sm:disabled{{opacity:.35; cursor:not-allowed}}
-.btn-danger{{color:var(--tally); border-color:var(--tally)}}
-.btn-danger:hover{{background:color-mix(in srgb, var(--tally) 12%, transparent)}}
-.primary-sm{{color:var(--phosphor); border-color:var(--phosphor); font-weight:600}}
-.add-form{{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px}}
-.add-form input{{flex:1; min-width:140px}}
-.primary{{background:var(--accent); border:none; color:#fff; font-family:'JetBrains Mono',monospace;
-  text-transform:uppercase; letter-spacing:.04em; border-radius:8px; padding:9px 18px; font-size:12px;
-  cursor:pointer; transition:opacity .15s}}
-.primary:hover{{opacity:.9}}
-.err{{background:color-mix(in srgb, var(--tally) 14%, transparent); border:1px solid color-mix(in srgb, var(--tally) 40%, transparent);
-  color:var(--tally); font-size:12px; padding:10px 12px; border-radius:8px; margin-bottom:16px}}
-.notice{{background:color-mix(in srgb, var(--phosphor) 14%, transparent); border:1px solid color-mix(in srgb, var(--phosphor) 40%, transparent);
-  color:var(--phosphor); font-size:12px; padding:10px 12px; border-radius:8px; margin-bottom:16px}}
-.group-card{{border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-top:12px}}
-.group-head{{display:flex; align-items:center; gap:10px; margin-bottom:10px}}
-.group-meta{{color:var(--ink-dim); font-size:11px; flex:1}}
-.perm-grid{{display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:6px 14px}}
-.group-check{{display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; color:var(--ink)}}
-</style></head><body>
-<div class="main"><div class=wrap>
-{f'<div class="err">{error}</div>' if error else ''}
-{f'<div class="notice">{notice}</div>' if notice else ''}
-<div class=card>
-<table>
-<tr><th>Username</th><th>Role</th><th>Group</th><th>Status</th><th>2FA</th><th>Created</th><th>Last login</th><th>Actions</th></tr>
-{rows}
-</table>
-</div>
-<div class=card>
-<h2>Add user</h2>
-<form method=post action="/admin/users/create" class=add-form>
-<input type=text name=username placeholder="Username" required>
-<input type=password name=password placeholder="Password (min 12 chars)" minlength=12 required>
-<select name=role><option value=user selected>user</option><option value=admin>admin</option></select>
-<button type=submit class=primary>Create</button>
-</form>
-</div>
-<div class=card>
-<h2>Groups</h2>
-<p style="font-size:12px;opacity:.7;margin:8px 0 0">A group grants the checked tabs. An account can be in several groups and gets every tab any of them grants; an account in no group sees only the Dashboard and Docs. Admins always have full access. Assign groups in Config &gt; Users.</p>
-{group_rows}
-<form method=post action="/admin/groups/create" class=add-form style="margin-top:14px">
-<input type=text name=name placeholder="New group name (e.g. Editors)" required>
-<button type=submit class=primary>Create group</button>
-</form>
-</div>
-</div></div>
-<script>
-// Every form on this page posts to a state-changing route, so each needs the
-// session's CSRF token. Tagging them once here rather than adding a hidden
-// input to ~10 separate form templates -- and, more usefully, a form added
-// later is covered automatically instead of silently 403ing.
-(function(){{
-  var token = {csrf_js!r};
-  if(!token) return;
-  document.querySelectorAll('form').forEach(function(f){{
-    var i = document.createElement('input');
-    i.type = 'hidden'; i.name = '_csrf'; i.value = token;
-    f.appendChild(i);
-  }});
-}})()
-</script>
-</body></html>'''
-
+# Config > Users drives everything below through JSON. The old standalone,
+# server-rendered /admin/users page and its form-posting routes were removed:
+# nothing used them any more, and the page wrote usernames into its HTML
+# unescaped (a self-registered username could run script as an admin).
 @app.route('/admin/users')
 def admin_users():
-    # Direct navigation here (bookmarked, typed in, an old link) now redirects
-    # into the app instead of showing the old standalone page -- user
-    # management is only meant to be reached via Config > Users from here on.
-    # The Config > Users iframe itself loads this exact URL with ?embed=1, so
-    # that specific request still renders the real page; everything else
-    # bounces to '/', where Config > Users is one click away.
-    if request.args.get('embed') != '1':
-        return redirect('/')
-    return _admin_users_page()
+    """Old bookmarks land in the app, where Config > Users is one click away."""
+    return redirect('/')
 
-@app.route('/admin/users/create', methods=['POST'])
-def admin_users_create():
-    uname = request.form.get('username', '')
-    ok, err = user_create(uname, request.form.get('password', ''),
-                           request.form.get('role', 'user'))
-    if ok:
-        audit_log('user_create', target=uname, detail=f"role={request.form.get('role', 'user')}",
-                   user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
-    return _admin_users_page(error=None if ok else err, notice='User created.' if ok else None)
-
-@app.route('/admin/users/<int:uid>/role', methods=['POST'])
-def admin_users_role(uid):
-    target = user_get(uid)
-    new_role = request.form.get('role', 'user')
-    ok, err = user_set_role(uid, new_role)
-    if ok and target:
-        audit_log('user_role_change', target=target['username'],
-                   detail=f"{target['role']} -> {new_role}",
-                   user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
-    return _admin_users_page(error=None if ok else err, notice='Role updated.' if ok else None)
-
-@app.route('/admin/users/<int:uid>/toggle', methods=['POST'])
-def admin_users_toggle(uid):
-    target = user_get(uid)
-    if not target:
-        return _admin_users_page(error='User not found.')
-    new_active = not target['is_active']
-    ok, err = user_set_active(uid, new_active)
-    if ok:
-        audit_log('user_enable' if new_active else 'user_disable', target=target['username'],
-                   user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
-    return _admin_users_page(error=None if ok else err, notice='Status updated.' if ok else None)
-
-@app.route('/admin/users/<int:uid>/2fa/reset', methods=['POST'])
-def admin_users_2fa_reset(uid):
-    """Clears another account's 2FA entirely -- the lost-phone escape hatch.
-    Admins can only turn it OFF, never enrol on someone's behalf: enrolling
-    would mean an admin holding a secret that's meant to be the user's alone.
-    The user then re-enrols themselves from Config > Security."""
-    target = user_get(uid)
-    if not target:
-        return _admin_users_page(error='No such account.')
-    user_totp_disable(uid)
-    audit_log('user_2fa_reset', target=target['username'],
-               user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
-    return _admin_users_page(notice=f"Two-factor authentication cleared for {target['username']} — "
-                                    "they can set it up again from Config > Security.")
-
-@app.route('/admin/users/<int:uid>/password', methods=['POST'])
-def admin_users_password(uid):
-    target = user_get(uid)
-    ok, err = user_set_password(uid, request.form.get('password', ''))
-    if ok and target:
-        # Never log the password itself, obviously -- just that it happened,
-        # by whom, and to whom.
-        audit_log('user_password_reset', target=target['username'],
-                   user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
-    return _admin_users_page(error=None if ok else err, notice='Password updated.' if ok else None)
-
-@app.route('/admin/users/<int:uid>/delete', methods=['POST'])
-def admin_users_delete(uid):
-    if uid == session.get('user_id'):
-        return _admin_users_page(error="You can't delete your own account while signed in as it.")
-    target = user_get(uid)
-    ok, err = user_delete(uid)
-    if ok and target:
-        audit_log('user_delete', target=target['username'],
-                   user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
-    return _admin_users_page(error=None if ok else err, notice='User deleted.' if ok else None)
-
-@app.route('/admin/users/<int:uid>/group', methods=['POST'])
-def admin_users_group(uid):
-    raw = request.form.get('group_id', '').strip()
-    gid = int(raw) if raw.isdigit() else None
-    ok, err = user_set_group(uid, gid)
-    return _admin_users_page(error=None if ok else err, notice='Group updated.' if ok else None)
-
-@app.route('/admin/groups/create', methods=['POST'])
-def admin_groups_create():
-    ok, err, _gid = group_create(request.form.get('name', ''))
-    return _admin_users_page(error=None if ok else err, notice='Group created -- check its permissions below, then assign accounts to it.' if ok else None)
-
-@app.route('/admin/groups/<int:gid>/permissions', methods=['POST'])
-def admin_groups_permissions(gid):
-    perms = request.form.getlist('permission')
-    ok, err = group_set_permissions(gid, perms)
-    return _admin_users_page(error=None if ok else err, notice='Permissions saved.' if ok else None)
-
-@app.route('/admin/groups/<int:gid>/delete', methods=['POST'])
-def admin_groups_delete(gid):
-    ok, err = group_delete(gid)
-    return _admin_users_page(error=None if ok else err, notice='Group deleted. Its members keep their other groups.' if ok else None)
 
 # ---- Admin: user management, JSON API ----
-# Same underlying functions as the form-posting routes above, but returning
-# JSON instead of a re-rendered page -- so Config > Users can be a normal
-# fetch-driven tab embedded in the main app shell (matching every other
-# Config tab: Network, Production, Security) instead of an <iframe> to a
-# separate server-rendered page. Left the HTML routes above in place rather
-# than deleting them -- no other caller depends on them, but there's no
-# reason to break a bookmark or script hitting them directly either.
+# Config > Users is a fetch-driven tab in the main app shell, like every
+# other Config tab.
 #
 # All under /admin/ so _access_control's existing admin-only gate covers
 # these automatically, same as everything else in this section.

@@ -4260,7 +4260,7 @@ document.addEventListener("DOMContentLoaded", function(){
       .then(function(r){ return r.json() })
       .then(function(d2){
         trNetworkFetchAbort = null
-        if(!d2.ok){ networkList.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + d2.error + '</div>'; return }
+        if(!d2.ok){ networkList.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + escapeHtmlLite(d2.error) + '</div>'; return }
         showNetworkPreview(d2.filename, d2.orig_name, d2.size)
       })
       .catch(function(e){
@@ -4374,7 +4374,7 @@ document.addEventListener("DOMContentLoaded", function(){
     folders.forEach(function(f){
       var row = document.createElement('div')
       row.className = 'net-modal-row'
-      row.innerHTML = '<span class="row-name">&#128193; ' + f.name + '</span>'
+      row.innerHTML = '<span class="row-name">&#128193; ' + escapeHtmlLite(f.name) + '</span>'
       row.addEventListener('click', function(){
         loadNetworkList(subpath ? subpath + '\\' + f.name : f.name)
       })
@@ -4502,7 +4502,7 @@ document.addEventListener("DOMContentLoaded", function(){
     fetch('/api/network/search?category=hires&subpath=' + encodeURIComponent(trNetworkSubpath || '') + '&q=' + encodeURIComponent(q))
       .then(function(r){ return r.json() }).then(function(d){
         if(mySeq !== trNetworkSearchSeq) return  // a newer search has since been issued; this response is stale
-        if(!d.ok){ networkList.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + d.error + '</div>'; return }
+        if(!d.ok){ networkList.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + escapeHtmlLite(d.error) + '</div>'; return }
         renderTrNetworkSearchResults(d.files, d.truncated)
       }).catch(function(e){ if(mySeq === trNetworkSearchSeq) networkList.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + e + '</div>' })
   }
@@ -4533,7 +4533,7 @@ document.addEventListener("DOMContentLoaded", function(){
       var chip = document.createElement('div')
       chip.className = 'net-fav-chip'
       chip.title = f.path || '(category root)'
-      chip.innerHTML = '<span>&#9733;</span><span class="fav-label">' + f.label + '</span><span class="fav-remove">&#10005;</span>'
+      chip.innerHTML = '<span>&#9733;</span><span class="fav-label">' + escapeHtmlLite(f.label) + '</span><span class="fav-remove">&#10005;</span>'
       chip.querySelector('.fav-label').addEventListener('click', function(){ loadNetworkList(f.path) })
       chip.querySelector('span:first-child').addEventListener('click', function(){ loadNetworkList(f.path) })
       chip.querySelector('.fav-remove').addEventListener('click', function(e){
@@ -4582,7 +4582,7 @@ document.addEventListener("DOMContentLoaded", function(){
     trNetworkRecursiveCheckbox.checked = false
     networkList.innerHTML = 'Loading\u2026'
     fetch('/api/network/list?category=hires&subpath=' + encodeURIComponent(trNetworkSubpath)).then(function(r){ return r.json() }).then(function(d){
-      if(!d.ok){ networkList.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + d.error + '</div>'; return }
+      if(!d.ok){ networkList.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + escapeHtmlLite(d.error) + '</div>'; return }
       trNetworkSubpath = d.subpath || ''
       var pathEl = document.getElementById('tr-network-path')
       if(pathEl) buildNetworkBreadcrumb(pathEl, d.root, trNetworkSubpath, loadNetworkList)
@@ -15459,7 +15459,7 @@ document.addEventListener('DOMContentLoaded', function(){
     folders.forEach(function(f){
       var row = document.createElement('div')
       row.className = 'net-modal-row'
-      row.innerHTML = '<span class="row-name">&#128193; ' + f.name + '</span>'
+      row.innerHTML = '<span class="row-name">&#128193; ' + escapeHtmlLite(f.name) + '</span>'
       row.addEventListener('click', function(){
         loadFolder(subpath ? subpath + '\\' + f.name : f.name)
       })
@@ -15567,7 +15567,7 @@ document.addEventListener('DOMContentLoaded', function(){
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name: name, category: active.category, subpath: subpath || ''})
     }).then(function(r){ return r.json() }).then(function(d){
-      if(!d.ok){ listEl.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + d.error + '</div>'; return }
+      if(!d.ok){ listEl.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + escapeHtmlLite(d.error) + '</div>'; return }
       if(active.fieldName === 'pl'){
         // The Player isn't a form field -- picking a file here should just
         // start playing it, reusing showPlayer() so the transcode-on-error
@@ -15687,7 +15687,7 @@ document.addEventListener('DOMContentLoaded', function(){
     files.forEach(function(f){
       var row = document.createElement('div')
       row.className = 'net-modal-row'
-      row.innerHTML = '<span class="row-name">' + f.name + '</span><span class="row-size">' + humanSize(f.size) + '</span>'
+      row.innerHTML = '<span class="row-name">' + escapeHtmlLite(f.name) + '</span><span class="row-size">' + humanSize(f.size) + '</span>'
       wireFileRow(row, f.name, active ? active.subpath : '', f.size)
       listEl.appendChild(row)
     })
@@ -15713,7 +15713,7 @@ document.addEventListener('DOMContentLoaded', function(){
     files.forEach(function(f){
       var row = document.createElement('div')
       row.className = 'net-modal-row'
-      var locationLabel = f.subpath ? f.subpath.replace(/\\/g, ' / ') + ' / ' : ''
+      var locationLabel = f.subpath ? escapeHtmlLite(f.subpath.replace(/\\/g, ' / ') + ' / ') : ''
       if(f.is_dir){
         // A matching FOLDER (not a file) -- searching used to only ever
         // check filenames, silently skipping folder names entirely, so
@@ -15721,14 +15721,14 @@ document.addEventListener('DOMContentLoaded', function(){
         // genuinely existed right there. Clicking it navigates into it,
         // exactly like a normal (non-search) folder row, rather than
         // trying to fetch it as if it were a file.
-        row.innerHTML = '<span class="row-name"><span style="opacity:.55;font-size:11px">' + locationLabel + '</span>&#128193; ' + f.name + '</span>'
+        row.innerHTML = '<span class="row-name"><span style="opacity:.55;font-size:11px">' + locationLabel + '</span>&#128193; ' + escapeHtmlLite(f.name) + '</span>'
         row.addEventListener('click', function(){
           loadFolder(f.subpath ? f.subpath + '\\' + f.name : f.name)
         })
         listEl.appendChild(row)
         return
       }
-      row.innerHTML = '<span class="row-name"><span style="opacity:.55;font-size:11px">' + locationLabel + '</span>' + f.name +
+      row.innerHTML = '<span class="row-name"><span style="opacity:.55;font-size:11px">' + locationLabel + '</span>' + escapeHtmlLite(f.name) +
                       '</span><span class="row-size">' + humanSize(f.size) + '</span>'
       wireFileRow(row, f.name, f.subpath, f.size)
       listEl.appendChild(row)
@@ -15761,7 +15761,7 @@ document.addEventListener('DOMContentLoaded', function(){
           '&subpath=' + encodeURIComponent(active.subpath || '') + '&q=' + encodeURIComponent(q))
       .then(function(r){ return r.json() }).then(function(d){
         if(mySeq !== netModalSearchSeq) return  // a newer search has since been issued; this response is stale
-        if(!d.ok){ listEl.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + d.error + '</div>'; return }
+        if(!d.ok){ listEl.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + escapeHtmlLite(d.error) + '</div>'; return }
         renderSearchResults(d.files, d.truncated)
         updateMultiBar()
       }).catch(function(e){ if(mySeq === netModalSearchSeq) listEl.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + e + '</div>' })
@@ -15793,7 +15793,7 @@ document.addEventListener('DOMContentLoaded', function(){
       var chip = document.createElement('div')
       chip.className = 'net-fav-chip'
       chip.title = f.path || '(category root)'
-      chip.innerHTML = '<span>&#9733;</span><span class="fav-label">' + f.label + '</span><span class="fav-remove">&#10005;</span>'
+      chip.innerHTML = '<span>&#9733;</span><span class="fav-label">' + escapeHtmlLite(f.label) + '</span><span class="fav-remove">&#10005;</span>'
       chip.querySelector('.fav-label').addEventListener('click', function(){ loadFolder(f.path) })
       chip.querySelector('span:first-child').addEventListener('click', function(){ loadFolder(f.path) })
       chip.querySelector('.fav-remove').addEventListener('click', function(e){
@@ -15851,7 +15851,7 @@ document.addEventListener('DOMContentLoaded', function(){
     fetch('/api/network/list?category=' + encodeURIComponent(active.category) +
           '&subpath=' + encodeURIComponent(active.subpath))
       .then(function(r){ return r.json() }).then(function(d){
-        if(!d.ok){ listEl.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + d.error + '</div>'; return }
+        if(!d.ok){ listEl.innerHTML = '<div class="net-modal-empty" style="color:var(--tally)">' + escapeHtmlLite(d.error) + '</div>'; return }
         buildNetworkBreadcrumb(pathEl, d.root, d.subpath || active.subpath, loadFolder)
         active.inPlace = !!d.in_place
         active.loadedFolders = d.folders || []
@@ -16039,7 +16039,7 @@ function _dashLoadShows(){
       var sub = t.genre ? t.genre.charAt(0).toUpperCase() + t.genre.slice(1) : 'Custom'
       return '<div class="dash-show-row" data-tpl-id="' + t.id + '" ' +
              'style="display:flex;justify-content:space-between;gap:10px;padding:6px 4px;border-bottom:1px solid var(--line);cursor:pointer;border-radius:6px">' +
-             '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + t.name + '</span>' +
+             '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtmlLite(t.name) + '</span>' +
              '<span style="opacity:.6;font-size:12px;white-space:nowrap">' + sub + '</span></div>'
     }).join('')
     el.querySelectorAll('.dash-show-row').forEach(function(row){

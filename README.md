@@ -170,7 +170,8 @@ Treat the host like the storage it can reach: the app holds network-share creden
   FORCE_HTTPS=1           # Secure session cookie when TLS terminates at the proxy
   ```
 
-- Sessions default to 1 day. Configure `SESSION_LIFETIME_DAYS` as needed.
+- Sessions default to 1 day. Configure `SESSION_LIFETIME_DAYS` as needed. Every request is checked against the account: disabling an account, deleting it, setting its password or resetting its 2FA signs it out everywhere, and a role change applies on the next click.
+- Rate limits and the audit log use the connecting address. `X-Forwarded-For` is only honoured with `TRUST_PROXY_HEADERS=1`, so set it behind a proxy (otherwise every user shares the proxy's address and its login limit), and never without one.
 - Keep `SECRET_KEY_FILE` and share/API credentials on the host private; they are stored as local config, not in the repo.
 
 ## License

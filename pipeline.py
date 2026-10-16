@@ -39,7 +39,7 @@ from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, l
     load_network_folders, save_network_folder, NETWORK_CATEGORY_KEYS,
     network_destinations_list, network_destination_get, network_destination_add,
     network_destination_update, network_destination_remove)
-from auth import require_permission
+from auth import require_permission, MEDIA_PERMISSIONS
 import database
 
 # ---- Per-show asset templates (PostgreSQL `show_templates` table) ----
@@ -5366,6 +5366,7 @@ def get_video_info(path):
 # ---- API ----
 
 @app.route('/api/opencv/info', methods=['POST'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_info():
     path, err = load_video(request)
     if not path:
@@ -5373,6 +5374,7 @@ def api_info():
     return jsonify(video_info=get_video_info(path))
 
 @app.route('/api/opencv/analyze', methods=['POST'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_analyze():
     path, err = load_video(request)
     if not path:
@@ -5434,6 +5436,7 @@ def _ensure_readable(path):
     return path
 
 @app.route('/api/media/playable', methods=['POST'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_media_playable():
     """Re-encodes a staged file to H.264/AAC MP4 for the browser Player.
 
@@ -5469,6 +5472,7 @@ def api_media_playable():
     return jsonify(ok=True, url=f'/uploads/{out_name}')
 
 @app.route('/api/scene/clip', methods=['POST'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_scene_clip():
     """Extracts a short clip from a staged source video for the preview
     modal's play button, instead of pointing the browser at the full episode
@@ -5531,6 +5535,7 @@ def api_scene_clip():
     return jsonify(ok=True, url=f'/uploads/{out_name}')
 
 @app.route('/api/media/probe', methods=['POST'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_media_probe():
     """Duration/resolution plus a single still-frame thumbnail for a staged
     file, WITHOUT needing the browser to decode it at all.
@@ -9378,6 +9383,8 @@ def api_admin_job_priority(job_id):
 def api_queue_status():
     """Overall queue state: how many jobs are running vs the current concurrency
     limit, plus every currently-queued job with its wait position."""
+    if session.get('role') != 'admin':
+        return jsonify(error='Admin access required.'), 403
     gate_status = GATE.status()
     with JOB_QUEUE_LOCK:
         queued = list(JOB_QUEUE)
@@ -9392,6 +9399,8 @@ def api_queue_limit():
     """View or change how many trailer jobs are allowed to run at once. Changing
     this takes effect immediately — queued jobs re-check the limit as soon as a
     slot frees up or the limit itself changes."""
+    if session.get('role') != 'admin':     # a server-wide setting, like everything under Config
+        return jsonify(error='Admin access required.'), 403
     if request.method == 'POST':
         data = request.get_json(silent=True) or {}
         try:
@@ -9428,6 +9437,7 @@ def _check_service(name, base_url, path='/', timeout=3):
         return {'name': name, 'url': base_url, 'status': 'down', 'error': str(e)}
 
 @app.route('/api/network/list')
+@require_permission(*MEDIA_PERMISSIONS)
 def api_network_list():
     """Lists the folders and files sitting in ?subpath= (default: the root)
     of the network folder for ?category=hires|music|vo|sfx (defaults to
@@ -9445,6 +9455,7 @@ def api_network_list():
         return jsonify(ok=False, error=f'Could not reach network folder: {e}'), 500
 
 @app.route('/api/network/favorites')
+@require_permission(*MEDIA_PERMISSIONS)
 def api_network_favorites_list():
     """This account's bookmarked folders, optionally narrowed to one
     category via ?category=. No admin gate -- same access level as browsing
@@ -9455,6 +9466,7 @@ def api_network_favorites_list():
     return jsonify(ok=True, items=network_favorites_list(session['user_id'], category))
 
 @app.route('/api/network/favorites', methods=['POST'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_network_favorites_add():
     data = request.get_json(silent=True) or {}
     category = (data.get('category') or '').strip()
@@ -9471,6 +9483,7 @@ def api_network_favorites_add():
     return jsonify(ok=True, items=network_favorites_list(session['user_id'], category))
 
 @app.route('/api/network/favorites/<int:fid>', methods=['DELETE'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_network_favorites_remove(fid):
     removed = network_favorite_remove(session['user_id'], fid)
     if not removed:
@@ -9478,6 +9491,7 @@ def api_network_favorites_remove(fid):
     return jsonify(ok=True)
 
 @app.route('/api/network/search')
+@require_permission(*MEDIA_PERMISSIONS)
 def api_network_search():
     """Recursive file search starting at ?subpath= (default: category root)
     for ?category=..., optionally filtered by ?q= (case-insensitive filename
@@ -9497,6 +9511,7 @@ def api_network_search():
         return jsonify(ok=False, error=f'Could not search network folder: {e}'), 500
 
 @app.route('/api/network/fetch', methods=['POST'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_network_fetch():
     """Copies one file from inside `subpath` of the network folder (for the
     given category) into the local upload folder so it can be used exactly
@@ -9521,6 +9536,7 @@ def api_network_fetch():
         return jsonify(ok=False, error=f'Could not fetch {name}: {e}'), 500
 
 @app.route('/api/network/combine', methods=['POST'])
+@require_permission(*MEDIA_PERMISSIONS)
 def api_network_combine():
     """Combines several already-staged HIRES files (each fetched individually
     via /api/network/fetch first) into one source video, so multi-part

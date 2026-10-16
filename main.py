@@ -10,7 +10,7 @@ from flask import request, jsonify, session, send_from_directory, send_file, ren
 from core import app, ensure_csrf_token
 import library_db      # noqa: F401
 import auth             # noqa: F401 -- registers /login, /logout, /admin/users
-from auth import require_permission, user_permissions
+from auth import require_permission, user_permissions, MEDIA_PERMISSIONS
 from pipeline import (
     GENRE_DOCS_ROWS, EXPORT_FORMATS, build_export_cmd,
     _sweeper_loop, sweep_upload_folder, free_disk_mb, load_config_overrides, load_branding,
@@ -74,6 +74,7 @@ def index():
                            csrf_token=ensure_csrf_token())
 
 @app.route('/uploads/<filename>')
+@require_permission(*MEDIA_PERMISSIONS)
 def uploaded(filename):
     if filename in pipeline.INPLACE:           # a file left where it is on the network share
         resp = send_file(pipeline.INPLACE[filename]['path'], conditional=True)
