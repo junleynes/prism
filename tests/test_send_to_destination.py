@@ -34,7 +34,7 @@ import pytest
 import library_db
 import pipeline
 import core
-from tests.dbutil import reset_tables, LIBRARY_TABLES
+from tests.dbutil import reset_tables, LIBRARY_TABLES, ungrouped_user_gets_every_tab
 
 with mock.patch('requests.post'), mock.patch('requests.get'):
     import main
@@ -457,6 +457,8 @@ def test_send_to_destination_requires_ownership(rendered_trailer):
     library_id = result['library_id']
     dest_id = _make_destination('video')
 
+    # Another account that may use the promo tools, but did not make this plug.
+    ungrouped_user_gets_every_tab(999, 'someone-else')
     with client.session_transaction() as sess:
         sess['user_id'] = 999
         sess['role'] = 'user'

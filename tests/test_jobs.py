@@ -13,7 +13,7 @@ import pytest
 with mock.patch('requests.post'), mock.patch('requests.get'):
     import main
 import pipeline
-from tests.dbutil import reset_tables
+from tests.dbutil import reset_tables, ungrouped_user_gets_every_tab
 
 
 def _use_temp_jobs_db(tmp_path, monkeypatch):
@@ -104,6 +104,8 @@ def test_a_job_says_which_feature_it_belongs_to(tmp_path, monkeypatch):
 
 
 def _session(user_id=7, role='user', username='ana'):
+    if role != 'admin':
+        ungrouped_user_gets_every_tab(user_id, username)
     client = main.app.test_client()
     with client.session_transaction() as s:
         s.update(authed=True, user_id=user_id, username=username, role=role, csrf_token='t')

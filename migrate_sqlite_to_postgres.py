@@ -124,7 +124,8 @@ def migrate(library_dir, templates_dir, replace=False, dry_run=False, out=print)
                 'These PostgreSQL tables already contain data: ' + ', '.join(non_empty) + '.\n'
                 'Run again with --replace to empty them first, or point DATABASE_URL at an empty database.')
         if non_empty:
-            conn.execute('TRUNCATE ' + ', '.join(t for t, _, _ in plan) + ' RESTART IDENTITY')
+            emptied = [t for t, _, _ in plan] + (['user_groups'] if any(t == 'users' for t, _, _ in plan) else [])
+            conn.execute('TRUNCATE ' + ', '.join(emptied) + ' RESTART IDENTITY')
 
         # ---- copy ----
         for table, src, cols in plan:
@@ -151,6 +152,14 @@ def migrate(library_dir, templates_dir, replace=False, dry_run=False, out=print)
                 conn.execute(
                     f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
                     f'(SELECT MAX(id) FROM {table}))')
+
+        # Old installs kept one group per account in users.group_id; accounts can
+        # now be in several (user_groups). Same move schema.sql makes on start-up.
+        if copied.get('users'):
+            conn.execute('INSERT INTO user_groups (user_id, group_id) '
+                         'SELECT u.id, u.group_id FROM users u JOIN groups g ON g.id = u.group_id '
+                         'ON CONFLICT DO NOTHING')
+            conn.execute('UPDATE users SET group_id = NULL WHERE group_id IS NOT NULL')
 
         # ---- verify against the source before committing ----
         for table, src, _ in plan:

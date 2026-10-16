@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS users (
     is_active         INTEGER NOT NULL DEFAULT 1,
     created_at        DOUBLE PRECISION NOT NULL,
     last_login        DOUBLE PRECISION,
-    -- NULL = no group assigned = unrestricted (see user_can in auth.py).
+    -- Legacy single group, from before an account could be in several. Moved
+    -- into user_groups below and cleared; nothing reads it any more.
     group_id          BIGINT,
     -- TOTP two-factor. totp_enabled only flips to 1 after a code is verified;
     -- totp_backup_codes holds newline-separated hashes of one-time codes.
@@ -52,6 +53,24 @@ CREATE TABLE IF NOT EXISTS group_permissions (
     permission TEXT NOT NULL,
     PRIMARY KEY (group_id, permission)
 );
+
+-- Which groups each account is in (any number). An account's tabs are every
+-- tab any of its groups grants; with no group it gets only the ungated ones
+-- (see user_can in auth.py). Admins are not limited by groups.
+CREATE TABLE IF NOT EXISTS user_groups (
+    user_id  BIGINT NOT NULL,
+    group_id BIGINT NOT NULL,
+    PRIMARY KEY (user_id, group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_groups_group ON user_groups (group_id);
+
+-- One-time move of the old single users.group_id into user_groups. Clearing
+-- the old column afterwards is what makes this safe to run on every start:
+-- a membership an admin later removes is not brought back.
+INSERT INTO user_groups (user_id, group_id)
+    SELECT u.id, u.group_id FROM users u JOIN groups g ON g.id = u.group_id
+    ON CONFLICT DO NOTHING;
+UPDATE users SET group_id = NULL WHERE group_id IS NOT NULL;
 
 -- ---- Trailer library, audit trail, network browser ----
 CREATE TABLE IF NOT EXISTS audit_log (

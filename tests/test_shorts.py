@@ -35,7 +35,7 @@ with mock.patch('requests.post'), mock.patch('requests.get'):
     import core
     import auth
 import shorts_core as sc
-from tests.dbutil import reset_tables
+from tests.dbutil import reset_tables, ungrouped_user_gets_every_tab
 
 
 pytestmark = pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg not available')
@@ -46,6 +46,8 @@ FF = ['ffmpeg', '-y', '-loglevel', 'error']
 def _client(user_id=1, role='admin', username='admin'):
     client = main.app.test_client()
     tok = f'csrf-shorts-{user_id}'
+    if role != 'admin':
+        ungrouped_user_gets_every_tab(user_id, username)
     with client.session_transaction() as sess:
         sess.update(authed=True, user_id=user_id, username=username, role=role, csrf_token=tok)
     return client, {'X-CSRF-Token': tok}

@@ -300,17 +300,15 @@ def users_db_init():
     # The tables themselves come from schema.sql. Notes on columns that live
     # there, kept here because the behaviour is this module's:
     #
-    # users.group_id is NULL for every account that has no group, which
-    # user_can() below treats as "unrestricted" rather than locked out.
-    # Restricting an account is an opt-in action an admin takes (create a
-    # group, check only the permissions it should have, assign the account to
-    # it), not something that silently happens to existing accounts.
+    # An account may be in any number of groups (user_groups). Its tabs are
+    # every tab any of them grants; an account in no group gets only the
+    # ungated ones (Dashboard, and Docs: NO_GROUP_PERMISSIONS). Admins are not
+    # limited by groups.
     #
-    # There is no FOREIGN KEY from users.group_id / group_permissions.group_id
-    # to groups, matching the SQLite schema this replaced (which never enforced
-    # one). Group deletion's cleanup -- clearing group_id off members and
-    # removing the group's permission rows -- is done explicitly in
-    # group_delete() below.
+    # There are no FOREIGN KEYs from user_groups / group_permissions to users
+    # or groups, matching the SQLite schema this replaced (which never enforced
+    # one). Deleting a group or an account removes its rows explicitly
+    # (group_delete, user_delete below).
     database.init_schema()
     conn = database.connect()
     count = conn.execute('SELECT COUNT(*) AS c FROM users').fetchone()['c']
@@ -349,14 +347,27 @@ def user_get(uid):
     return dict(row) if row else None
 
 def user_list():
+    """Every account, with group_ids / group_names: the groups it is in, by name."""
     conn = database.connect()
     rows = conn.execute(
-        'SELECT u.id, u.username, u.role, u.is_active, u.created_at, u.last_login, u.group_id, '
-        'u.totp_enabled, g.name AS group_name '
-        'FROM users u LEFT JOIN groups g ON g.id = u.group_id ORDER BY LOWER(u.username)'
+        'SELECT u.id, u.username, u.role, u.is_active, u.created_at, u.last_login, u.totp_enabled '
+        'FROM users u ORDER BY LOWER(u.username)'
     ).fetchall()
+    links = conn.execute(
+        'SELECT ug.user_id, g.id, g.name FROM user_groups ug JOIN groups g ON g.id = ug.group_id '
+        'ORDER BY LOWER(g.name)').fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    by_user = {}
+    for r in links:
+        by_user.setdefault(r['user_id'], []).append((r['id'], r['name']))
+    out = []
+    for r in rows:
+        u = dict(r)
+        mine = by_user.get(u['id'], [])
+        u['group_ids'] = [g for g, _ in mine]
+        u['group_names'] = [n for _, n in mine]
+        out.append(u)
+    return out
 
 def user_count_active_admins(exclude_id=None):
     conn = database.connect()
@@ -448,6 +459,7 @@ def user_delete(uid):
         return False, "Can't delete the last active admin."
     conn = database.connect()
     conn.execute('DELETE FROM users WHERE id=%s', (uid,))
+    conn.execute('DELETE FROM user_groups WHERE user_id=%s', (uid,))
     conn.commit()
     conn.close()
     return True, None
@@ -581,17 +593,57 @@ def user_totp_disable(uid):
     conn.commit()
     conn.close()
 
-def user_set_group(uid, group_id):
-    """group_id=None (or 0/'') clears the assignment -- back to unrestricted,
-    same as an account that's never been assigned one."""
-    group_id = group_id or None
+def _ids(values):
+    out = set()
+    for v in values or []:
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+def user_groups(uid):
+    """The ids of the groups an account is in."""
     conn = database.connect()
-    if group_id is not None:
-        exists = conn.execute('SELECT 1 FROM groups WHERE id=%s', (group_id,)).fetchone()
-        if not exists:
-            conn.close()
-            return False, 'No such group.'
-    conn.execute('UPDATE users SET group_id=%s WHERE id=%s', (group_id, uid))
+    rows = conn.execute('SELECT group_id FROM user_groups WHERE user_id=%s', (uid,)).fetchall()
+    conn.close()
+    return {r['group_id'] for r in rows}
+
+def user_set_groups(uid, group_ids):
+    """Puts an account in exactly these groups (an empty list: none)."""
+    gids = _ids(group_ids)
+    conn = database.connect()
+    if not conn.execute('SELECT 1 FROM users WHERE id=%s', (uid,)).fetchone():
+        conn.close()
+        return False, 'No such account.'
+    known = {r['id'] for r in conn.execute('SELECT id FROM groups').fetchall()}
+    if gids - known:
+        conn.close()
+        return False, 'No such group.'
+    conn.execute('DELETE FROM user_groups WHERE user_id=%s', (uid,))
+    conn.executemany('INSERT INTO user_groups (user_id, group_id) VALUES (%s,%s)', [(uid, g) for g in sorted(gids)])
+    conn.commit()
+    conn.close()
+    return True, None
+
+def user_set_group(uid, group_id):
+    """The one-group form, kept for the older admin page and API: the account
+    ends up in only this group, or in none for None/0/''."""
+    return user_set_groups(uid, [group_id] if group_id else [])
+
+def group_set_members(gid, user_ids):
+    """Makes exactly these accounts the group's members, leaving their other groups alone."""
+    uids = _ids(user_ids)
+    conn = database.connect()
+    if not conn.execute('SELECT 1 FROM groups WHERE id=%s', (gid,)).fetchone():
+        conn.close()
+        return False, 'No such group.'
+    known = {r['id'] for r in conn.execute('SELECT id FROM users').fetchall()}
+    if uids - known:
+        conn.close()
+        return False, 'No such account.'
+    conn.execute('DELETE FROM user_groups WHERE group_id=%s', (gid,))
+    conn.executemany('INSERT INTO user_groups (user_id, group_id) VALUES (%s,%s)', [(u, gid) for u in sorted(uids)])
     conn.commit()
     conn.close()
     return True, None
@@ -605,7 +657,9 @@ def group_list():
     for g in groups:
         perms = conn.execute('SELECT permission FROM group_permissions WHERE group_id=%s', (g['id'],)).fetchall()
         g['permissions'] = sorted(p['permission'] for p in perms)
-        g['member_count'] = conn.execute('SELECT COUNT(*) AS c FROM users WHERE group_id=%s', (g['id'],)).fetchone()['c']
+        g['member_ids'] = sorted(r['user_id'] for r in conn.execute(
+            'SELECT user_id FROM user_groups WHERE group_id=%s', (g['id'],)).fetchall())
+        g['member_count'] = len(g['member_ids'])
     conn.close()
     return groups
 
@@ -669,16 +723,15 @@ def group_rename(gid, name):
         conn.close()
 
 def group_delete(gid):
-    """Members of a deleted group fall back to group_id=NULL -- unrestricted,
-    not locked out -- rather than left pointing at a group row that no
-    longer exists. Done explicitly here (not via a DB-level FK cascade,
-    which this app doesn't have enabled -- see users_db_init's comment on
-    the users.group_id column) so it happens reliably regardless of that."""
+    """Its members leave it and keep their other groups (one left in no group
+    keeps only NO_GROUP_PERMISSIONS). Its rows in user_groups and
+    group_permissions are removed here, explicitly: there is no FK cascade
+    (see users_db_init)."""
     conn = database.connect()
     if not conn.execute('SELECT 1 FROM groups WHERE id=%s', (gid,)).fetchone():
         conn.close()
         return False, 'No such group.'
-    conn.execute('UPDATE users SET group_id=NULL WHERE group_id=%s', (gid,))
+    conn.execute('DELETE FROM user_groups WHERE group_id=%s', (gid,))
     conn.execute('DELETE FROM group_permissions WHERE group_id=%s', (gid,))
     conn.execute('DELETE FROM groups WHERE id=%s', (gid,))
     conn.commit()
@@ -686,54 +739,51 @@ def group_delete(gid):
     return True, None
 
 def group_membership():
-    """({user id: group id or None}, {group id: group name}) in two queries,
-    for code that decides what a group may see across many records at once."""
+    """({user id: frozenset of group ids}, {group id: group name}) in two
+    queries, for code that decides what groups may see across many records at
+    once. An account in no group is absent from the first dict."""
     conn = database.connect()
-    users = {r['id']: r['group_id'] for r in conn.execute('SELECT id, group_id FROM users').fetchall()}
+    users = {}
+    for r in conn.execute('SELECT user_id, group_id FROM user_groups').fetchall():
+        users.setdefault(r['user_id'], set()).add(r['group_id'])
     groups = {r['id']: r['name'] for r in conn.execute('SELECT id, name FROM groups').fetchall()}
     conn.close()
-    return users, groups
+    return {u: frozenset(g & groups.keys()) for u, g in users.items()}, groups
+
+# What an account in no group may open (the Dashboard is never gated).
+NO_GROUP_PERMISSIONS = frozenset({'docs'})
+
+def user_permissions(user_id, role):
+    """The permission keys a session has: everything for an admin; for anyone
+    else every key any of their groups grants, or NO_GROUP_PERMISSIONS when
+    they are in no group at all (an admin puts them in one to give access)."""
+    if role == 'admin':
+        return set(_PERMISSION_KEYS)
+    if not user_id:
+        return set()
+    conn = database.connect()
+    member = conn.execute('SELECT 1 FROM user_groups ug JOIN groups g ON g.id = ug.group_id '
+                          'WHERE ug.user_id=%s LIMIT 1', (user_id,)).fetchone()
+    if not member:
+        conn.close()
+        return set(NO_GROUP_PERMISSIONS)
+    granted = conn.execute('SELECT DISTINCT gp.permission FROM user_groups ug '
+                           'JOIN group_permissions gp ON gp.group_id = ug.group_id WHERE ug.user_id=%s',
+                           (user_id,)).fetchall()
+    conn.close()
+    return {p['permission'] for p in granted} & _PERMISSION_KEYS
 
 def user_can(user_id, role, *permissions):
     """True if the session identified by (user_id, role) may use a feature
     gated behind ANY of the given permission keys (multiple keys = OR, for
     the handful of endpoints two different tabs both depend on -- see
-    require_permission's docstring). Admins always pass. An account with no
-    group assigned (group_id IS NULL) always passes too -- see
-    users_db_init's comment on why that's the safe default rather than
-    locking out every existing account the moment this feature ships."""
+    require_permission's docstring). See user_permissions for who has what."""
     if role == 'admin':
         return True
     if not user_id:
         return False
-    conn = database.connect()
-    row = conn.execute('SELECT group_id FROM users WHERE id=%s', (user_id,)).fetchone()
-    if not row or not row['group_id']:
-        conn.close()
-        return True
-    granted = conn.execute('SELECT permission FROM group_permissions WHERE group_id=%s',
-                           (row['group_id'],)).fetchall()
-    conn.close()
-    granted = {p['permission'] for p in granted}
+    granted = user_permissions(user_id, role)
     return any(p in granted for p in permissions)
-
-def user_permissions(user_id, role):
-    """The set of permission keys the current session actually has, for
-    handing to the template so it can hide tabs a user's group doesn't
-    grant. Admins and ungrouped accounts get the full set (matching
-    user_can's semantics above) rather than an empty one, since neither is
-    actually restricted."""
-    if role == 'admin' or not user_id:
-        return set(_PERMISSION_KEYS) if role == 'admin' else set()
-    conn = database.connect()
-    row = conn.execute('SELECT group_id FROM users WHERE id=%s', (user_id,)).fetchone()
-    if not row or not row['group_id']:
-        conn.close()
-        return set(_PERMISSION_KEYS)
-    granted = conn.execute('SELECT permission FROM group_permissions WHERE group_id=%s',
-                           (row['group_id'],)).fetchall()
-    conn.close()
-    return {p['permission'] for p in granted}
 
 def require_permission(*permissions):
     """Route decorator: 403s (JSON for /api/, redirect to / otherwise)
@@ -823,8 +873,7 @@ def _admin_users_page(error=None, notice=None):
         created = time.strftime('%Y-%m-%d', time.localtime(u['created_at'])) if u['created_at'] else '—'
         last_login = time.strftime('%Y-%m-%d %H:%M', time.localtime(u['last_login'])) if u['last_login'] else 'never'
         is_you = (u['id'] == session.get('user_id'))
-        this_group_options = '<option value="">\u2014 none (unrestricted) \u2014</option>' + ''.join(
-            f'<option value={g["id"]} {"selected" if u["group_id"] == g["id"] else ""}>{g["name"]}</option>' for g in groups)
+        this_groups = escape(', '.join(u['group_names'])) if u['group_names'] else '<span style="opacity:.6">no group</span>'
         rows += f'''<tr>
 <td>{u['username']}{' <span class="you">(you)</span>' if is_you else ''}</td>
 <td>
@@ -835,11 +884,7 @@ def _admin_users_page(error=None, notice=None):
     </select>
   </form>
 </td>
-<td>
-  <form method=post action="/admin/users/{u['id']}/group" class=inline-form>
-    <select name=group_id onchange="this.form.submit()">{this_group_options}</select>
-  </form>
-</td>
+<td title="Change groups in Config &gt; Users">{this_groups}</td>
 <td>{'active' if u['is_active'] else 'pending / disabled'}</td>
 <td>{_twofa_cell(u)}</td>
 <td>{created}</td>
@@ -872,14 +917,14 @@ def _admin_users_page(error=None, notice=None):
     <span class=group-meta>{g['member_count']} member{'s' if g['member_count'] != 1 else ''}</span>
     <button type=submit class="btn-sm primary-sm">Save</button>
     <button type=submit form=delgroup-{g['id']} class="btn-sm btn-danger"
-            onclick="return confirm('Delete group {g['name']}? Members fall back to unrestricted access, not locked out.')">Delete</button>
+            onclick="return confirm('Delete group {g['name']}? Its members keep their other groups.')">Delete</button>
   </div>
   <div class=perm-grid>{checks}</div>
 </form>
 <form id=delgroup-{g['id']} method=post action="/admin/groups/{g['id']}/delete"></form>
 </div>'''
     if not groups:
-        group_rows = '<p style="font-size:12px;opacity:.7;margin:4px 0 0">No groups yet. Accounts with no group assigned have unrestricted access to every tab.</p>'
+        group_rows = '<p style="font-size:12px;opacity:.7;margin:4px 0 0">No groups yet. Accounts in no group see only the Dashboard and Docs.</p>'
 
     return f'''<!doctype html><html><head><meta charset="utf-8">
 <title>Manage users &mdash; {brand_name}</title>
@@ -992,7 +1037,7 @@ select,input{{background:var(--panel); border:1px solid var(--line); color:var(-
 </div>
 <div class=card>
 <h2>Groups</h2>
-<p style="font-size:12px;opacity:.7;margin:8px 0 0">A group grants access to only the checked tabs. An account with no group assigned (the default) is unrestricted -- creating and assigning a group is an opt-in way to <em>narrow</em> access, not something that happens automatically. Admins always have full access regardless of group.</p>
+<p style="font-size:12px;opacity:.7;margin:8px 0 0">A group grants the checked tabs. An account can be in several groups and gets every tab any of them grants; an account in no group sees only the Dashboard and Docs. Admins always have full access. Assign groups in Config &gt; Users.</p>
 {group_rows}
 <form method=post action="/admin/groups/create" class=add-form style="margin-top:14px">
 <input type=text name=name placeholder="New group name (e.g. Editors)" required>
@@ -1120,7 +1165,7 @@ def admin_groups_permissions(gid):
 @app.route('/admin/groups/<int:gid>/delete', methods=['POST'])
 def admin_groups_delete(gid):
     ok, err = group_delete(gid)
-    return _admin_users_page(error=None if ok else err, notice='Group deleted. Its members are now unrestricted.' if ok else None)
+    return _admin_users_page(error=None if ok else err, notice='Group deleted. Its members keep their other groups.' if ok else None)
 
 # ---- Admin: user management, JSON API ----
 # Same underlying functions as the form-posting routes above, but returning
@@ -1136,15 +1181,15 @@ def admin_groups_delete(gid):
 def _user_json(u, current_uid):
     return {
         'id': u['id'], 'username': u['username'], 'role': u['role'],
-        'is_active': bool(u['is_active']), 'group_id': u['group_id'],
-        'group_name': u['group_name'], 'totp_enabled': bool(u['totp_enabled']),
+        'is_active': bool(u['is_active']), 'group_ids': u['group_ids'],
+        'group_names': u['group_names'], 'totp_enabled': bool(u['totp_enabled']),
         'created_at': u['created_at'], 'last_login': u['last_login'],
         'is_you': u['id'] == current_uid,
     }
 
 def _group_json(g):
     return {'id': g['id'], 'name': g['name'], 'member_count': g['member_count'],
-            'permissions': sorted(g['permissions'])}
+            'member_ids': g['member_ids'], 'permissions': sorted(g['permissions'])}
 
 @app.route('/admin/api/users')
 def admin_api_users():
@@ -1204,6 +1249,20 @@ def admin_api_users_group(uid):
     ok, err = user_set_group(uid, gid)
     return jsonify(ok=ok, error=None if ok else err, notice='Group updated.' if ok else None)
 
+@app.route('/admin/api/users/<int:uid>/groups', methods=['POST'])
+def admin_api_users_groups(uid):
+    """{group_ids: [...]}: the account is in exactly these groups."""
+    d = request.get_json(silent=True) or {}
+    ok, err = user_set_groups(uid, d.get('group_ids') or [])
+    return jsonify(ok=ok, error=None if ok else err, notice='Groups updated.' if ok else None)
+
+@app.route('/admin/api/groups/<int:gid>/members', methods=['POST'])
+def admin_api_groups_members(gid):
+    """{user_ids: [...]}: exactly these accounts are the group's members."""
+    d = request.get_json(silent=True) or {}
+    ok, err = group_set_members(gid, d.get('user_ids') or [])
+    return jsonify(ok=ok, error=None if ok else err, notice='Members saved.' if ok else None)
+
 @app.route('/admin/api/groups/create', methods=['POST'])
 def admin_api_groups_create():
     d = request.get_json(silent=True) or {}
@@ -1221,5 +1280,5 @@ def admin_api_groups_permissions(gid):
 def admin_api_groups_delete(gid):
     ok, err = group_delete(gid)
     return jsonify(ok=ok, error=None if ok else err,
-                    notice='Group deleted. Its members are now unrestricted.' if ok else None)
+                    notice='Group deleted. Its members keep their other groups.' if ok else None)
 
