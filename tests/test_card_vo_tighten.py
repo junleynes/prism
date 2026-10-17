@@ -69,3 +69,23 @@ def test_the_page_paints_and_drags_every_part_of_a_multi_part_recording(users_db
     html = client.get('/').get_data(as_text=True)
     for needle in ('_extraHandles', "dragMode = 'extra'", 'extraSel', "'.extra-ranges[data-prefix=\"' + prefix + '\"] .er-row'"):
         assert needle in html, needle
+
+
+def _card(path, secs):
+    subprocess.run(FF + ['-f', 'lavfi', '-i', f'color=c=black:s=320x180:r=25:d={secs}', '-f', 'lavfi',
+                         '-i', f'anullsrc=r=48000:cl=stereo:d={secs}', '-shortest', '-c:v', 'libx264',
+                         '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(path)], check=True)
+    return str(path)
+
+
+def test_silence_is_only_taken_out_of_card_narration_that_does_not_fit_its_card(work):
+    card = _card(work / 'card.mp4', 4.0)
+    fits = _speech(work / 'fits.wav', [('gap', 0.6), ('tone', 0.8), ('gap', 1.0), ('tone', 0.8)])       # 3.2 s
+    long_ = _speech(work / 'long.wav', [('gap', 1.2), ('tone', 0.8), ('gap', 1.5), ('tone', 0.8), ('gap', 1.5)])  # 5.8 s
+    assert pipeline.card_vo_overruns(card, fits, 0.0, None) is False, 'fits: left as recorded'
+    assert pipeline.card_vo_overruns(card, long_, 0.0, None) is True
+    assert pipeline.card_vo_overruns(card, long_, 0.0, 3.0) is False, 'its Out is what counts'
+    assert pipeline.card_vo_overruns(card, long_, 1.0, None) is True
+    assert pipeline.card_vo_overruns(str(work / 'nope.mp4'), long_, 0.0, None) is False
+    path, _, _, saved = pipeline.tighten_card_vo(long_, 0.0, None)
+    assert saved > 1.5 and _dur(path) < 4.0, 'taken out, it now fits the card'

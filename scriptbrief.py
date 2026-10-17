@@ -491,6 +491,21 @@ def timeline_starts(clip_durs, card_durs, xfade):
     return starts[:len(clip_durs)], starts[len(clip_durs):]
 
 
+def card_targets(texts, n_cards):
+    """Which card each tune-in line is said over: 0 the title card, 1 the end card. With two cards and more than
+    one such line, the line that reads as the schedule ("8:50PM ON GMA PRIME", "weeknights") is the end card's and
+    the others are the title card's; when they all read alike the first is the title card's and the rest the end
+    card's. A single line, or a plug with one card, keeps everything on the first card (the line then carries on
+    over the cards that follow)."""
+    n = len(texts)
+    if n_cards < 2 or n < 2:
+        return [0] * n
+    sched = [bool(_TUNE_IN.search(t or '')) for t in texts]
+    if any(sched) and not all(sched):
+        return [1 if x else 0 for x in sched]
+    return [0] + [1] * (n - 1)
+
+
 def place_lines(vo, clips, clip_starts, card_starts, xfade=0.3, jcut=0.0, card_jcut=0.0):
     """Times for the script's voice-over lines.
 
@@ -502,6 +517,8 @@ def place_lines(vo, clips, clip_starts, card_starts, xfade=0.3, jcut=0.0, card_j
                  the end of its clip carries on over the next picture by itself (an L-cut)."""
     jcut = max(0.0, float(jcut or 0.0))
     lines, notes, taken = [], [], {}
+    card_ix = [k for k, v in enumerate(vo) if v['anchor']['kind'] == 'card']
+    which = dict(zip(card_ix, card_targets([vo[k]['text'] for k in card_ix], len(card_starts or []))))
     for k, v in enumerate(vo):
         a = v['anchor']
         at = None
@@ -516,11 +533,15 @@ def place_lines(vo, clips, clip_starts, card_starts, xfade=0.3, jcut=0.0, card_j
                 taken[idx] = True
         elif a['kind'] == 'card':
             if card_starts:
-                lead_in = max(jcut, max(0.0, float(card_jcut or 0.0)))
-                at = card_starts[0] + CARD_LEAD - min(lead_in, card_starts[0] + CARD_LEAD)
-                if 'card' in taken:
-                    at = None                                  # a second line on the card: after the first
-                taken['card'] = True
+                ci = min(which.get(k, 0), len(card_starts) - 1)
+                # Only the title card's line is led by the cards' own lead (it is the one that has to fit them all).
+                lead_in = max(jcut, max(0.0, float(card_jcut or 0.0))) if ci == 0 else jcut
+                at = card_starts[ci] + CARD_LEAD - min(lead_in, card_starts[ci] + CARD_LEAD)
+                if ('card', ci) in taken:
+                    at = None                                  # a second line on the same card: after the first
+                taken[('card', ci)] = True
+                if ci == 1:
+                    notes.append(f'"{v["text"][:40]}" is said over the end card, which is where it starts.')
             else:
                 notes.append(f'"{v["text"][:40]}" is the tune-in line but the plug has no card: it follows the line before.')
         elif a['kind'] == 'order':

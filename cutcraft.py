@@ -415,6 +415,21 @@ def raise_floors_for_voice(floors, durations, need, xfade=0.3):
     return floors, max(0.0, round(gap, 3))
 
 
+def raise_floors_per_card(floors, durations, wants):
+    """Each card has its own voice line (the title card's, the end card's), said from where the card starts:
+    `wants[i]` seconds (the line, plus the lead and the tail kept free; 0 or None for no line). Raises card i's
+    floor to that, never past the card's own length. -> (floors, short_by) where short_by is how much the
+    cards fall short of their lines even whole, in total."""
+    out, short = [], 0.0
+    for f, d, w in zip(floors, durations, wants):
+        f = min(float(f), float(d))
+        if w and w > f:
+            short += max(0.0, float(w) - float(d))
+            f = min(float(d), float(w))
+        out.append(f)
+    return out, round(short, 3)
+
+
 def card_adjust_limit(length, policy='fit'):
     """How much the cards may stretch or shrink in total, to close the last
     gap. 'off' keeps the old fixed 1.0 s; 'fit' scales with the plug (12 % of
@@ -767,7 +782,10 @@ def _line_elements(words, w0, w1, lo, hi):
     return elems
 
 
-def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO, aligned=None):
+LEAD_AUTO_MAX = 1.5     # the most a line is brought forward, under the picture before it, to fit (a J-cut)
+
+
+def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO, aligned=None, lead_max=0.0):
     """Cut the recorded narration at word edges and place it.
 
     lines    parse_vo_script() output (with no script, one line per spoken
@@ -780,10 +798,16 @@ def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO,
     Returns {'pieces', 'notes', 'fits', 'end', 'lines'}. A piece is one cut of
     the recording: {'a','b','at','tempo','fade_in','fade_out','line'}.
 
-    When the narration is too long for the room it has, in order: pauses are
-    tightened to 0.15 s, the speech is sped up by at most 8 %, lines marked
-    optional are dropped from the end, and as the last step the end is trimmed
-    at a word edge. The cut never falls inside a word."""
+    When the narration is too long for the room it has, in order: pauses (and
+    the silence around the words) are tightened to 0.15 s; then, if `lead_max`
+    allows, the line is brought forward under the picture before it (a J-cut)
+    by as much as it is short, never more than `lead_max` seconds, never
+    before the line ahead of it has finished, never before 0; then the speech
+    is sped up by at most 8 %, lines marked optional are dropped from the end,
+    and as the last step the end is trimmed at a word edge. The cut never
+    falls inside a word. A narration that fits is placed as it is: no
+    tightening, no lead. (A line that runs past its clip simply carries on
+    over the next picture, an L-cut, up to the next line's start.)"""
     words = _tidy_words(words)
     notes = []
     if not words or not lines:
@@ -829,23 +853,29 @@ def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO,
             bounds[k][0]['gap_before'] = min(1.5, max(PAUSE_KEEP, bounds[k][0]['a'] - prev_last['b']))
         runs[-1]['items'].append((k, bounds[k]))
 
-    pieces = []
+    pieces, prev_end = [], None
     for ri, run in enumerate(runs):
         deadline = window_end
         if ri + 1 < len(runs):
             nxt = runs[ri + 1]['at'] - 0.1
             deadline = nxt if deadline is None else min(deadline, nxt)
-        pieces.extend(_fit_run(run, deadline, lines, info, max_tempo, notes, words))
+        floor = 0.0 if prev_end is None else prev_end + 0.1
+        got = _fit_run(run, deadline, lines, info, max_tempo, notes, words, lead_max=lead_max, lead_floor=floor)
+        pieces.extend(got)
+        if got:
+            prev_end = max(p['at'] + (p['b'] - p['a']) / p['tempo'] for p in got)
 
     end = max((p['at'] + (p['b'] - p['a']) / p['tempo'] for p in pieces), default=start_at)
     fits = window_end is None or end <= window_end + 0.02
     return {'pieces': pieces, 'notes': notes, 'fits': fits, 'end': round(end, 3), 'lines': info}
 
 
-def _fit_run(run, deadline, lines, info, max_tempo, notes, words):
+def _fit_run(run, deadline, lines, info, max_tempo, notes, words, lead_max=0.0, lead_floor=0.0):
     """Lay out one run from its anchor and fit it before `deadline`.
     Returns that run's pieces."""
     anchor = run['at']
+    cur = anchor                       # where the run starts: the anchor, or earlier when it is led (J-cut)
+    lead_by = 0.0
     items = [(k, [dict(e) for e in els]) for k, els in run['items']]
 
     def flat(items_):
@@ -861,7 +891,7 @@ def _fit_run(run, deadline, lines, info, max_tempo, notes, words):
 
     def layout(seq, squeeze, tempo):
         """squeeze 0 keeps the natural pauses, 1 tightens them to PAUSE_KEEP."""
-        t, out = anchor, []
+        t, out = cur, []
         for idx, e in enumerate(seq):
             if idx > 0:
                 t += PAUSE_KEEP + (e['natural'] - PAUSE_KEEP) * (1.0 - squeeze)
@@ -876,8 +906,16 @@ def _fit_run(run, deadline, lines, info, max_tempo, notes, words):
     if deadline is not None and end > deadline + 0.02:
         laid, end = layout(seq, 1.0, 1.0)
         how = 'tightened'
+        if end > deadline + 0.02 and lead_max > 0.01:
+            # Silence is out and it still does not fit: bring it forward, under the picture before it.
+            shift = min(float(lead_max), max(0.0, anchor - float(lead_floor)), end - deadline)
+            if shift > 0.02:
+                cur, lead_by = anchor - shift, shift
+                laid, end = layout(seq, 1.0, 1.0)
+                notes.append(f'Narration line {items[0][0] + 1} starts {shift:.1f}s early, under the picture before it '
+                             f'(a J-cut), because it did not fit.')
         if end > deadline + 0.02:
-            need = (end - anchor) / max(deadline - anchor, 0.01)
+            need = (end - cur) / max(deadline - cur, 0.01)
             laid, end = layout(seq, 1.0, min(max_tempo, need))
             how = 'sped up'
         while end > deadline + 0.02:
@@ -916,6 +954,8 @@ def _fit_run(run, deadline, lines, info, max_tempo, notes, words):
             continue
         row['at'] = round(have[k][0]['at'], 2)
         row['end'] = round(have[k][-1]['at'] + have[k][-1]['dur'], 2)
+        if lead_by > 0.02 and k == items[0][0]:
+            row['lead'] = round(lead_by, 2)
         if how == 'trimmed' and (k == laid[-1]['line']) and row['status'] == 'ok':
             row['status'] = 'trimmed'
         elif how in ('tightened', 'sped up') and row['status'] == 'ok':

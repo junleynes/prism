@@ -239,6 +239,40 @@ def test_plan_vo_tightens_pauses_before_anything_else():
     assert any('Pauses' in n for n in plan['notes'])
 
 
+def _no_overlap(pieces):
+    pcs = sorted(pieces, key=lambda p: p['at'])
+    return all(b['at'] >= a['at'] + (a['b'] - a['a']) / a['tempo'] - 1e-6 for a, b in zip(pcs, pcs[1:]))
+
+
+def test_a_narration_that_fits_gets_no_j_cut_even_when_one_is_allowed():
+    lines = cc.parse_vo_script('00:02 Abangan ngayong gabi\n00:06 Only on GMA\n00:10 Huwag palampasin')
+    plan = cc.plan_vo(lines, VO_WORDS, window_end=15, lead_max=cc.LEAD_AUTO_MAX)
+    assert [round(p['at']) for p in plan['pieces']] == [2, 6, 10]
+    assert not any('lead' in l for l in plan['lines']) and not any('J-cut' in n for n in plan['notes'])
+
+
+def test_a_line_that_does_not_fit_after_its_silence_is_out_starts_under_the_picture_before_it():
+    lines = cc.parse_vo_script('00:02 Abangan ngayong gabi\n00:03 Only on GMA')
+    without = cc.plan_vo(lines, VO_WORDS, window_end=15)
+    assert without['pieces'][0]['tempo'] > 1.0 or not without['fits'] or any(l['status'] != 'ok' for l in without['lines'])
+    plan = cc.plan_vo(lines, VO_WORDS, window_end=15, lead_max=cc.LEAD_AUTO_MAX)
+    first = plan['pieces'][0]
+    assert first['at'] < 2.0 - 0.5, 'brought forward by about what it was short'
+    assert first['tempo'] == 1.0, 'led instead of sped up'
+    assert plan['lines'][0].get('lead', 0) > 0.5 and any('J-cut' in n for n in plan['notes'])
+    assert plan['lines'][0]['end'] <= 2.9 + 0.03, 'and it ends before the next line starts'
+    assert _no_overlap(plan['pieces'])
+
+
+def test_a_j_cut_never_goes_back_into_the_line_before_or_past_the_allowance():
+    lines = cc.parse_vo_script('00:00 Abangan ngayong gabi\n00:02 Only on GMA\n00:03 Huwag palampasin')
+    plan = cc.plan_vo(lines, VO_WORDS, window_end=15, lead_max=cc.LEAD_AUTO_MAX)
+    assert _no_overlap(plan['pieces']), 'the second line may not start over the first'
+    assert all(p['at'] >= 0 for p in plan['pieces'])
+    small = cc.plan_vo(cc.parse_vo_script('00:02 Abangan ngayong gabi\n00:03 Only on GMA'), VO_WORDS, window_end=15, lead_max=0.2)
+    assert small['pieces'][0]['at'] >= 2.0 - 0.2 - 1e-6, 'never more than the allowance'
+
+
 def test_plan_vo_speeds_up_only_a_little():
     lines = cc.parse_vo_script('Abangan ngayong gabi\nOnly on GMA\nHuwag palampasin')
     tight = cc.plan_vo(lines, VO_WORDS, window_end=60)

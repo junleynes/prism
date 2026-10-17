@@ -164,12 +164,26 @@ def test_each_line_starts_with_its_clip_and_the_tune_in_line_with_the_cards(brie
     clip_starts, card_starts = sb.timeline_starts([5.0, 7.0], [3.0, 3.0], 0.3)
     assert clip_starts == pytest.approx([0.0, 4.7]) and card_starts == pytest.approx([11.4, 14.1])
     lines, notes = sb.place_lines(brief['vo'], CLIPS, clip_starts, card_starts)
-    assert _ats(lines) == [0.12, 4.82, 11.6, None] and notes == []
+    # The title card's line starts with the title card, the end card's (the schedule) with the end card.
+    assert _ats(lines) == [0.12, 4.82, 11.6, 14.3] and len(notes) == 1 and 'end card' in notes[0]
     text = sb.vo_script_text(lines)
     assert text.splitlines()[0].startswith('@0.12s KAKANTA') and '@11.60s TASKFORCE FIREWALL' in text
     parsed = cutcraft.parse_vo_script(text)
-    assert [None if p['at'] is None else round(p['at'], 2) for p in parsed] == [0.12, 4.82, 11.6, None]
+    assert [None if p['at'] is None else round(p['at'], 2) for p in parsed] == [0.12, 4.82, 11.6, 14.3]
     assert parsed[3]['text'] == '8:50PM ON GMA PRIME'
+
+
+def test_the_title_cards_line_goes_to_the_title_card_and_the_end_cards_line_to_the_end_card():
+    assert sb.card_targets(['TASKFORCE FIREWALL', '8:50PM ON GMA PRIME'], 2) == [0, 1]
+    assert sb.card_targets(['8:50PM ON GMA PRIME', 'TASKFORCE FIREWALL'], 2) == [1, 0], 'by what it says, not by order'
+    assert sb.card_targets(['Abangan ngayong gabi', 'Huwag palampasin'], 2) == [0, 1], 'alike: first then second'
+    assert sb.card_targets(['8:50PM ON GMA PRIME'], 2) == [0], 'one line stays on the first card and plays on'
+    assert sb.card_targets(['TASKFORCE FIREWALL', '8:50PM ON GMA PRIME'], 1) == [0, 0], 'one card: all on it'
+    vo = [{'text': 'TASKFORCE FIREWALL', 'anchor': {'kind': 'card'}}, {'text': 'WEEKNIGHTS 8:50PM ON GMA PRIME', 'anchor': {'kind': 'card'}}]
+    lines, _ = sb.place_lines(vo, [], [], [10.0, 13.0], xfade=0.3, card_jcut=0.5)
+    assert _ats(lines) == [9.7, 13.2], 'the card lead is for the title card line only'
+    lines, _ = sb.place_lines(vo, [], [], [10.0])
+    assert _ats(lines) == [10.2, None], 'with one card the second line follows the first'
 
 
 def test_a_clip_that_was_dropped_makes_its_line_follow_the_line_before(brief):
@@ -197,6 +211,14 @@ def test_a_title_is_found_in_what_a_frame_reads_as_even_with_a_wrong_letter():
     assert cutcraft.title_in_text('TASKFORCE FIREWALL', 'rasa TASKF0RCE\nFIREWALL ')
     assert not cutcraft.title_in_text('TASKFORCE FIREWALL', 'FIREWALL')
     assert not cutcraft.title_in_text('TASKFORCE FIREWALL', '')
+
+
+def test_each_card_is_kept_as_long_as_its_own_line_needs():
+    floors, short = cutcraft.raise_floors_per_card([1.5, 1.5], [4.0, 3.0], [3.0, 2.0])
+    assert floors == [3.0, 2.0] and short == 0.0
+    floors, short = cutcraft.raise_floors_per_card([1.5, 1.5], [2.0, 3.0], [3.0, 0.0])
+    assert floors == [2.0, 1.5] and short == pytest.approx(1.0), 'never past the card, and it says by how much it is short'
+    assert cutcraft.raise_floors_per_card([1.5, 1.5], [4.0, 3.0], [None, None]) == ([1.5, 1.5], 0.0)
 
 
 def test_the_cards_are_kept_as_long_as_the_tune_in_line_needs():
@@ -234,7 +256,8 @@ def test_the_card_is_measured_for_where_its_title_appears(tmp_path):
 def test_the_job_turns_the_script_brief_into_timed_narration_text(brief):
     selected = [{'material': 1, 'trim_start': 213.0, 'selected_dur': 5.0}, {'material': 2, 'trim_start': 35.0, 'selected_dur': 7.0}]
     text, notes = pipeline._script_vo_text(brief, selected, [3.0, 3.0], 0.3)
-    assert text.splitlines()[1].startswith('@4.82s NGAYONG') and '@11.60s TASKFORCE' in text and notes == []
+    assert text.splitlines()[1].startswith('@4.82s NGAYONG') and '@11.60s TASKFORCE' in text and '@14.30s 8:50PM' in text
+    assert len(notes) == 1 and 'end card' in notes[0]
     assert pipeline._script_vo_text(None, selected, [3.0], 0.3) == (None, [])
     summary = pipeline._brief_summary(brief)
     assert summary['title'] == 'TASKFORCE FIREWALL' and summary['tone'] == 'MAANGAS' and len(summary['vo']) == 4
@@ -277,9 +300,9 @@ def test_the_scripts_clips_are_kept_whole_and_the_card_gets_what_is_left():
 def test_a_j_cut_starts_a_line_under_the_clip_before_but_never_before_the_start(brief):
     clip_starts, card_starts = sb.timeline_starts([5.0, 7.0], [3.0, 3.0], 0.3)
     lines, _ = sb.place_lines(brief['vo'], CLIPS, clip_starts, card_starts, jcut=0.5)
-    assert _ats(lines) == [0.12, 4.32, 11.1, None], 'the first clip has nothing before it'
+    assert _ats(lines) == [0.12, 4.32, 11.1, 13.8], 'the first clip has nothing before it'
     lines, _ = sb.place_lines(brief['vo'], CLIPS, clip_starts, card_starts, jcut=0.0)
-    assert _ats(lines) == [0.12, 4.82, 11.6, None]
+    assert _ats(lines) == [0.12, 4.82, 11.6, 14.3]
     lines, _ = sb.place_lines(brief['vo'], CLIPS, [0.0, 0.2], [0.3], jcut=5.0)
     assert all(l['at'] is None or l['at'] >= 0 for l in lines)
 
@@ -519,3 +542,71 @@ def test_a_sentence_wrapped_over_two_highlighted_rows_is_one_line_but_a_line_end
     b = sb.read_script_brief(_script_pdf(rows), 'script.pdf', '', [])
     assert [v['text'] for v in b['vo']] == ['AKO ANG NAGTIMBRE SA SINDIKATO PARA DI MO MALIGRAS KAPATID MO',
                                            'TASKFORCE FIREWALL', '8:50PM ON GMA PRIME']
+
+
+def _post_generate(**extra):
+    import io as _io
+    import unittest.mock as mock
+    import core
+    pipeline.ALLOW_LOCAL_MEDIA_UPLOAD, was = True, pipeline.ALLOW_LOCAL_MEDIA_UPLOAD
+    try:
+        return _post_generate_inner(_io, mock, core, **extra)
+    finally:
+        pipeline.ALLOW_LOCAL_MEDIA_UPLOAD = was
+
+
+def _post_generate_inner(_io, mock, core, **extra):
+    client = main.app.test_client()
+    with client.session_transaction() as sess:
+        sess.update(authed=True, user_id=1, username='admin', role='admin', csrf_token='t-jcut')
+    got = {}
+
+    class FakeThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            got['params'] = args[1] if len(args) > 1 else None
+
+        def start(self):
+            pass
+    core._job_submit_limiter.buckets.clear()
+    data = {'file': (_io.BytesIO(b'\x00' * 10), 'mat1.mp4'), 'genre': '', 'trailer_length': '15',
+            'scoring_mode': 'none', 'vo_mode': 'none'}
+    data.update(extra)
+    with mock.patch('requests.post'), mock.patch('requests.get'), mock.patch('pipeline.threading.Thread', FakeThread):
+        r = client.post('/api/trailer/generate', data=data, headers={'X-CSRF-Token': 't-jcut'},
+                        content_type='multipart/form-data')
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return got['params']
+
+
+def test_the_voice_lead_is_automatic_unless_the_form_says_otherwise():
+    p = _post_generate()
+    assert p['vo_jcut_auto'] is True and p['vo_jcut'] == 0.0, 'default: only where the narration does not fit'
+    p = _post_generate(vo_jcut='auto')
+    assert p['vo_jcut_auto'] is True and p['vo_jcut'] == 0.0
+    p = _post_generate(vo_jcut='0')
+    assert p['vo_jcut_auto'] is False and p['vo_jcut'] == 0.0, 'never'
+    p = _post_generate(vo_jcut='0.5')
+    assert p['vo_jcut_auto'] is False and p['vo_jcut'] == 0.5, 'always, by that much'
+    p = _post_generate(vo_jcut='9')
+    assert p['vo_jcut'] == 1.5
+    assert _post_generate(vo_jcut='nonsense')['vo_jcut_auto'] is True
+
+
+def test_the_plan_leads_a_line_only_where_it_does_not_fit_and_the_review_says_so(tmp_path, monkeypatch):
+    f = tmp_path / 'nar.wav'
+    f.write_bytes(b'x')
+    words = [{'word': w, 'start': s, 'end': e} for w, s, e in
+             [('abangan', 0.5, 1.0), ('ngayong', 1.05, 1.6), ('gabi', 1.65, 2.1), ('only', 3.0, 3.3), ('on', 3.35, 3.5), ('gma', 3.55, 4.1)]]
+    monkeypatch.setattr(pipeline, '_transcribe_vo_cached', lambda p, a, b: (words, []))
+    monkeypatch.setattr(pipeline, '_detect_silence_intervals', lambda *a, **k: [])
+    monkeypatch.setattr(pipeline, 'probe_duration', lambda p: 5.0)
+    text = '@2.00s Abangan ngayong gabi\n@3.00s Only on GMA'
+    tight = pipeline._build_vo_plan(str(f), text, 0.0, None, 0.0, 14.85, lead_max=cutcraft.LEAD_AUTO_MAX)
+    assert tight['lines'][0].get('lead', 0) > 0.5 and any('J-cut' in n for n in tight['notes'])
+    assert pipeline._vo_plan_summary(tight)['lines'][0]['lead'] > 0.5, 'the review gets it'
+    never = pipeline._build_vo_plan(str(f), text, 0.0, None, 0.0, 14.85, lead_max=0.0)
+    assert 'lead' not in never['lines'][0] and not any('J-cut' in n for n in never['notes'])
+    roomy = pipeline._build_vo_plan(str(f), '@2.00s Abangan ngayong gabi\n@6.00s Only on GMA', 0.0, None, 0.0, 14.85,
+                                    lead_max=cutcraft.LEAD_AUTO_MAX)
+    assert not any('lead' in l for l in roomy['lines']), 'fits: no J-cut'
+    assert pipeline._plan_view({'vo_jcut_auto': True}, tight, None, 15.0, 0.3)['jcut_auto'] is True

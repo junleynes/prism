@@ -1770,13 +1770,14 @@ document.addEventListener("DOMContentLoaded", function(){
         </select>
         <label style="margin-top:8px">Voice lead (J-cut)</label>
         <select name=vo_jcut id="vo-jcut-select">
-          <option value=0 selected>Voice starts with its picture</option>
-          <option value=0.3>Voice leads its picture by 0.3 s</option>
-          <option value=0.5>Voice leads its picture by 0.5 s</option>
-          <option value=0.8>Voice leads its picture by 0.8 s</option>
+          <option value=auto selected>Only when the narration does not fit</option>
+          <option value=0>Never: voice starts with its picture</option>
+          <option value=0.3>Always: voice leads its picture by 0.3 s</option>
+          <option value=0.5>Always: voice leads its picture by 0.5 s</option>
+          <option value=0.8>Always: voice leads its picture by 0.8 s</option>
         </select>
-        <p class="clean-help">A line may start under the end of the clip before it (a J-cut), and the tune-in line under the last scene. A line that runs past its clip carries on over the next picture (an L-cut) by itself.</p>
-        <p class="clean-help">Start a script line with a time (<code>00:03 VO: &hellip;</code>) to put it there; each line is cut from the recording at word edges. Too long? Pauses tighten, then up to 8&nbsp;% faster, then optional lines go, then it ends on a word. Add <code>(optional)</code> to a line that can be dropped.</p>
+        <p class="clean-help">Silence is trimmed first, and only where a line does not fit its room. If it still does not fit, the line starts under the end of the picture before it (a J-cut), by as much as it is short, up to 1.5&nbsp;s. A line that runs past its clip carries on over the next picture (an L-cut) by itself. With the tune-in lines for both cards, the title card's is said from the title card and the end card's from the end card.</p>
+        <p class="clean-help">Start a script line with a time (<code>00:03 VO: &hellip;</code>) to put it there; each line is cut from the recording at word edges. Too long? Silence and pauses tighten, then the line leads its picture (J-cut), then up to 8&nbsp;% faster, then optional lines go, then it ends on a word. Add <code>(optional)</code> to a line that can be dropped.</p>
       </div>
     </div>
   </details>
@@ -5420,7 +5421,7 @@ function renderPlanStrips(d){
       var hi = (Math.max.apply(null, srcs.map(function(l){ return l.src_out })) + 0.35).toFixed(1)
       useBtn = '<button type="button" class="browse-btn" style="padding:2px 8px;font-size:12px;margin-top:4px" onclick="applyRange(\'vo_upload\',' + lo + ',' + hi + ')">Set In ' + lo + ' / Out ' + hi + ' from the script</button>'
     }
-    put('plan-strip-vo', '<b>Plan from the script</b>' + (pv.jcut ? ' &middot; voice leads picture by ' + pv.jcut + ' s' : '') +
+    put('plan-strip-vo', '<b>Plan from the script</b>' + (pv.jcut ? ' &middot; voice always leads picture by ' + pv.jcut + ' s' : (pv.jcut_auto ? ' &middot; voice leads its picture only where it does not fit' : '')) +
       '<div style="position:relative;height:8px;background:rgba(128,128,128,.25);border-radius:2px;margin:4px 0">' + bar + '</div>' + rows + useBtn)
   }else put('plan-strip-vo', '')
   var cards = (pv.cards || []).filter(function(c){ return c.label })
@@ -5488,7 +5489,7 @@ function renderEditReport(d){
     var statusCls = {ok: 'ok', tightened: 'ok', 'sped up': 'warn', trimmed: 'warn', dropped: 'warn', missing: 'bad', 'cut off': 'bad'}
     var fmt = function(t){ return t == null ? '&ndash;' : (Math.floor(t / 60) + ':' + ('0' + (t % 60).toFixed(1)).slice(-4)) }
     var table = (vp.edited && vp.lines && vp.lines.length) ? '<table class="vo-lines">' + vp.lines.map(function(l, i){
-      return '<tr><td class="t">' + (i + 1) + '</td><td>' + esc((l.text || '').slice(0, 70)) + '</td><td class="t">' + fmt(l.at) + ' &rarr; ' + fmt(l.end) + '</td><td><span class="st ' + (statusCls[l.status] || '') + '">' + esc(l.status) + '</span></td></tr>'
+      return '<tr><td class="t">' + (i + 1) + '</td><td>' + esc((l.text || '').slice(0, 70)) + '</td><td class="t">' + fmt(l.at) + ' &rarr; ' + fmt(l.end) + '</td><td><span class="st ' + (statusCls[l.status] || '') + '">' + esc(l.status) + '</span>' + (l.lead ? ' <span class="st warn" title="Starts under the picture before it, because it did not fit">J-cut ' + l.lead.toFixed(1) + ' s</span>' : '') + '</td></tr>'
     }).join('') + '</table>' : ''
     var vnotes = (vp.notes || []).map(function(n){ return esc(n) }).join('<br>')
     if((vp.notes || []).some(function(n){ return /not found/.test(n) })) kind = 'warn'
@@ -13471,7 +13472,7 @@ job. Configured via env vars:
       <ul>
         <li><strong>Cuts.</strong> Every clip starts and ends in a pause, never inside a word. The room before and after speech is sized to the transition, a clip that begins mid-sentence moves to the start of that sentence, and a hairline gap between two words is skipped for a real pause. Where the sound really stops is measured, not only taken from the transcript. Script timecode cues are your own exact points and stay as written. The review marks every clip <em>Clean cut</em>, <em>Cut on a word</em> (on a word edge but mid-sentence), <em>Cut is tight</em> or <em>Cut mid-word</em>, and summarises them at the top; drop or swap the risky ones.</li>
         <li><strong>Title &amp; end cards.</strong> A card that would squeeze the scenes is shortened before scenes are chosen, but only after its own voice and its animation have finished (measured on the card itself); a card that is still moving at its last frame is left alone. The review shows each card&rsquo;s length and what the scenes get. The last sliver of a gap is closed by holding or trimming a card up to 12&nbsp;% of the plug (1&nbsp;s minimum, 3.6&nbsp;s on a 30&nbsp;s plug); if the plug would still miss its exact length, the old 1&nbsp;s last resort applies and the review says so. The Ready? panel shows the time budget as soon as you pick the card files, for example <code>15 s = title 6.0 + end card 6.0 + scenes 3.0</code>.</li>
-        <li><strong>Uploaded narration.</strong> The recording is read with speech-to-text. Start a script line with a time to place it there &mdash; <code>00:03 VO: Abangan ngayong gabi</code>, <code>[0:07.5] ...</code> or <code>@12.5s ...</code> &mdash; and each line is found in the recording and cut at word edges, so one recording with several lines can be placed at several points. Lines without a time follow the previous one with the pause the speaker left. If it is too long for the room it has, it is fitted in this order: pauses tighten (down to 0.15&nbsp;s), the speech speeds up by at most 8&nbsp;% (pitch kept), lines marked <code>(optional)</code> are dropped from the end, and as the very last step the end is trimmed at a word edge. A line the recording does not contain is reported, not guessed. With no times in the script, a recording that fits plays exactly as before. The review lists every line with its time and status. AI-voice (text-to-speech) narration is unchanged.</li>
+        <li><strong>Uploaded narration.</strong> The recording is read with speech-to-text. Start a script line with a time to place it there &mdash; <code>00:03 VO: Abangan ngayong gabi</code>, <code>[0:07.5] ...</code> or <code>@12.5s ...</code> &mdash; and each line is found in the recording and cut at word edges, so one recording with several lines can be placed at several points. Lines without a time follow the previous one with the pause the speaker left. If it is too long for the room it has, it is fitted in this order: silence and pauses tighten (down to 0.15&nbsp;s), then the line is brought forward under the picture before it (a J-cut, up to 1.5&nbsp;s, as much as it is short, and only then), the speech speeds up by at most 8&nbsp;% (pitch kept), lines marked <code>(optional)</code> are dropped from the end, and as the very last step the end is trimmed at a word edge. A line the recording does not contain is reported, not guessed. With no times in the script, a recording that fits plays exactly as before. The review lists every line with its time and status. AI-voice (text-to-speech) narration is unchanged.</li>
       </ul>
       <p>What happens, in order, from upload to finished export:</p>
       <div style="overflow-x:auto;margin:14px 0 18px;background:var(--sunken);border:1px solid var(--line);border-radius:var(--radius);padding:16px;text-align:center">

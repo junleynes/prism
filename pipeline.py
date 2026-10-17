@@ -3230,6 +3230,20 @@ def tighten_card_vo(vo_path, trim_start, trim_end, upload_dir=None, tag='cardvo'
         return unchanged
 
 
+def card_vo_overruns(card_path, vo_path, trim_start, trim_end, margin=0.05):
+    """Whether a card's narration (its In to Out, or to the end of the file) is longer than the card itself, so
+    the card would cut it off. Silence is only taken out of narration that does not fit: one that fits plays as
+    recorded. Unreadable lengths count as fitting."""
+    try:
+        card = probe_duration(card_path) or 0.0
+        total = probe_duration(vo_path) or 0.0
+        t0 = float(trim_start or 0.0)
+        t1 = float(trim_end) if trim_end is not None else total
+        return card > 0 and (t1 - t0) > card - margin
+    except Exception:
+        return False
+
+
 def mux_card_vo(video_path, vo_path, trim_start, trim_end, output_path):
     """Replace a title/end card video's audio with a trimmed window of an uploaded
     VO file: [trim_start, trim_end) seconds of vo_path (trim_end=None means to the
@@ -4174,9 +4188,12 @@ def _drop_duplicate_card_vo(params):
     return t, e, notes
 
 
-def _card_voice_need(params, brief):
-    """How long the tune-in voice-over line is, in the recording: the cards have to last that long. None when the
-    script has no such line, there is no uploaded narration, or its words cannot be found."""
+def _card_voice_needs(params, brief, n_cards=2):
+    """How long the voice-over lines said over the cards are, in the recording, per card: [title card, end card],
+    each seconds or None. With the script's tune-in lines split between the two cards (see
+    scriptbrief.card_targets) each card has to last as long as its own line; with one such line it is all on the
+    title card's entry and plays on over the cards that follow. None when the script has no such line, there is
+    no uploaded narration, or its words cannot be found."""
     vo = (brief or {}).get('vo') or []
     idx = [i for i, v in enumerate(vo) if v['anchor']['kind'] == 'card']
     path = params.get('vo_upload_path')
@@ -4188,13 +4205,16 @@ def _card_voice_need(params, brief):
     if not words:
         return None
     aligned = cutcraft.align_script([{'text': v['text'], 'at': None, 'optional': False} for v in vo], words)
-    lens = [cutcraft.spoken_length(words, a['w0'], a['w1']) for k, a in enumerate(aligned) if k in idx and a['w0'] is not None]
-    if not lens:
-        return None
-    return sum(lens) + cutcraft.LINE_GAP * (len(lens) - 1)
+    where = dict(zip(idx, scriptbrief.card_targets([vo[i]['text'] for i in idx], n_cards)))
+    lens = [[], []]
+    for k, a in enumerate(aligned):
+        if k in where and a['w0'] is not None:
+            lens[min(1, where[k])].append(cutcraft.spoken_length(words, a['w0'], a['w1']))
+    needs = [(sum(l) + cutcraft.LINE_GAP * (len(l) - 1)) if l else None for l in lens]
+    return needs if any(needs) else None
 
 
-def _build_vo_plan(vo_path, vo_text, trim_start, trim_end, vo_start, window_end):
+def _build_vo_plan(vo_path, vo_text, trim_start, trim_end, vo_start, window_end, lead_max=0.0):
     """Plan the uploaded narration: where each line goes and where it is cut.
 
     Reads the recording with Whisper (word times), reads the script text for
@@ -4229,7 +4249,7 @@ def _build_vo_plan(vo_path, vo_text, trim_start, trim_end, vo_start, window_end)
     if not lines:
         lines = [{'at': None, 'text': (sg.get('text') or '').strip(), 'optional': False}
                  for sg in segments if (sg.get('text') or '').strip()]
-    plan = cutcraft.plan_vo(lines, words, start_at=float(vo_start or 0.0), window_end=window_end)
+    plan = cutcraft.plan_vo(lines, words, start_at=float(vo_start or 0.0), window_end=window_end, lead_max=lead_max)
     total = probe_duration(vo_path) or 0.0
     span = (float(trim_end) if trim_end is not None else total) - float(trim_start or 0.0)
     legacy_end = float(vo_start or 0.0) + max(0.0, span)
@@ -4361,7 +4381,7 @@ def _suggest_card_vo_ranges(params, brief):
 
 def _plan_view(params, plan, card_fit_info, estimated, xfade_dur):
     """What the script's plan did to the narration, the cards and the music, for the strips under their selectors."""
-    view = {'jcut': params.get('vo_jcut') or 0.0}
+    view = {'jcut': params.get('vo_jcut') or 0.0, 'jcut_auto': bool(params.get('vo_jcut_auto'))}
     if plan and plan.get('lines'):
         src = {}
         for pc in plan.get('pieces') or []:
@@ -6712,10 +6732,14 @@ def api_trailer():
     cut_clean = request.form.get('cut_clean', 'on') != 'off'
     card_fit = 'off' if request.form.get('card_fit', 'fit') == 'off' else 'fit'
     vo_smart = request.form.get('vo_smart', 'on') != 'off'
+    # J-cut: a line may lead its picture. 'auto' (the default) leads a line only where the narration does not
+    # fit once its silence is trimmed, by as much as it is short; '0' never; a number always, by that much.
+    _jraw = (request.form.get('vo_jcut', 'auto') or 'auto').strip().lower()
+    vo_jcut_auto = _jraw == 'auto'
     try:
-        vo_jcut = min(1.5, max(0.0, float(request.form.get('vo_jcut', 0) or 0)))     # J-cut: a line may lead its picture
+        vo_jcut = 0.0 if vo_jcut_auto else min(1.5, max(0.0, float(_jraw)))
     except ValueError:
-        vo_jcut = 0.0
+        vo_jcut, vo_jcut_auto = 0.0, True
 
     # Same idea, for the uploaded background music track: which portion of
     # that source file to actually use, rather than always starting from
@@ -6995,7 +7019,7 @@ def api_trailer():
                   vo_rate=vo_rate, vo_start=vo_start, vo_volume=vo_volume, sync_beats=sync_beats, whisper_enhance=whisper_enhance,
                   selection_driver=selection_driver,
                   vo_trim_start=vo_trim_start, vo_trim_end=vo_trim_end,
-                  cut_clean=cut_clean, card_fit=card_fit, vo_smart=vo_smart, vo_jcut=vo_jcut,
+                  cut_clean=cut_clean, card_fit=card_fit, vo_smart=vo_smart, vo_jcut=vo_jcut, vo_jcut_auto=vo_jcut_auto,
                   scoring_audio_trim_start=scoring_audio_trim_start, scoring_audio_trim_end=scoring_audio_trim_end,
                   end_card_path=end_card_path, end_card_orig_name=end_card_orig_name,
                   end_card_video_start=end_card_video_start, end_card_video_end=end_card_video_end,
@@ -10753,11 +10777,12 @@ def _run_trailer_job(jid, params):
                 end_card_path = result
         if title_card_vo_path and os.path.exists(title_card_vo_path):
             muxed = os.path.join(app.config['UPLOAD_FOLDER'], f'titlecard_vo_{_card_vo_ts}.mp4')
-            if params.get('card_vo_tighten', True):
+            if params.get('card_vo_tighten', True) and card_vo_overruns(
+                    end_card_path, title_card_vo_path, title_card_vo_start, title_card_vo_end):
                 title_card_vo_path, title_card_vo_start, title_card_vo_end, _saved = tighten_card_vo(
                     title_card_vo_path, title_card_vo_start, title_card_vo_end, tag='tcvo')
                 if _saved:
-                    _vo_notes.append(f'Title card voice-over: {_saved:.1f}s of silence between and around the words taken out.')
+                    _vo_notes.append(f'Title card voice-over: longer than its card, so {_saved:.1f}s of silence between and around the words was taken out.')
             result = mux_card_vo(end_card_path, title_card_vo_path, title_card_vo_start, title_card_vo_end, muxed)
             if result:
                 end_card_path = result
@@ -10771,11 +10796,12 @@ def _run_trailer_job(jid, params):
                 schedule_card_path = result
         if end_card_vo_path and os.path.exists(end_card_vo_path):
             muxed = os.path.join(app.config['UPLOAD_FOLDER'], f'endcard_vo_{_card_vo_ts}.mp4')
-            if params.get('card_vo_tighten', True):
+            if params.get('card_vo_tighten', True) and card_vo_overruns(
+                    schedule_card_path, end_card_vo_path, end_card_vo_start, end_card_vo_end):
                 end_card_vo_path, end_card_vo_start, end_card_vo_end, _saved = tighten_card_vo(
                     end_card_vo_path, end_card_vo_start, end_card_vo_end, tag='ecvo')
                 if _saved:
-                    _vo_notes.append(f'End card voice-over: {_saved:.1f}s of silence between and around the words taken out.')
+                    _vo_notes.append(f'End card voice-over: longer than its card, so {_saved:.1f}s of silence between and around the words was taken out.')
             result = mux_card_vo(schedule_card_path, end_card_vo_path, end_card_vo_start, end_card_vo_end, muxed)
             if result:
                 schedule_card_path = result
@@ -10815,12 +10841,24 @@ def _run_trailer_job(jid, params):
         card_floors = [m[0] for m in measured]
         if card_fit != 'off':
             need_ = None
-            # The tune-in line of the narration plays over the cards: they must last as long as it does.
+            needs_ = None
+            # The narration said over the cards: they must last as long as it does.
             try:
-                need_ = _card_voice_need(params, brief_)
+                needs_ = _card_voice_needs(params, brief_, len(card_files))
             except Exception as e:
                 print(f'Tune-in line length not measured: {e}')
-                need_ = None
+                needs_ = None
+            if needs_ and len(card_files) > 1 and needs_[1]:
+                # A line for the title card and a line for the end card: each is said over its own card, from
+                # where it starts, so each card is kept at least as long as its own line.
+                wants_ = [(n + scriptbrief.CARD_LEAD + cutcraft.VO_TAIL) if n else 0.0 for n in needs_]
+                card_floors, short_ = cutcraft.raise_floors_per_card(card_floors, card_durations, wants_)
+                card_fit_info['notes'].append(
+                    f'The title card line is {needs_[0] or 0:.1f}s and the end card line {needs_[1]:.1f}s, '
+                    'each said over its own card, so each card is kept at least that long.'
+                    + (f' They are {short_:.1f}s too short for them even at full length.' if short_ > 0.05 else ''))
+            elif needs_ and needs_[0]:
+                need_ = needs_[0]
             if need_:
                 card_floors, short_ = cutcraft.raise_floors_for_voice(
                     card_floors, card_durations, need_ + scriptbrief.CARD_LEAD + cutcraft.VO_TAIL, xfade_dur)
@@ -11916,7 +11954,8 @@ def _run_trailer_job(jid, params):
                 plan_text, place_notes = _script_vo_text(params.get('script_brief'), selected, card_durations, xfade_dur, params.get('vo_jcut') or 0.0, params.get('card_jcut') or 0.0)
                 params['script_vo_notes'] = list(place_notes or []) + [n for n in (params.get('script_vo_notes') or []) if 'same recording' in n or 'whole narration' in n]
             params['vo_plan'] = _build_vo_plan(vo_upload_path, plan_text or vo_text, vo_trim_start, vo_trim_end,
-                                               vo_start, trailer_length - cutcraft.VO_TAIL)
+                                               vo_start, trailer_length - cutcraft.VO_TAIL,
+                                               lead_max=cutcraft.LEAD_AUTO_MAX if params.get('vo_jcut_auto') else 0.0)
         except Exception as e:
             print(f'VO planning skipped: {e}')
             params['vo_plan'] = None
@@ -12658,7 +12697,8 @@ def _run_trailer_job(jid, params):
                         if not (vo_text or '').strip():
                             plan_text, _n = _script_vo_text(params.get('script_brief'), selected, card_durations, xfade_dur, params.get('vo_jcut') or 0.0, params.get('card_jcut') or 0.0)
                         vo_plan = _build_vo_plan(vo_raw_path, plan_text or vo_text, vo_trim_start, vo_trim_end,
-                                                 vo_start, trailer_length - cutcraft.VO_TAIL)
+                                                 vo_start, trailer_length - cutcraft.VO_TAIL,
+                                                 lead_max=cutcraft.LEAD_AUTO_MAX if params.get('vo_jcut_auto') else 0.0)
                     except Exception as e:
                         print(f'VO planning skipped: {e}')
                         vo_plan = None
