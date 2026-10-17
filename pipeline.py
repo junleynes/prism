@@ -38,8 +38,9 @@ from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, l
     load_disabled_services, set_service_disabled, save_branding_theme, THEME_PRESETS,
     load_network_folders, save_network_folder, NETWORK_CATEGORY_KEYS,
     network_destinations_list, network_destination_get, network_destination_add,
-    network_destination_update, network_destination_remove)
+    network_destination_update, network_destination_remove, library_set_project, library_project_counts)
 from auth import require_permission, MEDIA_PERMISSIONS
+import project_routes
 import database
 
 # ---- Per-show asset templates (PostgreSQL `show_templates` table) ----
@@ -1708,6 +1709,21 @@ def _owns_or_admin(owner_user_id):
         return True
     uid = session.get('user_id')
     return uid is not None and owner_user_id == uid
+
+
+def _may_use_trailer(row):
+    """Play, download, send or open a saved trailer: its maker or an admin and -- because a project is its
+    group's, not its maker's -- anyone who may see the project it is filed under."""
+    if _owns_or_admin(row.get('user_id')):
+        return True
+    pid = row.get('project_id')
+    return bool(pid and project_routes.visible_project('episodic', pid))
+
+
+# Episodic Plug projects: where a programme's plugs are filed (see project_routes.py).
+project_routes.register(project_routes.Feature(
+    'episodic', 'promo_generation', ('plug', 'plugs'), project_routes.default_root('episodic_projects'),
+    library_project_counts, job_words={'promo': 'Generate'}))
 
 class JobGate:
     """Caps how many trailer jobs run at once. Limit is adjustable at runtime
@@ -6379,6 +6395,12 @@ def api_trailer():
     # or stolen session can't queue unbounded ffmpeg work for everyone else.
     if not _job_submit_limiter.allow(_client_ip()):
         return jsonify(error='Too many render requests. Wait a few minutes and try again.'), 429
+    # The project the plug is for, when the page sent one. Checked here for the same reason as the rate limit:
+    # before load_video() writes the upload. Left optional on the server so scripts that never had projects
+    # keep working; the page always sends it, so nothing it makes is saved loose.
+    project_id = (request.form.get('project_id') or '').strip() or None
+    if project_id and not project_routes.visible_project('episodic', project_id):
+        return jsonify(error='That project no longer exists. Pick another.'), 404
     path, orig_name = load_video(request)
     if not path:
         return jsonify(error=orig_name), 400
@@ -6933,6 +6955,7 @@ def api_trailer():
         if not orig_name:
             orig_name = os.path.basename(path)
     params = dict(path=path, orig_name=orig_name, mode=mode, genre=genre, scoring_mode=scoring_mode,
+                  project_id=project_id,
                   materials_paths=materials_paths or None,
                   # Captured here (inside the request, where `session` exists) rather
                   # than inside the background thread that actually renders --
@@ -6994,6 +7017,7 @@ def api_trailer():
             if template_applied:
                 template_applied['filled'].append(_k)
 
+    project_routes.track_job('episodic', jid, project_id, 'promo')
     threading.Thread(target=run_trailer_job_gated, args=(jid, params), daemon=True).start()
     return jsonify(job_id=jid)
 
@@ -7263,6 +7287,7 @@ def api_trailer_render():
                              '(it may have been cleaned up). Re-upload and analyse again.'), 410
 
     jid = job_new(user_id=session.get('user_id'), username=session.get('username'))
+    project_routes.track_job('episodic', jid, params.get('project_id'), 'promo')
     threading.Thread(target=run_trailer_job_gated, args=(jid, params), daemon=True).start()
     return jsonify(job_id=jid, dropped=sorted(drop), added=sorted(added), scenes=len(selected))
 
@@ -8535,7 +8560,35 @@ def api_trailer_library():
     """Lists saved trailers (most recent first) for the History panel. A
     regular account sees only trailers it saved; an admin sees everyone's."""
     is_admin = session.get('role') == 'admin'
+    wanted = (request.args.get('project_id') or '').strip()
+    if request.args.get('unfiled') in ('1', 'true'):
+        # The caller's own plugs that are in no project: made before projects, or whose project has gone.
+        return jsonify(ok=True, items=library_list(user_id=session.get('user_id'), is_admin=is_admin, project_id='',
+                                                   unfiled_ids=project_routes.existing_ids('episodic')))
+    if wanted:
+        # One project's plugs: everyone who may see the project sees what is filed in it, whoever made it.
+        if not project_routes.visible_project('episodic', wanted):
+            return jsonify(ok=False, error='That project no longer exists.'), 404
+        return jsonify(ok=True, items=library_list(limit=500, project_id=wanted))
     return jsonify(ok=True, items=library_list(user_id=session.get('user_id'), is_admin=is_admin))
+
+
+@app.route('/api/trailer/library/<int:tid>/project', methods=['POST'])
+@require_permission('promo_generation')
+def api_trailer_library_move(tid):
+    """Files a saved plug under a project -- one made before there were projects, or put in the wrong one. Its
+    maker or an admin, into a project they may see."""
+    row = library_get_row(tid)
+    if not row or not _owns_or_admin(row.get('user_id')):
+        return jsonify(ok=False, error='Not found'), 404
+    pid = str((request.get_json(silent=True) or {}).get('project_id') or '').strip()
+    proj = project_routes.visible_project('episodic', pid)
+    if not proj:
+        return jsonify(ok=False, error='That project no longer exists.'), 404
+    library_set_project(tid, proj['project_id'])
+    audit_log('trailer_move', target=row.get('orig_name') or f'trailer #{tid}', detail=project_routes.project_name('episodic', pid),
+              user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True)
 
 @app.route('/api/admin/library-stats')
 def api_admin_library_stats():
@@ -8569,7 +8622,7 @@ def api_trailer_library_get(tid):
     row = library_get_row(tid)
     if not row or not row.get('result_json'):
         return jsonify(ok=False, error='Not found'), 404
-    if not _owns_or_admin(row.get('user_id')):
+    if not _may_use_trailer(row):
         return jsonify(ok=False, error='Not found'), 404
     return jsonify(ok=True, result=json.loads(row['result_json']), created_at=row['created_at'])
 
@@ -8594,7 +8647,7 @@ def library_file(tid):
     row = library_get_row(tid)
     if not row:
         return jsonify(error='Not found'), 404
-    if not _owns_or_admin(row.get('user_id')):
+    if not _may_use_trailer(row):
         return jsonify(error='Not found'), 404
     return send_from_directory(LIBRARY_DIR, row['filename'], conditional=True)
 
@@ -8612,7 +8665,7 @@ def library_download(tid):
 @require_permission('promo_generation')
 def library_fcpxml(tid):
     row = library_get_row(tid)
-    if not row or not _owns_or_admin(row.get('user_id')):
+    if not row or not _may_use_trailer(row):
         return jsonify(error='Not found'), 404
     try:
         xml_text = build_fcpxml(row)
@@ -8642,7 +8695,7 @@ def _resolve_export_file(tid, fmt_key=None, custom_name=None):
     row = library_get_row(tid)
     if not row:
         return None, None, None, 'Not found', 404
-    if not _owns_or_admin(row.get('user_id')):
+    if not _may_use_trailer(row):
         return None, None, None, 'Not found', 404
     fmt_key = fmt_key or request.args.get('format', 'mp4_high')
     if fmt_key not in EXPORT_FORMATS:
@@ -9065,7 +9118,7 @@ def library_send_to_destination(tid):
     row = None
     if destination['delivery_kind'] in ('csv', 'csv_video', 'fcpxml'):
         row = library_get_row(tid)
-        if not row or not _owns_or_admin(row.get('user_id')):
+        if not row or not _may_use_trailer(row):
             return jsonify(ok=False, error='Not found'), 404
 
     if destination['delivery_kind'] == 'video':
@@ -12853,7 +12906,9 @@ def _run_trailer_job(jid, params):
     # either way, just without a permanent library entry.
     try:
         result['library_id'] = library_add(filename, result,
-                                            user_id=params.get('user_id'), username=params.get('username'))
+                                            user_id=params.get('user_id'), username=params.get('username'),
+                                            project_id=params.get('project_id'))
+        result['project_id'] = params.get('project_id')
     except Exception as e:
         print(f'Trailer library save failed (job still succeeded): {e}')
     job_set(jid, percent=100, step='Done', done=True, result=result)

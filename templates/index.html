@@ -1110,6 +1110,7 @@ input.sh-num[type=number]{width:92px}
 .peak-meter-labels .ch-letter{opacity:.6}
 .peak-meter-labels .ch-db{font-weight:600;white-space:nowrap}
 </style>
+<script src="/static/projects.js"></script>
 </head>
 <body>
 <div id="net-modal-overlay" class="net-modal-overlay">
@@ -1251,7 +1252,7 @@ var CURRENT_USERNAME = {{ current_username|tojson }}
 </nav>
 <div class="container">
 
-<script>function switchTab(id,btn){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.sub-panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.sub-tab').forEach(t=>t.classList.remove('active'));btn.classList.add('active');var panel=document.getElementById(id);panel.classList.add('active');var firstSubTab=panel.querySelector('.sub-tab');var firstSubPanel=panel.querySelector('.sub-panel');if(firstSubTab&&firstSubPanel){firstSubTab.classList.add('active');firstSubPanel.classList.add('active')}if(id==='p-config'&&typeof loadConfigTab==='function'&&!configTabLoaded){loadConfigTab()}if(id==='p-config'&&typeof loadBrandingTab==='function'){loadBrandingTab()}if(id==='p-config'&&typeof loadNetworkFolders==='function'&&!networkFoldersLoaded){loadNetworkFolders()}if(id==='p-config'&&typeof loadNetworkDestinations==='function'&&!networkDestinationsLoaded){loadNetworkDestinations()}if(id==='p-config'&&typeof loadProductionTab==='function'&&!productionTabLoaded){loadProductionTab()}if(id==='p-config'&&typeof loadTwofaStatus==='function'&&!twofaLoaded){loadTwofaStatus()}if(id==='p-config'&&typeof loadUsersTab==='function'&&!usersTabLoaded){loadUsersTab()}if(id==='p-config'&&typeof loadAuditLog==='function'&&!auditLogLoaded){loadAuditLog()}if(id==='p-music'&&typeof loadAceStepModels==='function'){loadAceStepModels()}if(id==='p-music'&&typeof loadAceStepLoras==='function'){loadAceStepLoras()}if(id==='p-music'&&typeof loadLoraDatasets==='function'){loadLoraDatasets()}if(id==='p-shorts'&&typeof shortsOnTabOpen==='function'){shortsOnTabOpen()}if(id==='p-schedule'&&typeof scheduleOnTabOpen==='function'){scheduleOnTabOpen()}if(id==='p-jobs'&&typeof loadAdminJobs==='function'){loadAdminJobs()}if(id==='p-dashboard'&&typeof loadDashboard==='function'){loadDashboard()}try{localStorage.setItem('prism_last_tab',id)}catch(e){}}function switchSubTab(id,btn){document.querySelectorAll('.sub-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.sub-panel').forEach(p=>p.classList.remove('active'));btn.classList.add('active');document.getElementById(id).classList.add('active');try{var panel=btn.closest('.panel');if(panel)localStorage.setItem('prism_subtab_'+panel.id,id)}catch(e){}}
+<script>function switchTab(id,btn){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.sub-panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.sub-tab').forEach(t=>t.classList.remove('active'));btn.classList.add('active');var panel=document.getElementById(id);panel.classList.add('active');var firstSubTab=panel.querySelector('.sub-tab');var firstSubPanel=panel.querySelector('.sub-panel');if(firstSubTab&&firstSubPanel){firstSubTab.classList.add('active');firstSubPanel.classList.add('active')}if(id==='p-config'&&typeof loadConfigTab==='function'&&!configTabLoaded){loadConfigTab()}if(id==='p-config'&&typeof loadBrandingTab==='function'){loadBrandingTab()}if(id==='p-config'&&typeof loadNetworkFolders==='function'&&!networkFoldersLoaded){loadNetworkFolders()}if(id==='p-config'&&typeof loadNetworkDestinations==='function'&&!networkDestinationsLoaded){loadNetworkDestinations()}if(id==='p-config'&&typeof loadProductionTab==='function'&&!productionTabLoaded){loadProductionTab()}if(id==='p-config'&&typeof loadTwofaStatus==='function'&&!twofaLoaded){loadTwofaStatus()}if(id==='p-config'&&typeof loadUsersTab==='function'&&!usersTabLoaded){loadUsersTab()}if(id==='p-config'&&typeof loadAuditLog==='function'&&!auditLogLoaded){loadAuditLog()}if(id==='p-music'&&typeof loadAceStepModels==='function'){loadAceStepModels()}if(id==='p-music'&&typeof loadAceStepLoras==='function'){loadAceStepLoras()}if(id==='p-music'&&typeof loadLoraDatasets==='function'){loadLoraDatasets()}if(id==='p-shorts'&&typeof shortsOnTabOpen==='function'){shortsOnTabOpen()}if(id==='p-schedule'&&typeof scheduleOnTabOpen==='function'){scheduleOnTabOpen()}if(id==='p-trailer'&&typeof episodicOnTabOpen==='function'){episodicOnTabOpen()}if(id==='p-jobs'&&typeof loadAdminJobs==='function'){loadAdminJobs()}if(id==='p-dashboard'&&typeof loadDashboard==='function'){loadDashboard()}try{localStorage.setItem('prism_last_tab',id)}catch(e){}}function switchSubTab(id,btn){document.querySelectorAll('.sub-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.sub-panel').forEach(p=>p.classList.remove('active'));btn.classList.add('active');document.getElementById(id).classList.add('active');try{var panel=btn.closest('.panel');if(panel)localStorage.setItem('prism_subtab_'+panel.id,id)}catch(e){}}
 document.addEventListener('DOMContentLoaded',function(){
   // Restore the tab (and, within it, the sub-tab) the user was last on,
   // since switchTab()/switchSubTab() only toggle CSS classes client-side
@@ -1612,6 +1613,9 @@ document.addEventListener("DOMContentLoaded", function(){
 <!-- Episodic Promo Plug -->
 <div id="p-trailer" class="panel{{ ' active' if default_tab == 'p-trailer' else '' }}">
 <h2>Episodic Promo Plug Generator</h2>
+<p id="ep-intro" style="font-size:12px;opacity:.75;margin-top:-6px">Promo plugs are made inside a project: the episode they are for. Create the project first &mdash; programme, episode, air date, a description and a picture &mdash; or open one, then make its plugs there. Every plug you save for it is kept together in it, and everyone in the project&rsquo;s group can play, download and send them.</p>
+<div id="ep-projects"></div>
+<div id="ep-work">
 <div id=tr-steps class=ws-steps role="tablist" aria-label="Steps">
   <button type=button class="ws-step active" data-trstep=setup onclick="trScreen('setup')"><b>1</b> Episode &amp; settings</button>
   <button type=button class="ws-step" data-trstep=review onclick="trScreen('review')" disabled><b>2</b> Review the cut <span id=tr-step-count class=ws-count></span></button>
@@ -3008,7 +3012,7 @@ document.addEventListener("DOMContentLoaded", function(){
     if(data.script_brief && typeof autoFillVoFromScript === 'function') autoFillVoFromScript()
     if(data.skipped && data.skipped.length){
       skipEl.innerHTML = data.skipped.map(function(s){
-        return '<div>Skipped: ' + (s.line || '') + ' — ' + (s.reason || '') + '</div>'
+        return '<div>Skipped: ' + escapeHtmlLite(s.line || '') + ' — ' + escapeHtmlLite(s.reason || '') + '</div>'
       }).join('')
     } else {
       skipEl.textContent = ''
@@ -3987,6 +3991,7 @@ document.addEventListener("DOMContentLoaded", function(){
 </div>
 </div><!-- /.work-out -->
 </div><!-- /.work -->
+</div><!-- /#ep-work -->
 </div>
 
 <script>
@@ -4755,6 +4760,8 @@ async function submitTrailer(previewOnly){
     var manualEntries = collectManualCues()
     if(manualEntries.length) fd.append('manual_cues', JSON.stringify(manualEntries))
   }
+
+  if(episodicProjectId()) fd.append('project_id', episodicProjectId())
 
   let startData
   try{
@@ -7433,6 +7440,68 @@ window.closeTrailerResult = closeTrailerResult;
 // library on the server (survives restarts), shown here as a collapsible
 // list. Click a row to view/download it again without regenerating; click
 // the x to delete it permanently (removes the row and the saved file).
+// ---- Projects: the same screens as Vertical Shorts (static/projects.js) ----
+var EPP = null
+function episodicProjectId(){ return (window.PRISM_PROJECT || {}).episodic || null }
+
+function episodicProjectsInit(){
+  if(EPP || !window.PrismProjects) return
+  EPP = PrismProjects.create({
+    kind: 'episodic', prefix: 'ep', mount: 'ep-projects', work: 'ep-work', intro: 'ep-intro', noun: ['plug', 'plugs'],
+    onOpen: function(p, fresh, refresh){
+      if(!refresh){
+        // Back to the first step, with another project's result gone.
+        try{ if(typeof trScreen === 'function') trScreen('setup') }catch(e){}
+        var prompt = document.getElementById('tr-prompt')
+        if(prompt) prompt.style.display = ''
+      }
+      if(window.refreshTrailerHistory) window.refreshTrailerHistory()
+    },
+    loadUnfiled: episodicLoadUnfiled
+  })
+}
+
+// Plugs that are in no project: made before projects existed. Shown to whoever made them (and admins), each with a
+// "Move to" to file it.
+async function episodicLoadUnfiled(ctl, host, wrap){
+  try{
+    var d = await (await fetch('/api/trailer/library?unfiled=1')).json()
+    host.innerHTML = ''
+    wrap.style.display = d.ok && d.items.length ? 'block' : 'none'
+    if(!d.ok) return
+    d.items.forEach(function(item){
+      var row = document.createElement('div')
+      row.className = 'history-row'
+      var by = IS_ADMIN && item.username ? ' &middot; by ' + escapeHtmlLite(item.username) : ''
+      row.innerHTML = '<div class="history-main"><div class="h-name">' + escapeHtmlLite(item.orig_name || 'Untitled') + '</div>' +
+        '<div class="h-meta">' + escapeHtmlLite(String(item.trailer_duration)) + 's &middot; ' + window.fmtTrailerWhen(item.created_at) + by + '</div></div>'
+      row.querySelector('.history-main').addEventListener('click', function(){
+        fetch('/api/trailer/library/' + item.id).then(function(r){ return r.json() }).then(function(d2){
+          if(d2.ok) window.open('/library/' + item.id + '/file', '_blank')
+        })
+      })
+      row.appendChild(ctl.moveSelect(async function(pid){
+        try{
+          var r = await (await fetch('/api/trailer/library/' + item.id + '/project', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project_id: pid})})).json()
+          if(!r.ok){ alert(r.error || 'Could not move it.'); return }
+          ctl.reload()
+        }catch(e){ alert('Could not move it: ' + e) }
+      }))
+      host.appendChild(row)
+    })
+  }catch(e){ wrap.style.display = 'none' }
+}
+
+function episodicOnTabOpen(){
+  episodicProjectsInit()
+  if(EPP) EPP.reload()
+}
+document.addEventListener('DOMContentLoaded', function(){
+  var p = document.getElementById('p-trailer')
+  if(p && p.classList.contains('active')) episodicOnTabOpen()
+})
+
 (function(){
   var body = document.getElementById('tr-history-body')
   var toggle = document.getElementById('tr-history-toggle')
@@ -7447,8 +7516,10 @@ window.closeTrailerResult = closeTrailerResult;
   }
 
   function refreshHistory(){
-    fetch('/api/trailer/library').then(function(r){ return r.json() }).then(function(d){
-      if(!d.ok) return
+    var pid = episodicProjectId()
+    if(!pid){ countEl.textContent = ''; listEl.innerHTML = '<div class="net-modal-empty">Open a project to see its plugs.</div>'; return }
+    fetch('/api/trailer/library?project_id=' + encodeURIComponent(pid)).then(function(r){ return r.json() }).then(function(d){
+      if(!d.ok || episodicProjectId() !== pid) return
       countEl.textContent = d.items.length ? '(' + d.items.length + ')' : ''
       if(!d.items.length){
         listEl.innerHTML = '<div class="net-modal-empty">No saved plugs yet.</div>'
@@ -7458,10 +7529,10 @@ window.closeTrailerResult = closeTrailerResult;
       d.items.forEach(function(item){
         var row = document.createElement('div')
         row.className = 'history-row'
-        var byLine = (IS_ADMIN && item.username) ? ' &middot; by ' + item.username : ''
+        var byLine = item.username ? ' &middot; by ' + escapeHtmlLite(item.username) : ''
         row.innerHTML =
           '<div class="history-main">' +
-            '<div class="h-name">' + (item.orig_name || 'Untitled') + '</div>' +
+            '<div class="h-name">' + escapeHtmlLite(item.orig_name || 'Untitled') + '</div>' +
             '<div class="h-meta">' + item.trailer_duration + 's &middot; ' + fmtWhen(item.created_at) + byLine + '</div>' +
           '</div>' +
           '<span class="history-del" title="Delete">&#10005;</span>'
@@ -7475,13 +7546,14 @@ window.closeTrailerResult = closeTrailerResult;
         row.querySelector('.history-del').addEventListener('click', function(e){
           e.stopPropagation()
           if(!confirm('Delete "' + (item.orig_name || 'this plug') + '" permanently? This removes the saved file too.')) return
-          fetch('/api/trailer/library/' + item.id + '/delete', {method: 'POST'}).then(function(){ refreshHistory() })
+          fetch('/api/trailer/library/' + item.id + '/delete', {method: 'POST'}).then(function(){ refreshHistory(); if(window.EPP) EPP.reload() })
         })
         listEl.appendChild(row)
       })
     }).catch(function(){})
   }
   window.refreshTrailerHistory = refreshHistory
+  window.fmtTrailerWhen = fmtWhen
 
   toggle.addEventListener('click', function(){
     expanded = !expanded
@@ -11517,6 +11589,9 @@ document.addEventListener('DOMContentLoaded', function(){
 <!-- Schedule Plug -->
 <div id="p-schedule" class="panel{{ ' active' if default_tab == 'p-schedule' else '' }}">
 <h2>Schedule Plug</h2>
+<p id="sk-intro" style="font-size:12px;opacity:.75;margin-top:-6px">Schedule plugs are made inside a project: the episode they are for. Create the project first &mdash; programme, episode, air date, a description and a picture &mdash; or open one, then make its plugs there. Every plug you render for it is kept together in it, and everyone in the project&rsquo;s group can play and download them.</p>
+<div id="sk-projects"></div>
+<div id="sk-work">
 <div class="sub-tabs">
   <div class="sub-tab active" onclick="switchSubTab('p-schedule-create',this)" role="button" tabindex="0">Create</div>
   <div class="sub-tab" onclick="switchSubTab('p-schedule-saved',this);scheduleLoadSaved()" role="button" tabindex="0">Saved plugs</div>
@@ -11699,8 +11774,9 @@ document.addEventListener('DOMContentLoaded', function(){
 </div>
 
 <div id="p-schedule-saved" class="sub-panel">
-<p style="font-size:12px;opacity:.75;margin-top:-6px">Every plug is kept here until you delete it{% if current_role == 'admin' %} (as an admin you see everyone's){% endif %}.</p>
+<p style="font-size:12px;opacity:.75;margin-top:-6px">Every plug made for this project is kept here until you delete it, and is shared with everyone in the project&rsquo;s group.</p>
 <div id=sp-saved></div>
+</div>
 </div>
 </div>
 
@@ -12425,6 +12501,7 @@ async function spBatchRun(){
     var fd = new FormData()
     fd.append('schedule_image_network', b.net)
     fd.append('preset_id', 'last')
+    if(scheduleProjectId()) fd.append('project_id', scheduleProjectId())
     fd.append('duration', spEl('sp-duration').value)
     fd.append('style', spEl('sp-style').value)
     fd.append('text_motion', spEl('sp-text').value)
@@ -12497,6 +12574,8 @@ async function spBatchRun(){
 
 
 async function scheduleOnTabOpen(){
+  scheduleProjectsInit()
+  if(SKP) SKP.reload()
   if(SP.options) return
   try{
     var d = await (await fetch('/api/schedule/options')).json()
@@ -12611,6 +12690,7 @@ function spForm(){
   fd.append('text_motion', spEl('sp-text').value)
     fd.append('timing', spEl('sp-timing').value)
   fd.append('prompt', spEl('sp-prompt').value)
+  if(scheduleProjectId()) fd.append('project_id', scheduleProjectId())
   return fd
 }
 
@@ -12642,6 +12722,7 @@ async function scheduleRender(){
   spEl('sp-batch').style.display = 'block'
   spLooksLoad()
   spScreen('result')
+  if(SKP) SKP.reload()
 }
 
 function spCard(p, fresh){
@@ -12754,21 +12835,77 @@ async function scheduleDelete(pid){
     document.querySelectorAll('[data-plug="' + pid + '"]').forEach(function(el){ el.remove() })
     if(spEl('sp-result') && !spEl('sp-result').children.length) spEl('sp-result').style.display = 'none'
     if(spEl('sp-saved') && !spEl('sp-saved').children.length) scheduleLoadSaved()
+    if(SKP) SKP.reload()
   }catch(e){ alert('Could not delete: ' + e) }
 }
 
 async function scheduleLoadSaved(){
   var host = spEl('sp-saved')
   if(!host) return
+  var pid = scheduleProjectId()
+  if(!pid){ host.innerHTML = '<div class=no-data>Open a project to see its plugs.</div>'; return }
   host.innerHTML = '<div class=no-data>Loading&hellip;</div>'
   try{
-    var d = await (await fetch('/api/schedule/items')).json()
+    var d = await (await fetch('/api/schedule/items?project_id=' + encodeURIComponent(pid))).json()
+    if(scheduleProjectId() !== pid) return                    // another project was opened meanwhile
     host.innerHTML = ''
-    if(!d.ok || !d.items.length){ host.innerHTML = '<div class=no-data>No schedule plugs made yet.</div>'; return }
+    if(!d.ok || !d.items.length){ host.innerHTML = '<div class=no-data>No schedule plugs in this project yet. Make one under <b>Create</b>.</div>'; return }
     d.items.forEach(function(p){ var c = spCard(p, false); c.style.marginBottom = '14px'; host.appendChild(c) })
   }catch(e){
     host.innerHTML = '<div class=no-data><span style="color:var(--amber)">Could not load saved plugs: ' + escapeHtmlLite(String(e)) + '</span></div>'
   }
+}
+
+// ---- Projects: the same screens as Vertical Shorts (static/projects.js) ----
+var SKP = null
+function scheduleProjectId(){ return (window.PRISM_PROJECT || {}).schedule || null }
+
+function scheduleProjectsInit(){
+  if(SKP || !window.PrismProjects) return
+  var lastOpened = null
+  SKP = PrismProjects.create({
+    kind: 'schedule', prefix: 'sk', mount: 'sk-projects', work: 'sk-work', intro: 'sk-intro', noun: ['plug', 'plugs'],
+    onOpen: function(p, fresh, refresh){
+      var tabs = document.querySelectorAll('#p-schedule .sub-tabs .sub-tab')
+      if(!refresh){
+        // A new project, or one with no plugs, opens ready to make its first; otherwise on its plugs.
+        var create = fresh || !p.count
+        switchSubTab(create ? 'p-schedule-create' : 'p-schedule-saved', tabs[create ? 0 : 1])
+      }
+      // Another project's result is not this one's.
+      if(lastOpened !== p.project_id && spEl('sp-result')){ spEl('sp-result').innerHTML = ''; spEl('sp-result').style.display = 'none' }
+      lastOpened = p.project_id
+      scheduleLoadSaved()
+    },
+    onClose: function(){ lastOpened = null },
+    loadUnfiled: scheduleLoadUnfiled
+  })
+}
+
+// Plugs that are in no project: made before projects existed. Shown to whoever made them (and admins), each with a
+// "Move to" to file it.
+async function scheduleLoadUnfiled(ctl, host, wrap){
+  try{
+    var d = await (await fetch('/api/schedule/items?unfiled=1')).json()
+    host.innerHTML = ''
+    wrap.style.display = d.ok && d.items.length ? 'block' : 'none'
+    if(!d.ok) return
+    d.items.forEach(function(p){
+      var c = spCard(p, false); c.style.marginBottom = '14px'
+      var bar = document.createElement('div')
+      bar.style.cssText = 'display:flex;gap:8px;align-items:center;margin-top:8px;font-size:12px'
+      bar.appendChild(ctl.moveSelect(async function(pid){
+        try{
+          var r = await (await fetch('/api/schedule/items/' + p.plug_id + '/project', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project_id: pid})})).json()
+          if(!r.ok){ alert(r.error || 'Could not move it.'); return }
+          ctl.reload()
+        }catch(e){ alert('Could not move it: ' + e) }
+      }))
+      c.appendChild(bar)
+      host.appendChild(c)
+    })
+  }catch(e){ wrap.style.display = 'none' }
 }
 
 document.addEventListener('DOMContentLoaded', function(){
@@ -16093,7 +16230,7 @@ function _dashLoadRecent(){
       var when = it.created_at ? new Date(it.created_at * 1000).toLocaleDateString() : ''
       var dur = (it.trailer_duration != null) ? it.trailer_duration + 's' : ''
       return '<div class="dash-recent-row" data-idx="' + i + '" style="display:flex;justify-content:space-between;gap:10px;padding:6px 4px;border-bottom:1px solid var(--line);cursor:pointer;border-radius:6px">' +
-             '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (it.orig_name || 'Untitled') + '</span>' +
+             '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtmlLite(it.orig_name || 'Untitled') + '</span>' +
              '<span style="opacity:.6;font-size:12px;white-space:nowrap">' + dur + (dur && when ? ' &middot; ' : '') + when + '</span></div>'
     }).join('')
     // Clicking a row jumps to Generate Promo Plug and shows that exact saved

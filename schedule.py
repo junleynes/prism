@@ -27,6 +27,7 @@ from core import app, _job_submit_limiter, _RateLimiter, _client_ip
 from library_db import LIBRARY_DIR, audit_log, network_destination_get
 from auth import require_permission
 import pipeline
+import project_routes
 import schedule_core as sk
 import shorts_core
 
@@ -77,6 +78,7 @@ def _load_manifest(pid):
 def _public(m):
     pid = m['plug_id']
     return {'plug_id': pid, 'title': m.get('title'), 'created': m.get('created'), 'username': m.get('username'),
+            'project_id': m.get('project_id'),
             'duration': m.get('duration'), 'format': m.get('format'), 'format_label': m.get('format_label'),
             'loudness': m.get('loudness'),
             'size': m.get('size'), 'file': m.get('file'), 'layers': m.get('layers'), 'layered': m.get('layered'),
@@ -221,7 +223,8 @@ def _run(jid, params):
                                                                   interpolation=cv2.INTER_AREA)):
             poster = None
         manifest = {'plug_id': pid, 'created': time.time(), 'user_id': params.get('user_id'),
-                    'username': params.get('username'), 'title': params['orig_name'], 'duration': duration,
+                    'username': params.get('username'), 'project_id': params.get('project_id'),
+                    'title': params['orig_name'], 'duration': duration,
                     'format': fmt, 'format_label': pipeline.EXPORT_FORMATS[fmt]['label'], 'file': name,
                     'size': os.path.getsize(out), 'preview': preview, 'poster': poster,
                     'layers': names, 'layered': art['layered'], 'prompt': params.get('prompt') or '',
@@ -287,6 +290,50 @@ def _house_loudness():
     """Config > Production's loudness target: what a plug's music is
     levelled to unless another level is chosen for that plug."""
     return float(pipeline.load_production_defaults().get('target_loudness', -14.0))
+
+
+def _may_use(m):
+    """Play, download or send a plug: its maker or an admin and -- because a project is its group's, not its
+    maker's -- anyone who may see the project it is filed under."""
+    if pipeline._owns_or_admin(m.get('user_id')):
+        return True
+    pid = m.get('project_id')
+    return bool(pid and project_routes.visible_project('schedule', pid))
+
+
+def _all_manifests():
+    """Every saved plug's manifest, newest first."""
+    try:
+        names = sorted((n for n in os.listdir(SCHEDULE_DIR) if _PLUG_ID.match(n)), reverse=True)
+    except OSError:
+        names = []
+    for name in names:
+        m = _load_manifest(name)
+        if m:
+            yield m
+
+
+def _project_counts():
+    """{project id: {'count', 'last', 'poster'}} from the plugs on disk: how many are filed in each project, when
+    the newest was made, and a frame of it."""
+    counts = {}
+    for m in _all_manifests():
+        pid = m.get('project_id')
+        if not pid:
+            continue
+        c = counts.setdefault(pid, {'count': 0, 'last': None, 'poster': None})
+        c['count'] += 1
+        if c['last'] is None:                       # newest first, so the first seen is the latest
+            c['last'] = m.get('created')
+            if m.get('poster'):
+                c['poster'] = f"/api/schedule/file/{m['plug_id']}/{m['poster']}"
+    return counts
+
+
+# Schedule Plug projects: where a programme's plugs are filed (see project_routes.py).
+project_routes.register(project_routes.Feature(
+    'schedule', 'schedule_plug', ('plug', 'plugs'), project_routes.default_root('schedule_projects'),
+    _project_counts, job_words={'schedule': 'Render'}))
 
 
 @app.route('/api/schedule/options')
@@ -646,6 +693,11 @@ def api_schedule_storyboard():
 def api_schedule_render():
     if not _job_submit_limiter.allow(_client_ip()):
         return jsonify(error='Too many render requests. Wait a few minutes and try again.'), 429
+    # The project the plug is for, when the page sent one: optional here so scripts that never had projects keep
+    # working; the page always sends it, so nothing it makes is saved loose.
+    project_id = (request.form.get('project_id') or '').strip() or None
+    if project_id and not project_routes.visible_project('schedule', project_id):
+        return jsonify(error='That project no longer exists. Pick another.'), 404
     try:
         duration = int(float(request.form.get('duration') or 0))
     except ValueError:
@@ -682,7 +734,7 @@ def api_schedule_render():
               'timing': 'together' if request.form.get('timing') == 'together' else 'stagger',
               'loudness': pipeline.resolve_loudness(request.form.get('loudness'), _house_loudness()),
               'prompt': ' '.join((request.form.get('prompt') or '').split())[:600],
-              'user_id': session.get('user_id'), 'username': session.get('username')}
+              'user_id': session.get('user_id'), 'username': session.get('username'), 'project_id': project_id}
     look = (request.form.get('preset_id') or '').strip()
     if look == 'last':
         look = f"last_{session.get('user_id')}"
@@ -708,6 +760,7 @@ def api_schedule_render():
         for k in list(_JOBS)[:250]:
             _JOBS.pop(k, None)
     _JOBS[jid] = True
+    project_routes.track_job('schedule', jid, project_id, 'schedule')
     _spawn(pipeline.run_trailer_job_gated, jid, params, runner=_guard(_run, _settle))
     return jsonify(job_id=jid)
 
@@ -743,28 +796,54 @@ def api_schedule_cancel(job_id):
 @app.route('/api/schedule/items')
 @require_permission('schedule_plug')
 def api_schedule_items():
-    """Saved plugs, newest first. A regular account sees its own; an admin
-    sees everyone's -- the same rule as the trailer library."""
+    """Saved plugs, newest first. A regular account sees its own; an admin sees everyone's -- the same rule as
+    the trailer library. ?project_id= lists one project's plugs instead: whoever may see the project sees all of
+    them, whoever made them. ?unfiled=1 lists the caller's own plugs that are in no project (made before projects,
+    or whose project has gone)."""
+    wanted = (request.args.get('project_id') or '').strip()
+    unfiled = request.args.get('unfiled') in ('1', 'true')
+    if wanted and not project_routes.visible_project('schedule', wanted):
+        return jsonify(ok=False, error='That project no longer exists.'), 404
+    known = set(project_routes.existing_ids('schedule')) if unfiled else set()
     out = []
-    try:
-        names = sorted((n for n in os.listdir(SCHEDULE_DIR) if _PLUG_ID.match(n)), reverse=True)
-    except OSError:
-        names = []
-    for name in names:
-        m = _load_manifest(name)
-        if not m or not pipeline._owns_or_admin(m.get('user_id')):
+    for m in _all_manifests():
+        if wanted:
+            if m.get('project_id') != wanted:
+                continue
+        elif not pipeline._owns_or_admin(m.get('user_id')) or (unfiled and m.get('project_id') in known):
             continue
         out.append(_public(m))
-        if len(out) >= 60:
+        if len(out) >= (500 if wanted else 60):
             break
     return jsonify(ok=True, items=out)
 
 
-def _plug_or_error(pid):
+def _plug_or_error(pid, change=False):
+    """(manifest, None), or (None, a 404) for a plug the caller may not use -- or, with change=True, may not
+    delete or move: its maker or an admin."""
     m = _load_manifest(pid)
-    if not m or not pipeline._owns_or_admin(m.get('user_id')):
+    if not m or not (pipeline._owns_or_admin(m.get('user_id')) if change else _may_use(m)):
         return None, (jsonify(ok=False, error='Not found'), 404)
     return m, None
+
+
+@app.route('/api/schedule/items/<pid>/project', methods=['POST'])
+@require_permission('schedule_plug')
+def api_schedule_move(pid):
+    """Files a plug under a project -- one made before there were projects, or put in the wrong one. Its maker or
+    an admin, into a project they may see."""
+    m, err = _plug_or_error(pid, change=True)
+    if err:
+        return err
+    target = str((request.get_json(silent=True) or {}).get('project_id') or '').strip()
+    proj = project_routes.visible_project('schedule', target)
+    if not proj:
+        return jsonify(ok=False, error='That project no longer exists.'), 404
+    m['project_id'] = proj['project_id']
+    _write_manifest(_plug_dir(pid), m)
+    audit_log('schedule_plug_move', target=str(m.get('file')), detail=project_routes.project_name('schedule', target),
+              user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True)
 
 
 @app.route('/api/schedule/file/<pid>/<name>')
@@ -785,7 +864,7 @@ def api_schedule_file(pid, name):
 @app.route('/api/schedule/items/<pid>', methods=['DELETE'])
 @require_permission('schedule_plug')
 def api_schedule_delete(pid):
-    m, err = _plug_or_error(pid)
+    m, err = _plug_or_error(pid, change=True)
     if err:
         return err
     # Renamed aside first, then removed: on Windows the rename fails while

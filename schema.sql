@@ -138,6 +138,12 @@ CREATE TABLE IF NOT EXISTS trailers (
     username         TEXT
 );
 
+-- A saved Episodic Plug belongs to a project (project_routes.py), the way a
+-- batch of Vertical Shorts does. NULL for a plug made before projects, or
+-- whose project has since been deleted: such a plug is shown as not filed.
+ALTER TABLE trailers ADD COLUMN IF NOT EXISTS project_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_trailers_project ON trailers (project_id);
+
 -- ---- Background jobs (promo / shorts / schedule share one table and queue) ----
 CREATE TABLE IF NOT EXISTS jobs (
     id               TEXT PRIMARY KEY,

@@ -191,7 +191,7 @@ def network_destination_remove(dest_id):
     conn.close()
     return removed
 
-def library_add(upload_filename, result, user_id=None, username=None):
+def library_add(upload_filename, result, user_id=None, username=None, project_id=None):
     """Copies the just-finished trailer (currently sitting in the ephemeral
     UPLOAD_FOLDER as `upload_filename`) into LIBRARY_DIR under a permanent
     name, records it in PostgreSQL, and returns the new row id. The saved
@@ -205,13 +205,13 @@ def library_add(upload_filename, result, user_id=None, username=None):
     shutil.copy2(src, dst)
     conn = database.connect()
     cur = conn.execute(
-        'INSERT INTO trailers (orig_name, filename, created_at, trailer_duration, video_duration, trailer_length, bgm_source, sfx_source, vo_source, result_json, user_id, username) '
-        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
+        'INSERT INTO trailers (orig_name, filename, created_at, trailer_duration, video_duration, trailer_length, bgm_source, sfx_source, vo_source, result_json, user_id, username, project_id) '
+        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
         (result.get('orig_name'), persist_name, time.time(), result.get('trailer_duration'), result.get('video_duration'),
          result.get('trailer_length'), result.get('bgm_source'), result.get('sfx_source'), result.get('vo_source'), None,
-         user_id, username))
+         user_id, username, project_id))
     tid = cur.fetchone()['id']
-    saved_result = dict(result, trailer_url=f'/library/{tid}/file', library_id=tid)
+    saved_result = dict(result, trailer_url=f'/library/{tid}/file', library_id=tid, project_id=project_id)
     conn.execute('UPDATE trailers SET result_json=%s WHERE id=%s', (json.dumps(saved_result), tid))
     conn.commit()
     conn.close()
@@ -238,23 +238,64 @@ def library_stats():
             missing += 1  # DB row survives its file being deleted out from under it -- don't crash the count over it
     return {'count': len(rows), 'total_bytes': total_bytes, 'missing_files': missing}
 
-def library_list(limit=50, user_id=None, is_admin=False):
+def library_list(limit=50, user_id=None, is_admin=False, project_id=None, unfiled_ids=None):
     """Most recent saved trailers. An admin sees everything; anyone else sees
     only what they own (user_id must match) -- rows with no owner at all
     (user_id IS NULL, from before this app had accounts, or a save that
     somehow didn't capture one) are admin-only, same reasoning as
-    _owns_or_admin in pipeline.py."""
+    _owns_or_admin in pipeline.py.
+
+    project_id: only the trailers filed under that project. Which projects a
+    caller may see is decided by the caller (project_routes), and -- because a
+    project is its group's, not its maker's -- someone who may see a project
+    sees every trailer filed in it, whoever made it, so a project listing
+    ignores ownership. unfiled_ids: the project ids that exist; with
+    project_id='' it lists the caller's own trailers filed under none of them
+    (made before projects, or whose project was deleted)."""
+    cols = ('id, orig_name, filename, created_at, trailer_duration, video_duration, trailer_length, '
+            'bgm_source, sfx_source, vo_source, user_id, username, project_id')
     conn = database.connect()
-    if is_admin:
-        rows = conn.execute(
-            'SELECT id, orig_name, filename, created_at, trailer_duration, video_duration, trailer_length, bgm_source, sfx_source, vo_source, user_id, username '
-            'FROM trailers ORDER BY created_at DESC LIMIT %s', (limit,)).fetchall()
-    else:
-        rows = conn.execute(
-            'SELECT id, orig_name, filename, created_at, trailer_duration, video_duration, trailer_length, bgm_source, sfx_source, vo_source, user_id, username '
-            'FROM trailers WHERE user_id=%s ORDER BY created_at DESC LIMIT %s', (user_id, limit)).fetchall()
-    conn.close()
+    try:
+        if project_id:
+            rows = conn.execute(f'SELECT {cols} FROM trailers WHERE project_id=%s ORDER BY created_at DESC LIMIT %s',
+                                (project_id, limit)).fetchall()
+        else:
+            where, args = [], []
+            if not is_admin:
+                where.append('user_id=%s')
+                args.append(user_id)
+            if project_id == '':
+                known = list(unfiled_ids or ())
+                where.append('(project_id IS NULL OR project_id = \'\'' + (' OR project_id <> ALL(%s)' if known else '') + ')')
+                if known:
+                    args.append(known)
+            sql = f'SELECT {cols} FROM trailers' + (' WHERE ' + ' AND '.join(where) if where else '') + \
+                  ' ORDER BY created_at DESC LIMIT %s'
+            rows = conn.execute(sql, (*args, limit)).fetchall()
+    finally:
+        conn.close()
     return [dict(r) for r in rows]
+
+
+def library_set_project(tid, project_id):
+    """Files a trailer under a project (or under none, with None). The caller has already checked who may."""
+    conn = database.connect()
+    try:
+        conn.execute('UPDATE trailers SET project_id=%s WHERE id=%s', (project_id, tid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def library_project_counts():
+    """{project id: {'count', 'last', 'poster'}} for the trailers filed under each project."""
+    conn = database.connect()
+    try:
+        rows = conn.execute('SELECT project_id, COUNT(*) AS n, MAX(created_at) AS last FROM trailers '
+                            'WHERE project_id IS NOT NULL AND project_id <> \'\' GROUP BY project_id').fetchall()
+    finally:
+        conn.close()
+    return {r['project_id']: {'count': r['n'], 'last': r['last'], 'poster': None} for r in rows}
 
 def library_get_row(tid):
     conn = database.connect()
