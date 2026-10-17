@@ -106,3 +106,37 @@ def test_the_overlay_plays_over_the_freeze_and_nowhere_else(tmp_path, with_sound
     assert r > 100, 'starting just before it (centred on it)'
     assert px(0.4, w // 2, h // 2)[2] < 60, 'not over the action before'
     assert px(stop + 1.0, w // 2, h // 2)[2] < 60, 'gone once it has played'
+
+
+@pytest.mark.parametrize('with_sound', [False, True])
+def test_the_ending_preview_shows_the_overlay_across_the_freeze(tmp_path, with_sound):
+    staged = f'net_2_prev{int(with_sound)}.mov'
+    ov = [*FF, '-f', 'lavfi', '-i', 'color=c=red:s=200x200:r=25:d=0.8,format=rgba,colorchannelmixer=aa=0.7']
+    if with_sound:
+        ov += ['-f', 'lavfi', '-i', 'sine=f=2000:d=0.8', '-c:a', 'pcm_s16le']
+    subprocess.run(ov + ['-c:v', 'qtrle', '-shortest', os.path.join(main.app.config['UPLOAD_FOLDER'], staged)],
+                   check=True)
+    c = main.app.test_client()
+    with c.session_transaction() as s:
+        s.update(authed=True, user_id=1, username='admin', role='admin', csrf_token='t')
+    hdr = {'X-CSRF-Token': 't'}
+    r = c.post('/api/shorts/ending-preview', json={'ending_hold': 2, 'ending_overlay': staged}, headers=hdr).get_json()
+    assert r['ok'], r
+    assert r['overlay'] is True and r['sound'] is with_sound
+    out = os.path.join(main.app.config['UPLOAD_FOLDER'], os.path.basename(r['url']))
+    lead = 0.7                                             # 0.8 s overlay: half of it + 0.3 s before the freeze
+    assert abs(pipeline.probe_duration(out) - (lead + 2.0)) < 0.15
+    cap = cv2.VideoCapture(out)
+
+    def red(t):
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        _r, f = cap.read()
+        b, g, r_ = [int(v) for v in f[240, 135]]
+        return r_ > 150 and r_ > b + 60
+    assert red(lead - 0.2) and red(lead + 0.2), 'across the freeze'
+    assert not red(0.1) and not red(lead + 1.5), 'and only there'
+    plain = c.post('/api/shorts/ending-preview', json={'ending_hold': 2}, headers=hdr).get_json()
+    assert plain['ok'] and plain['overlay'] is False
+    gone = c.post('/api/shorts/ending-preview', json={'ending_hold': 2, 'ending_overlay': 'net_9_gone.mov'},
+                  headers=hdr)
+    assert gone.status_code == 400 and 'pick it again' in gone.get_json()['error']

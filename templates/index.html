@@ -8195,7 +8195,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   </div>
         <div id=sh-ending-pv style="margin-top:10px;display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
       <video id=sh-ending-pv-video muted loop playsinline style="display:none;width:135px;border-radius:6px;background:#000"></video>
-      <div class="sh-note" id=sh-ending-pv-note style="margin:0;max-width:340px">Preview of the ending: shown on a frame of the analysed episode (or a plain card until then) with the Look, Movement and Push-in chosen here. It updates as you change them.</div>
+      <div class="sh-note" id=sh-ending-pv-note style="margin:0;max-width:340px">Preview of the ending: shown on a frame of the analysed episode (or a plain card until then) with the Look, Movement and Push-in chosen here, and the transition overlay if one is picked. It updates as you change them.</div>
     </div>
     
       </div>
@@ -8727,6 +8727,9 @@ function shSfxSync(){
   var has = !!shEl('shorts_sfx_network').value
   b.style.display = has ? '' : 'none'
   if(!has) shSfxStop()
+  // The transition overlay is shown in the ending preview: picked or cleared, it is made again.
+  var ov = shEl('shorts_overlay_network').value
+  if(ov !== shSfxSync._ov){ shSfxSync._ov = ov; shEndingPreviewSoon() }
 }
 
 function shWordHlSync(){
@@ -8762,7 +8765,8 @@ async function shEndingPreview(){
   var v = shEl('sh-ending-pv-video'), note = shEl('sh-ending-pv-note')
   if(!v || shEl('sh-ending').value !== 'cliffhanger') return
   var seq = ++shEndPvSeq, o = shRenderOptions()
-  var body = {ending_hold: o.ending_hold, ending_zoom: o.ending_zoom, ending_look: o.ending_look, ending_motion: o.ending_motion}
+  var body = {ending_hold: o.ending_hold, ending_zoom: o.ending_zoom, ending_look: o.ending_look, ending_motion: o.ending_motion,
+              ending_overlay: o.ending_overlay}
   if(SH.analysis){ body.analysis_id = SH.analysis.analysis_id
     var c = (SH.cands || [])[0]; if(c) body.at = c.end - 0.2 }
   var meta = document.querySelector('meta[name="csrf-token"]'), headers = {'Content-Type': 'application/json'}
@@ -8772,8 +8776,12 @@ async function shEndingPreview(){
   catch(e){ r = {ok: false, error: String(e)} }
   if(seq !== shEndPvSeq) return
   if(!r.ok){ v.style.display = 'none'; note.textContent = r.error || 'Could not make the preview.'; return }
-  v.src = r.url; v.style.display = 'block'; v.play().catch(function(){})
-  note.textContent = 'Ending preview (' + r.hold + ' s hold, then black in the real thing): the Look, Movement and Push-in as chosen.'
+  v.src = r.url; v.style.display = 'block'
+  // With the overlay's own sound there are controls to unmute it; a muted loop otherwise.
+  v.controls = !!r.sound; v.muted = true; v.play().catch(function(){})
+  note.textContent = r.overlay
+    ? 'Ending preview: the action up to the freeze, the transition overlay across it, then the ' + r.hold + ' s hold (black follows in the real thing).' + (r.sound ? ' Unmute to hear the overlay\u2019s sound.' : '')
+    : 'Ending preview (' + r.hold + ' s hold, then black in the real thing): the Look, Movement and Push-in as chosen.'
 }
 
 function shEndingChanged(){

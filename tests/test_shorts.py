@@ -3897,6 +3897,15 @@ def test_the_ending_look_movement_and_push_can_be_previewed(env, monkeypatch):
     bw = _frames(os.path.join(shorts.app.config['UPLOAD_FOLDER'], os.path.basename(again['url'])))[10]
     assert abs(float(bw[..., 0].mean()) - float(bw[..., 2].mean())) < 6, 'black and white has no colour cast'
     assert client.post('/api/shorts/ending-preview', json={'analysis_id': 'nope0000'}, headers=headers).status_code in (404, 400)
+    # With a transition overlay: the episode's own action before the freeze, then the hold.
+    staged = f'net_{int(time.time())}_pv.mov'
+    subprocess.run(FF + ['-f', 'lavfi', '-i', 'color=c=red:s=64x64:r=25:d=0.6,format=rgba', '-c:v', 'qtrle',
+                         os.path.join(main.app.config['UPLOAD_FOLDER'], staged)], check=True, timeout=30)
+    r = client.post('/api/shorts/ending-preview', json={'ending_hold': 2, 'analysis_id': aid, 'at': 4,
+                                                         'ending_overlay': staged}, headers=headers).get_json()
+    assert r['ok'] and r['overlay'], r
+    fr = _frames(os.path.join(shorts.app.config['UPLOAD_FOLDER'], os.path.basename(r['url'])))
+    assert len(fr) == 50 + 15 and fr[0].shape[:2] == (480, 270), '0.6 s lead-in, then the 2 s hold'
     html = client.get('/').get_data(as_text=True)
     for needle in ('id=sh-ending-pv-video', 'function shEndingPreview(', '/api/shorts/ending-preview'):
         assert needle in html, needle

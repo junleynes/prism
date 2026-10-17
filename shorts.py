@@ -3056,12 +3056,19 @@ def api_shorts_framing():
 def api_shorts_ending_preview():
     """The ending's Look, Movement and Push-in on a still, as a few seconds of
     9:16 video: the same filters the render uses. The still is a frame of the
-    analysed episode (at `at`, seconds) if there is an analysis, else a plain card."""
+    analysed episode (at `at`, seconds) if there is an analysis, else a plain card.
+    With a transition overlay picked, the second or so of action before the
+    freeze comes first, and the overlay plays across the freeze as it will in
+    the render (centred on it), with its sound."""
     data = request.get_json(silent=True) or {}
-    opts = _render_options(data)
+    opts = _render_options(dict(data, ending='cliffhanger'))
+    overlay, ov_err = _resolve_ending_overlay(opts)
+    if ov_err:
+        return jsonify(ok=False, error=ov_err), 400
     hold = min(float(opts['ending_hold']), 4.0)
     fps, w, h = 25, 270, 480
     frame = None
+    lead_src = None                       # (path, from, sar) of the action before the freeze
     aid = str(data.get('analysis_id') or '').strip()
     if aid:
         a, err = _analysis_or_error(aid)
@@ -3078,6 +3085,8 @@ def api_shorts_ending_preview():
                 ok, img = cap.read()
             finally:
                 cap.release()
+            if ok and overlay:
+                lead_src = (a['path'], at, float(a['info'].get('sar') or 1.0))
             if ok:
                 ih, iw = img.shape[:2]
                 crop_w = min(iw, int(round(ih * 9 / 16.0 * (a['info'].get('sar') or 1.0) ** -1)))
@@ -3088,20 +3097,29 @@ def api_shorts_ending_preview():
         frame = np.dstack([np.repeat(ys, w, axis=1)] * 3)
         cv2.circle(frame, (w // 2, h // 3), 60, (90, 130, 200), -1)
         cv2.rectangle(frame, (w // 4, h // 2), (3 * w // 4, h - 60), (180, 110, 70), -1)
+    ov_key = None
+    if overlay:
+        try:
+            ov_key = [overlay['name'], os.path.getsize(overlay['path']), os.path.getmtime(overlay['path'])]
+        except OSError:
+            ov_key = [overlay['name']]
     key = json.dumps([aid, data.get('at'), opts['ending_hold'], opts['ending_zoom'], opts['ending_look'],
-                      opts['ending_motion'], bool(frame is not None)], sort_keys=True, default=str)
+                      opts['ending_motion'], bool(frame is not None), ov_key], sort_keys=True, default=str)
     name = 'she_' + hashlib.sha1(key.encode()).hexdigest()[:16] + '.mp4'
     out = os.path.join(app.config['UPLOAD_FOLDER'], name)
     if not os.path.exists(out):
         still = os.path.join(app.config['UPLOAD_FOLDER'], f'she_{secrets.token_hex(5)}.png')
         cv2.imwrite(still, frame)
         n = max(2, int(round(hold * fps)))
+        held = sc.ending_preview_graph(n, fps, opts['ending_zoom'], opts['ending_look'], opts['ending_motion'], w, h)
+        if overlay:
+            cmd = _overlay_preview_cmd(still, held, n, fps, w, h, overlay, lead_src, out + '.tmp.mp4')
+        else:
+            cmd = [pipeline.FFMPEG, '-y', '-v', 'error', '-loop', '1', '-framerate', str(fps), '-i', still,
+                   '-vf', held, '-frames:v', str(n), '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+                   '-movflags', '+faststart', out + '.tmp.mp4']
         try:
-            r = sc.run_tool([pipeline.FFMPEG, '-y', '-v', 'error', '-loop', '1', '-framerate', str(fps), '-i', still,
-                             '-vf', sc.ending_preview_graph(n, fps, opts['ending_zoom'], opts['ending_look'],
-                                                            opts['ending_motion'], w, h),
-                             '-frames:v', str(n), '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
-                             '-movflags', '+faststart', out + '.tmp.mp4'], 60)
+            r = sc.run_tool(cmd, 60)
             ok = r.returncode == 0 and os.path.exists(out + '.tmp.mp4')
             err = (r.stderr or '')[-300:]
         except sc.ToolTimeout as e:
@@ -3114,7 +3132,48 @@ def api_shorts_ending_preview():
         if not ok:
             return jsonify(ok=False, error=f'Could not make the preview: {err}'), 502
         os.replace(out + '.tmp.mp4', out)
-    return jsonify(ok=True, url=f'/uploads/{name}', hold=round(hold, 1))
+    return jsonify(ok=True, url=f'/uploads/{name}', hold=round(hold, 1), overlay=bool(overlay),
+                   sound=bool(overlay and overlay.get('audio')))
+
+
+def _overlay_preview_cmd(still, held, n, fps, w, h, overlay, lead_src, out):
+    """ffmpeg for the ending preview with the transition overlay: up to 1.5 s of
+    the action before the freeze (the episode itself, or the still when there is
+    none), then the hold, with the overlay laid across the join -- centred on it,
+    scaled into the frame with its transparency kept -- and its sound."""
+    od = max(0.04, float(overlay.get('dur') or 1.0))
+    lead = round(min(1.5, max(0.5, od / 2.0 + 0.3)), 2)
+    total = lead + n / float(fps)
+    at = max(0.0, lead - od / 2.0)
+    cmd = [pipeline.FFMPEG, '-y', '-v', 'error']
+    if lead_src:
+        path, t, sar = lead_src
+        cmd += ['-ss', f'{max(0.0, t - lead):.3f}', '-t', f'{lead:.3f}', '-i', path]
+        first = (f'[0:v]scale=iw*{sar:.4f}:ih,setsar=1,crop=min(iw\\,ih*9/16):ih,scale={w}:{h},setsar=1,fps={fps},'
+                 f'trim=duration={lead:.3f},setpts=PTS-STARTPTS,format=yuv420p[lead]')
+    else:
+        cmd += ['-loop', '1', '-framerate', str(fps), '-t', f'{lead:.3f}', '-i', still]
+        first = f'[0:v]scale={w}:{h},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[lead]'
+    cmd += ['-loop', '1', '-framerate', str(fps), '-i', still]
+    if overlay['path'].lower().endswith('.webm'):
+        cmd += ['-c:v', 'libvpx-vp9']             # VP9 keeps its alpha channel only through the libvpx decoder
+    cmd += ['-i', overlay['path']]
+    graph = (f'{first};[1:v]{held},trim=end_frame={n},setpts=PTS-STARTPTS[hold];'
+             f'[lead][hold]concat=n=2:v=1:a=0[base];'
+             f'[2:v]format=rgba,scale={w}:{h}:force_original_aspect_ratio=decrease,'
+             f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0,setpts=PTS-STARTPTS+{at:.3f}/TB[ovl];'
+             f'[base][ovl]overlay=eof_action=pass:format=auto,format=yuv420p[v]')
+    maps = ['-map', '[v]']
+    if overlay.get('audio'):
+        ms = int(round(at * 1000))
+        graph += (f';[2:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms},'
+                  f'apad=whole_dur={total:.3f}[a]')
+        maps += ['-map', '[a]', '-c:a', 'aac', '-b:a', '128k']
+    else:
+        maps += ['-an']
+    return cmd + ['-filter_complex', graph] + maps + [
+        '-t', f'{total:.3f}', '-r', str(fps), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+        '-movflags', '+faststart', out]
 
 
 @app.route('/api/shorts/vpreview', methods=['POST'])
