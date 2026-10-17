@@ -419,6 +419,9 @@ def _normalize_unc_path(path):
 # What Vertical Shorts takes as a source: the usual video types and MXF, the broadcast master format
 # (the other tabs do not take it).
 SHORTS_EXTENSIONS = set(ALLOWED_EXTENSIONS) | {'mxf'}
+# Transition media: a Highlights Video luma matte (video or still) or a Vertical Shorts overlay (video with an
+# alpha channel -- ProRes 4444 / QuickTime Animation .mov, or VP9 .webm).
+TRANSITION_EXTENSIONS = set(ALLOWED_EXTENSIONS) | {'png', 'jpg', 'jpeg'}
 
 
 def _network_categories():
@@ -445,6 +448,9 @@ def _network_categories():
         # the same mapping).
         'tcard': {'exts': ALLOWED_EXTENSIONS, 'label': 'Title card (TCARD)'},
         'endcard': {'exts': ALLOWED_EXTENSIONS, 'label': 'End card (ENDCARD)'},
+        # Transition mattes (Highlights Video) and alpha overlays (Vertical Shorts). Reads the title card
+        # folder until it is given a path of its own.
+        'transitions': {'exts': TRANSITION_EXTENSIONS, 'label': 'Transitions (matte / alpha overlay)', 'fallback': 'tcard'},
         'music': {'exts': AUDIO_EXTENSIONS, 'label': 'Music'},
         'vo':    {'exts': AUDIO_EXTENSIONS, 'label': 'VO'},
         'sfx':   {'exts': AUDIO_EXTENSIONS, 'label': 'SFX'},
@@ -2492,7 +2498,7 @@ def _resolve_upload(field_name, exts=None):
         # and that still exists in UPLOAD_FOLDER -- never trust an arbitrary path here.
         safe = os.path.basename(staged)
         path = staged_path(safe)
-        if safe.startswith('net_') and os.path.exists(path):
+        if safe.startswith('net_') and os.path.exists(path) and (exts is None or allowed_file(safe, exts)):
             return path
     return None
 
@@ -6575,16 +6581,9 @@ def api_trailer():
         xfade_dur = float(request.form.get('xfade_dur', 0.3))
         xfade_dur = max(0.1, min(2.0, xfade_dur))
         if transition == 'custom_matte':
-            # Same media-upload policy as everywhere else -- a matte is a video
-            # file handed to ffmpeg like any other. See ALLOW_LOCAL_MEDIA_UPLOAD.
-            if (ALLOW_LOCAL_MEDIA_UPLOAD and 'transition_matte' in request.files
-                    and request.files['transition_matte'].filename):
-                f = request.files['transition_matte']
-                fn = secure_filename(f.filename)
-                if fn:
-                    transition_matte_path = os.path.join(
-                        app.config['UPLOAD_FOLDER'], f'transmatte_{int(time.time())}{os.path.splitext(fn)[1]}')
-                    f.save(transition_matte_path)
+            # Picked with Browse library (the Transitions folder), or uploaded where
+            # ALLOW_LOCAL_MEDIA_UPLOAD allows it: _resolve_upload takes either.
+            transition_matte_path = _resolve_upload('transition_matte', TRANSITION_EXTENSIONS)
             if not transition_matte_path:
                 # Selected "Custom" but didn't upload anything — fall back rather
                 # than fail the whole job over a missing optional asset.

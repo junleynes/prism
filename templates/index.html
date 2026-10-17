@@ -1985,7 +1985,13 @@ document.addEventListener("DOMContentLoaded", function(){
   </div>
   <div class="genre-manual-transition" style="display:none">
   <div id=transition-matte-area style="display:none;margin-top:8px">
-    <input type=file name=transition_matte accept="video/*,image/*">
+    <div class="browse-row">
+      {% if allow_local_upload %}<input type=file name=transition_matte accept="video/*,image/*" data-net-field="transition_matte">{% endif %}
+      <button type=button class="browse-btn" onclick="openNetworkBrowser('transition_matte','transitions','Transitions')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z"/></svg>Browse library</button>
+    </div>
+    <input type=hidden id=transition_matte_network name=transition_matte_network value="">
+    <span class="net-file-chip" id=transition_matte_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('transition_matte')">&#10005;</span></span>
+    <p style="font-size:11px;opacity:.65;margin:4px 0 0">A black-and-white matte (video or still) that wipes from one scene to the next, from the <b>Transitions</b> folder.</p>
   </div>
   </div>
   <div class="adv-only">
@@ -8109,7 +8115,15 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   </section>
   <section class="sh-out-card" aria-label="Cuts">
     <h4>Cuts</h4>
-    <div class="sh-fld"><span class="sh-fld-l">Where a part is cut out</span><select id=sh-cut-join title="How the two sides of a part cut out of the middle of a moment meet"><option value=fade selected>Short crossfade (0.3 s)</option><option value=cut>Hard cut</option></select></div>
+    <div class="sh-fld"><span class="sh-fld-l">Where pieces join</span><select id=sh-cut-join onchange="shOverlayToggle()" title="How the two sides of a part cut out of the middle of a moment meet, and the scenes of a highlight reel"><option value=fade selected>Short crossfade (0.3 s)</option><option value=cut>Hard cut</option><option value=overlay>Transition overlay (from library)</option></select></div>
+    <div id=sh-overlay-area style="display:none;margin-top:6px">
+      <div class="browse-row">
+        <button type=button class="browse-btn" onclick="openNetworkBrowser('shorts_overlay','transitions','Transition overlay')">Browse library</button>
+      </div>
+      <input type=hidden id=shorts_overlay_network name=shorts_overlay_network value="">
+      <span class="net-file-chip" id=shorts_overlay_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('shorts_overlay')">&#10005;</span></span>
+      <p class=sh-note style="margin:4px 0 0">A video with transparency (ProRes 4444 or QuickTime Animation .mov, or VP9 .webm) from the <b>Transitions</b> folder. Each join becomes a hard cut with the overlay played across it, centred on the cut; its sound, if any, is mixed in.</p>
+    </div>
   </section>
   <section class="sh-out-card" aria-label="Captions">
     <h4>Captions</h4>
@@ -8776,6 +8790,10 @@ function shEndingChanged(){
   shEl('sh-ending-cliff').textContent = 'Cliffhanger \u2014 freeze, slow push-in, cut to black (+' + (h + black).toFixed(1) + ' s)'
 }
 
+function shOverlayToggle(){
+  shEl('sh-overlay-area').style.display = shEl('sh-cut-join').value === 'overlay' ? '' : 'none'
+}
+
 // The Output settings, as both ways of rendering send them.
 function shRenderOptions(){
   return {reframe: shEl('sh-reframe').value,
@@ -8789,6 +8807,7 @@ function shRenderOptions(){
           ending_hold: shEl('sh-ending-hold').value,
           ending_zoom: shEl('sh-ending-zoom').value,
           cut_join: shEl('sh-cut-join').value,
+          transition_overlay: shEl('sh-cut-join').value === 'overlay' ? shEl('shorts_overlay_network').value : '',
           ending_look: shEl('sh-ending-look').value,
           ending_motion: shEl('sh-ending-motion').value,
           fade_last: shEl('sh-fade-last').checked,
@@ -9285,7 +9304,8 @@ async function shTplSave(){
   var cap = shSelCapture(), vals = {}
   var keys = ['reframe','speaker','subtitles','subtitle_size','episode_labels','word_highlight','highlight_color','cut_join','ending','ending_hold','ending_zoom','ending_look','ending_motion','fade_last','ending_fade','ending_sfx_gain','format','loudness']
   keys.forEach(function(k){ if(cap.values[k] !== undefined) vals[k] = cap.values[k] })
-  var files = cap.files.shorts_sfx ? {shorts_sfx: cap.files.shorts_sfx} : {}
+  var files = {}
+  ;['shorts_sfx', 'shorts_overlay'].forEach(function(k){ if(cap.files[k]) files[k] = cap.files[k] })
   try{
     var r = await (await fetch('/api/shorts/templates', {method: 'POST', headers: {'Content-Type': 'application/json'},
                                                           body: JSON.stringify({name: name, values: vals, files: files})})).json()
@@ -11236,7 +11256,7 @@ var SH_SEL = {
   bool: {word_highlight: 'sh-word-hl', speaker: 'sh-speaker', subtitles: 'sh-captions', episode_labels: 'sh-ep-labels', fade_last: 'sh-fade-last',
          caption_drop_sounds: 'sh-cap-sounds', caption_drop_speakers: 'sh-cap-speakers'}
 }
-var SH_SEL_FILES = ['shorts_file', 'shorts_caption', 'shorts_sfx'].concat(
+var SH_SEL_FILES = ['shorts_file', 'shorts_caption', 'shorts_sfx', 'shorts_overlay'].concat(
   [2, 3, 4, 5, 6, 7, 8, 9, 10].map(function(k){ return 'shorts_file' + k }),
   [2, 3, 4, 5, 6, 7, 8, 9, 10].map(function(k){ return 'shorts_caption' + k }))
 SH.selReady = false; SH.selDefaults = null; SH.selTimer = null
@@ -11278,6 +11298,7 @@ function shSelApplyValues(v){
   if(typeof shModeSync === 'function') shModeSync()
   if(typeof shEndingChanged === 'function') shEndingChanged()
   if(typeof shSyncSpeaker === 'function') shSyncSpeaker()
+  if(typeof shOverlayToggle === 'function') shOverlayToggle()
   if(typeof shCountNote === 'function') shCountNote()
 }
 
@@ -14339,7 +14360,7 @@ async function saveProductionTab(){
 }
 window.saveProductionTab = saveProductionTab
 
-var NETWORK_CATEGORY_LABELS = {hires: 'Video (HIRES)', shorts: 'Vertical Shorts video (HIRES)', captions: 'Vertical Shorts captions (SRT / VTT / SCC)', schedule: 'Animation artwork (image / PSD)', tcard: 'Title card', endcard: 'End card', music: 'Music', vo: 'VO', sfx: 'SFX', script: 'Script / rundown'}
+var NETWORK_CATEGORY_LABELS = {hires: 'Video (HIRES)', shorts: 'Vertical Shorts video (HIRES)', captions: 'Vertical Shorts captions (SRT / VTT / SCC)', schedule: 'Animation artwork (image / PSD)', tcard: 'Title card', endcard: 'End card', transitions: 'Transitions (matte / alpha overlay)', music: 'Music', vo: 'VO', sfx: 'SFX', script: 'Script / rundown'}
 var networkFoldersLoaded = false
 var networkDestinationsLoaded = false
 async function loadNetworkFolders(){
@@ -14367,7 +14388,8 @@ async function loadNetworkFolders(){
         // blank says so, or an empty row reads as "not set up" when the tab
         // it serves is in fact working.
         (row.fallback && NETWORK_CATEGORY_LABELS[row.fallback] ? '<div style="font-size:11px;opacity:.7;margin:-4px 0 10px">' +
-          'Where the Vertical Shorts tab browses for episodes. ' +
+          ({shorts: 'Where the Vertical Shorts tab browses for episodes. ', captions: 'Where Vertical Shorts finds existing captions. ',
+            transitions: 'Transition mattes for Highlights Video and alpha overlays for Vertical Shorts. '}[cat] || '') +
           (row.path ? 'Clear the path to go back to the ' : 'Blank: it is using the ') +
           NETWORK_CATEGORY_LABELS[row.fallback] + ' folder' + (row.path ? '.' : ' until a path is saved here.') + '</div>' : '') +
         '<div style="display:flex;flex-direction:column;gap:10px">' +
