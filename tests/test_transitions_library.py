@@ -147,3 +147,9 @@ def test_group_members_are_chips_with_a_search_not_a_list_of_every_user():
     assert 'data-gm-search' in html and 'data-gm-add' in html and 'data-gm-remove' in html
     assert '<input type=checkbox data-group-member' not in html, 'no checkbox per user in each group'
     assert "gmIds(document.querySelector('[data-gm][data-gid=" in html, 'saved from the chips'
+
+
+def test_graphite_is_a_branding_color_theme():
+    t = library_db.THEME_PRESETS['graphite']
+    assert t['label'] == 'Graphite' and library_db.resolve_theme_colors('graphite', None)['bg_dark'] == t['bg_dark']
+    assert set(t) == set(library_db.THEME_PRESETS['violet'])

@@ -433,6 +433,13 @@ THEME_PRESETS = {
               'elevated_dark': '#212940', 'sunken_dark': '#0b0e19',
               'bg_light': '#eff0f9', 'panel_light': '#fdfdff', 'panel_2_light': '#eaecf6',
               'elevated_light': '#fdfdff', 'sunken_light': '#e1e3f0', 'rail_bg_dark': 'rgba(19,24,43,.72)', 'rail_bg_light': 'rgba(239,240,249,.75)'},
+    'graphite': {'label': 'Graphite',
+                'phosphor': '#cbd5e1', 'phosphor_dim': '#64748b',
+                'tally': '#f87171', 'amber': '#fbbf24', 'accent': '#94a3b8',
+                'bg_dark': '#16181b', 'panel_dark': '#1d2024', 'panel_2_dark': '#262a2f',
+                'elevated_dark': '#272b31', 'sunken_dark': '#0c0d0f',
+                'bg_light': '#f1f2f4', 'panel_light': '#ffffff', 'panel_2_light': '#eceef0',
+                'elevated_light': '#ffffff', 'sunken_light': '#e2e4e8', 'rail_bg_dark': 'rgba(22,24,27,.72)', 'rail_bg_light': 'rgba(241,242,244,.75)'},
 }
 DEFAULT_THEME_NAME = 'crimson'
 _BRANDING_IMAGE_EXTS = {'.svg', '.png', '.jpg', '.jpeg', '.webp', '.gif'}
