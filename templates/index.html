@@ -1244,7 +1244,7 @@ var CURRENT_USERNAME = {{ current_username|tojson }}
       <span class="rail-user-label">Signed in</span>
       <strong class="rail-user-name">{{ current_username }}</strong>
     </div>
-    <a class="rail-signout" href="/logout">Sign out</a>
+    <form method=post action="/logout" style="margin:0"><input type=hidden name=_csrf value="{{ csrf_token }}"><button type=submit class="rail-signout">Sign out</button></form>
   </div>
   {% if brand_footer %}
   <div class="rail-footer">{{ brand_footer }}</div>
@@ -14829,6 +14829,13 @@ function renderUsersTab(d){
       '</table>' +
     '</div>' +
     '<div class=card>' +
+      '<h3 style="margin:0 0 10px;font-size:13px">Access requests</h3>' +
+      '<label style="display:flex;gap:8px;align-items:center;font-size:12px;cursor:pointer"><input type=checkbox id=cu-registration onchange="saveRegistrationSetting()"> ' +
+        'Let people request an account from the sign-in page</label>' +
+      '<p style="font-size:11px;opacity:.65;margin:6px 0 0">Requested accounts stay disabled until an admin enables them here. Off: the sign-in page has no <em>Request access</em>, and only admins create accounts.</p>' +
+      '<span id=cu-registration-status style="font-size:12px"></span>' +
+    '</div>' +
+    '<div class=card>' +
       '<h3 style="margin:0 0 10px;font-size:13px">Add user</h3>' +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
         '<input type=text id=cu-username placeholder="Username" style="flex:1;min-width:140px">' +
@@ -14847,6 +14854,9 @@ function renderUsersTab(d){
       '</div>' +
     '</div>'
 
+  fetch('/api/branding').then(function(r){ return r.json() }).then(function(b){
+    var box = document.getElementById('cu-registration'); if(box) box.checked = b.registration_enabled !== false
+  }).catch(function(){})
   document.getElementById('cu-submit').addEventListener('click', createUser)
   document.getElementById('cg-submit').addEventListener('click', createGroup)
   var tableSave = document.getElementById('cu-save-role-group')
@@ -14996,6 +15006,18 @@ async function usersActionQuiet(url, body){
     var r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
     return await r.json()
   }catch(e){ return {ok: false, error: 'Action failed: ' + e} }
+}
+async function saveRegistrationSetting(){
+  var box = document.getElementById('cu-registration'), st = document.getElementById('cu-registration-status')
+  st.textContent = 'Saving…'; st.style.color = 'var(--ink-dim)'
+  try{
+    var fd = new FormData(); fd.append('registration_enabled', box.checked ? '1' : '0')
+    var d = await (await fetch('/api/branding', {method: 'POST', body: fd})).json()
+    if(!d.ok) throw new Error(d.error || 'unknown error')
+    box.checked = d.registration_enabled !== false
+    st.textContent = box.checked ? 'Saved. The sign-in page offers Request access.' : 'Saved. Only admins create accounts.'
+    st.style.color = 'var(--phosphor)'
+  }catch(e){ box.checked = !box.checked; st.textContent = 'Save failed: ' + (e.message || e); st.style.color = 'var(--amber)' }
 }
 async function createUser(){
   var username = document.getElementById('cu-username').value

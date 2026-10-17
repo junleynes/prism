@@ -7,6 +7,7 @@ no risk of circular imports.
 import os, tempfile, threading, time, secrets, hmac
 from collections import deque
 from flask import Flask, request, jsonify, session, redirect, url_for
+from flask.sessions import SecureCookieSessionInterface
 from werkzeug.security import generate_password_hash
 
 try:
@@ -77,6 +78,21 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('FORCE_HTTPS', '').lower() in ('1', 'true', 'yes')
 
+
+class _SessionInterface(SecureCookieSessionInterface):
+    """Marks the session cookie Secure whenever the request came over HTTPS
+    (directly, or through a proxy when TRUST_PROXY_HEADERS is on), not only
+    when FORCE_HTTPS says so -- so it is never sent back over plain HTTP by
+    mistake. Plain-HTTP installs (a LAN with no TLS) still work."""
+    def get_cookie_secure(self, app):
+        try:
+            return bool(app.config['SESSION_COOKIE_SECURE'] or request.is_secure)
+        except RuntimeError:                  # no request (tests building a session by hand)
+            return bool(app.config['SESSION_COOKIE_SECURE'])
+
+
+app.session_interface = _SessionInterface()
+
 _PUBLIC_PATHS = {'/', '/login', '/logout', '/register', '/branding/logo', '/branding/logo-dark', '/branding/favicon', '/branding/logo-mark'}
 _API_PREFIXES = ('/api/', '/uploads/', '/library/', '/download/')
 _ADMIN_PREFIX = '/admin/'
@@ -113,6 +129,12 @@ class _RateLimiter:
 _file_route_limiter = _RateLimiter(limit=int(os.environ.get('FILE_ROUTE_RATE_LIMIT', 40)), window=60)
 _job_submit_limiter = _RateLimiter(limit=int(os.environ.get('JOB_SUBMIT_RATE_LIMIT', 12)), window=300)
 _login_limiter = _RateLimiter(limit=int(os.environ.get('LOGIN_RATE_LIMIT', 8)), window=300)
+# Access requests per address per hour: each one stores an account and hashes a password.
+_register_limiter = _RateLimiter(limit=int(os.environ.get('REGISTER_RATE_LIMIT', 5)), window=3600)
+# Largest request body accepted from someone not signed in (the sign-in and
+# access-request forms are a few hundred bytes). Signed-in users keep
+# MAX_CONTENT_LENGTH for uploads.
+PUBLIC_MAX_BODY = 64 * 1024
 _DUMMY_PW_HASH = generate_password_hash(secrets.token_hex(16))
 
 @app.after_request
@@ -150,8 +172,19 @@ def ensure_csrf_token():
     return tok
 
 @app.before_request
+def _limit_public_bodies():
+    """A signed-out visitor can only reach the sign-in and access-request
+    forms, so their requests are capped at PUBLIC_MAX_BODY instead of the
+    multi-GB upload limit -- otherwise anyone could fill the server's temp
+    disk by posting a huge body to /login. Checked as the body is read, so a
+    chunked upload with no Content-Length is stopped too."""
+    if not session.get('authed'):
+        request.max_content_length = PUBLIC_MAX_BODY
+    return None
+
+@app.before_request
 def _csrf_protect():
-    if request.method in ('GET', 'HEAD', 'OPTIONS') or request.path in ('/login', '/logout'):
+    if request.method in ('GET', 'HEAD', 'OPTIONS') or request.path == '/login':
         return None
     if not session.get('authed'):
         return None

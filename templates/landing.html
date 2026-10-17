@@ -1,4 +1,4 @@
-{% set landing_enabled = landing_enabled if landing_enabled is defined else true %}<!DOCTYPE html>
+{% set landing_enabled = landing_enabled if landing_enabled is defined else true %}{% set registration_enabled = registration_enabled if registration_enabled is defined else true %}<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -383,7 +383,7 @@ footer{
       <a class="nav-link" href="#how">How it works</a>
       <a class="nav-link" href="#features">Features</a>
       {% endif %}
-      <button type="button" class="btn btn-ghost btn-nav" id="navBtnRegister" data-auth="register">Request access</button>
+      {% if registration_enabled %}<button type="button" class="btn btn-ghost btn-nav" id="navBtnRegister" data-auth="register">Request access</button>{% endif %}
       <button type="button" class="btn btn-primary btn-nav" id="navBtnSignIn" data-auth="signin">Sign in</button>
       <button type="button" class="theme-btn" id="themeToggle" aria-label="Toggle theme">
         <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 14.3A9 9 0 1 1 9.7 3a7 7 0 0 0 11.3 11.3z"/></svg>
@@ -434,10 +434,11 @@ footer{
             <button type="submit" class="btn btn-primary">Continue</button>
           </form>
           <p class="auth-meta">Secure session · rate-limited</p>
-          <p class="auth-switch">Need an account? <button type="button" data-auth="register">Request access</button></p>
+          {% if registration_enabled %}<p class="auth-switch">Need an account? <button type="button" data-auth="register">Request access</button></p>{% else %}<p class="auth-switch">Need an account? Ask an administrator.</p>{% endif %}
         </div>
       </div>
 
+      {% if registration_enabled %}
       <div class="auth-dock{% if auth_panel in ('register', 'register-done') or register_error or register_success %} open{% endif %}" id="dock-register" role="dialog" aria-modal="true" aria-label="Request access">
         <div class="auth-dock-head">
           <strong>{% if register_success %}Request received{% else %}Request access{% endif %}</strong>
@@ -467,6 +468,7 @@ footer{
           {% endif %}
         </div>
       </div>
+      {% endif %}
     </div>
 
     {% if landing_enabled %}
@@ -569,7 +571,7 @@ footer{
 
     <div class="cta-band">
       <h2>Ready when your media is.</h2>
-      <p>Use <strong class="cta-highlight">Request access</strong> or <strong class="cta-highlight">Sign in</strong> in the top right to start processing media with AI on your own hardware.</p>
+      <p>Use {% if registration_enabled %}<strong class="cta-highlight">Request access</strong> or {% endif %}<strong class="cta-highlight">Sign in</strong> in the top right to start processing media with AI on your own hardware.</p>
     </div>
   </section>
 
@@ -647,7 +649,7 @@ footer{
   });
 
   var panel = {{ (auth_panel or '')|tojson }};
-  if(panel === 'register' || panel === 'register-done' || location.hash === '#register'){
+  if({{ 'true' if registration_enabled else 'false' }} && (panel === 'register' || panel === 'register-done' || location.hash === '#register')){
     openAuth('register');
   } else if(!landing || panel === 'signin' || {{ 'true' if (pending_2fa or login_error) else 'false' }} || location.hash === '#signin'){
     openAuth('signin');

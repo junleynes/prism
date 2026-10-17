@@ -228,7 +228,7 @@ $env:PGPASSWORD = 'YOUR_PASSWORD'
 & "C:\Program Files\PostgreSQL\16\bin\pg_restore.exe" -h localhost -U prism -d prism --clean --if-exists D:\backups\prism.dump
 ```
 
-Also copy `LIBRARY_DIR`, `TEMPLATES_DIR`, `.env`, `.secret_key` and the `*.json` files listed at the top. Schedule the dump with cron / systemd timers on Linux or Task Scheduler on Windows.
+Also copy `LIBRARY_DIR`, `TEMPLATES_DIR`, `.env`, `.secret_key`, `.data_key` and the `*.json` files listed at the top. `.data_key` encrypts the saved share passwords, API keys and two-factor secrets: without it those must be entered again, and accounts with two-factor set it up again. Schedule the dump with cron / systemd timers on Linux or Task Scheduler on Windows.
 
 ---
 

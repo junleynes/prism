@@ -4,13 +4,14 @@ Depends on: core (app, rate limiter, dummy-hash, default password) and
 database (the PostgreSQL connection pool; accounts live in the `users`,
 `groups` and `group_permissions` tables -- see schema.sql).
 """
-import os, re, time, functools, secrets
+import os, re, time, datetime, functools, secrets
 from flask import request, session, redirect, jsonify, render_template
 from markupsafe import escape
 from werkzeug.security import generate_password_hash, check_password_hash
-from core import app, _client_ip, _login_limiter, _DUMMY_PW_HASH, ensure_csrf_token
+from core import app, _client_ip, _login_limiter, _register_limiter, _DUMMY_PW_HASH, ensure_csrf_token
 from library_db import load_branding, audit_log
 import database
+import secretbox
 
 def _safe_next(dest):
     """Only ever redirect to a path on this app -- an absolute or
@@ -165,6 +166,7 @@ def login():
                            brand_tagline=brand['tagline'],
                            brand_theme=brand['theme_colors'],
                            landing_enabled=brand['landing_enabled'],
+                           registration_enabled=brand['registration_enabled'],
                            login_error=error,
                            register_error=None,
                            register_success=None,
@@ -179,14 +181,18 @@ def register():
     from pipeline import load_branding
     brand = load_branding()
     if request.method == 'GET':
-        return redirect('/#register')
+        return redirect('/#register' if brand['registration_enabled'] else '/#signin')
+    if not brand['registration_enabled']:
+        return redirect('/#signin')
 
     username = (request.form.get('username') or '').strip()
     password = request.form.get('password') or ''
     password2 = request.form.get('password2') or ''
     error = None
     success = None
-    if password != password2:
+    if not _register_limiter.allow(_client_ip()):
+        error = 'Too many requests from this address. Try again later.'
+    elif password != password2:
         error = 'Passwords do not match.'
     else:
         ok, err = user_create(username, password, role='user', active=False)
@@ -201,6 +207,7 @@ def register():
         brand_tagline=brand['tagline'],
         brand_theme=brand['theme_colors'],
         landing_enabled=brand['landing_enabled'],
+        registration_enabled=brand['registration_enabled'],
         login_error=error if not success else None,
         register_error=error if not success else None,
         register_success=success,
@@ -210,9 +217,13 @@ def register():
     )
 
 
-@app.route('/logout')
+@app.route('/logout', methods=['GET', 'POST'])
 def logout():
-    session.clear()
+    """POST, with the session's CSRF token (core._csrf_protect), so another site
+    cannot sign people out with a link or an <img>. A GET -- an old bookmark --
+    just goes back to the app."""
+    if request.method == 'POST':
+        session.clear()
     return redirect('/')
 
 # ---- Two-factor enrolment (self-service, any signed-in account) ----
@@ -360,6 +371,11 @@ def users_db_init():
     # (group_delete, user_delete below).
     database.init_schema()
     conn = database.connect()
+    # Two-factor secrets saved before they were encrypted at rest (secretbox): encrypt them once.
+    for r in conn.execute("SELECT id, totp_secret FROM users WHERE totp_secret IS NOT NULL "
+                          "AND totp_secret NOT LIKE 'enc:v1:%%'").fetchall():
+        conn.execute('UPDATE users SET totp_secret=%s WHERE id=%s', (secretbox.encrypt(r['totp_secret']), r['id']))
+    conn.commit()
     count = conn.execute('SELECT COUNT(*) AS c FROM users').fetchone()['c']
     if count == 0:
         # Bootstrap: no accounts exist yet, so create a default admin rather
@@ -584,7 +600,8 @@ def user_totp_begin_enrolment(uid):
     conn = database.connect()
     row = conn.execute('SELECT username FROM users WHERE id=%s', (uid,)).fetchone()
     username = row['username'] if row else 'user'
-    conn.execute('UPDATE users SET totp_secret=%s, totp_enabled=0 WHERE id=%s', (secret, uid))
+    conn.execute('UPDATE users SET totp_secret=%s, totp_enabled=0, totp_last_step=NULL WHERE id=%s',
+                 (secretbox.encrypt(secret), uid))
     conn.commit()
     conn.close()
     try:
@@ -593,6 +610,33 @@ def user_totp_begin_enrolment(uid):
         issuer = 'PRISM'
     uri = pyotp.totp.TOTP(secret).provisioning_uri(name=username, issuer_name=issuer)
     return secret, uri
+
+def _totp_secret(value):
+    """The usable secret from a stored totp_secret (encrypted at rest; see secretbox)."""
+    return secretbox.decrypt_or_blank(value) if value else None
+
+def _totp_accept(pyotp, uid, secret, code):
+    """True if `code` is valid now (one 30s step of clock drift either side) and its step is
+    later than the last one accepted for this account -- so a code seen over someone's shoulder,
+    or replayed from a captured request, cannot be used a second time while it is still valid."""
+    if not secret or not code:
+        return False
+    totp = pyotp.TOTP(secret)
+    now = time.time()
+    for drift in (0, -1, 1):
+        at = now + drift * totp.interval
+        if secrets.compare_digest(totp.at(at), code):
+            step = totp.timecode(datetime.datetime.fromtimestamp(at))
+            conn = database.connect()
+            try:
+                row = conn.execute('UPDATE users SET totp_last_step=%s WHERE id=%s '
+                                   'AND (totp_last_step IS NULL OR totp_last_step < %s) RETURNING id',
+                                   (step, uid, step)).fetchone()
+                conn.commit()
+            finally:
+                conn.close()
+            return row is not None
+    return False
 
 def _hash_backup_code(code):
     return generate_password_hash(code.strip().upper())
@@ -613,7 +657,7 @@ def user_totp_confirm(uid, code):
     # valid_window=1 accepts the adjacent 30s step either side, which absorbs
     # ordinary clock drift between the phone and the server without meaningfully
     # widening the guess space.
-    if not pyotp.TOTP(row['totp_secret']).verify((code or '').strip(), valid_window=1):
+    if not _totp_accept(pyotp, uid, _totp_secret(row['totp_secret']), (code or '').strip()):
         conn.close()
         return None, 'That code was not correct. Check your phone and try again.'
     codes = [secrets.token_hex(4).upper() for _ in range(10)]
@@ -631,7 +675,7 @@ def user_totp_verify(user, code):
     code = (code or '').strip()
     if not code or not user or not user['totp_secret']:
         return False
-    if pyotp and pyotp.TOTP(user['totp_secret']).verify(code, valid_window=1):
+    if pyotp and _totp_accept(pyotp, user['id'], _totp_secret(user['totp_secret']), code):
         return True
     stored = (user['totp_backup_codes'] or '').split('\n')
     for h in stored:
@@ -647,7 +691,7 @@ def user_totp_verify(user, code):
 def user_totp_disable(uid):
     """Also ends the account's sessions: a reset is for a lost or stolen phone."""
     conn = database.connect()
-    conn.execute('UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_backup_codes=NULL, '
+    conn.execute('UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_backup_codes=NULL, totp_last_step=NULL, '
                  'session_version = session_version + 1 WHERE id=%s', (uid,))
     conn.commit()
     conn.close()

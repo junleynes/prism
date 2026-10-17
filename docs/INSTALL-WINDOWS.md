@@ -155,6 +155,13 @@ ADMIN_PASSWORD=choose-a-real-password-12-chars-or-more
   icacls C:\PRISM\.env /inheritance:r /grant:r "Administrators:F" "SYSTEM:F"
   ```
 
+  After the first start, do the same for `.secret_key` and `.data_key` (the key that encrypts saved share passwords, API keys and two-factor secrets), and back `.data_key` up with the database:
+
+  ```powershell
+  icacls C:\PRISM\.secret_key /inheritance:r /grant:r "Administrators:F" "SYSTEM:F"
+  icacls C:\PRISM\.data_key /inheritance:r /grant:r "Administrators:F" "SYSTEM:F"
+  ```
+
 Check the database connection:
 
 ```powershell

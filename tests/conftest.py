@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault('LIBRARY_DIR', '/tmp/prism_test_library')
 os.environ.setdefault('SECRET_KEY_FILE', '/tmp/prism_test_library/.secret_key')
+os.makedirs(os.environ['LIBRARY_DIR'], exist_ok=True)
+os.environ.setdefault('DATA_KEY_FILE', os.path.join(os.environ['LIBRARY_DIR'], '.data_key'))
 
 # The suite runs against a real PostgreSQL database and TRUNCATEs tables, so it
 # only ever uses TEST_DATABASE_URL -- never DATABASE_URL, which on a developer

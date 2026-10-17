@@ -151,7 +151,7 @@ Back up the database and the media folders together; the database indexes the fi
 pg_dump -h localhost -U prism -Fc -f prism.dump prism
 ```
 
-Also copy `LIBRARY_DIR`, `TEMPLATES_DIR`, `.env`, `.secret_key` and the `*.json` config files in the app folder. Restore and scheduling: [docs/POSTGRESQL.md, section 7](docs/POSTGRESQL.md#7-backup-and-restore).
+Also copy `LIBRARY_DIR`, `TEMPLATES_DIR`, `.env`, `.secret_key`, `.data_key` and the `*.json` config files in the app folder. Restore and scheduling: [docs/POSTGRESQL.md, section 7](docs/POSTGRESQL.md#7-backup-and-restore).
 
 ### Tests
 
@@ -172,7 +172,10 @@ Treat the host like the storage it can reach: the app holds network-share creden
 
 - Sessions default to 1 day. Configure `SESSION_LIFETIME_DAYS` as needed. Every request is checked against the account: disabling an account, deleting it, setting its password or resetting its 2FA signs it out everywhere, and a role change applies on the next click.
 - Rate limits and the audit log use the connecting address. `X-Forwarded-For` is only honoured with `TRUST_PROXY_HEADERS=1`, so set it behind a proxy (otherwise every user shares the proxy's address and its login limit), and never without one.
-- Keep `SECRET_KEY_FILE` and share/API credentials on the host private; they are stored as local config, not in the repo.
+- Keep `SECRET_KEY_FILE` (signs sessions) and `DATA_KEY_FILE` (default `.data_key`; encrypts saved share/destination passwords, AI service API keys and two-factor secrets) private and backed up. Losing `.data_key` means re-entering those passwords and keys, and two-factor being set up again.
+- The session cookie is marked Secure whenever the request arrives over HTTPS (or `FORCE_HTTPS=1`). Serve PRISM over HTTPS for anything beyond a trusted LAN.
+- "Request access" on the sign-in page can be switched off in Config > Users; it is limited to `REGISTER_RATE_LIMIT` requests per address per hour (default 5). Signed-out visitors can send at most 64 KB per request.
+- A two-factor code is accepted once: the same code cannot be used again while it is still valid.
 
 ## License
 

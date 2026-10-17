@@ -33,7 +33,7 @@ import scriptbrief
 from schedule_core import IMAGE_EXTENSIONS as SCHEDULE_IMAGE_EXTENSIONS
 from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, library_get_row, library_delete,
     audit_log, audit_log_list, network_favorites_list, network_favorite_add, network_favorite_remove,
-    load_branding, save_branding_text, save_branding_landing, save_branding_color, save_branding_logo, save_branding_favicon,
+    load_branding, save_branding_text, save_branding_landing, save_branding_registration, save_branding_color, save_branding_logo, save_branding_favicon,
     clear_branding_logo, clear_branding_favicon, clear_branding_color, BRANDING_DIR,
     load_disabled_services, set_service_disabled, save_branding_theme, THEME_PRESETS,
     load_network_folders, save_network_folder, NETWORK_CATEGORY_KEYS,
@@ -42,6 +42,7 @@ from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, l
 from auth import require_permission, MEDIA_PERMISSIONS
 import project_routes
 import database
+import secretbox
 
 # ---- Per-show asset templates (PostgreSQL `show_templates` table) ----
 # A "template" is a named bundle of the reusable assets a specific show always
@@ -961,6 +962,12 @@ def load_config_overrides():
     except Exception as e:
         print(f'Config file load error ({CONFIG_FILE}): {e}')
         return
+    # API keys are kept encrypted (secretbox); a file saved before that is re-saved encrypted.
+    if any(cfg.get(k) and not secretbox.is_encrypted(cfg[k]) for k in _SECRET_CONFIG_KEYS):
+        _write_config_file(cfg)
+    for k in _SECRET_CONFIG_KEYS:
+        if k in cfg:
+            cfg[k] = secretbox.decrypt_or_blank(cfg[k])
     if 'FISH_AUDIO_URL' in cfg and cfg['FISH_AUDIO_URL']: FISH_AUDIO_URL = cfg['FISH_AUDIO_URL']
     if 'FISH_AUDIO_API_KEY' in cfg: FISH_AUDIO_API_KEY = cfg['FISH_AUDIO_API_KEY']
     if 'WHISPER_URL' in cfg and cfg['WHISPER_URL']: WHISPER_URL = cfg['WHISPER_URL']
@@ -968,6 +975,17 @@ def load_config_overrides():
     if 'ACE_STEP_URL' in cfg and cfg['ACE_STEP_URL']: ACE_STEP_URL = cfg['ACE_STEP_URL']
     if 'ACE_STEP_API_KEY' in cfg: ACE_STEP_API_KEY = cfg['ACE_STEP_API_KEY']
     if 'WOOSH_URL' in cfg and cfg['WOOSH_URL']: WOOSH_URL = cfg['WOOSH_URL']
+
+_SECRET_CONFIG_KEYS = ('FISH_AUDIO_API_KEY', 'ACE_STEP_API_KEY')
+
+
+def _write_config_file(cfg):
+    out = {k: (secretbox.encrypt(v) if k in _SECRET_CONFIG_KEYS else v) for k, v in cfg.items()}
+    tmp = CONFIG_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(out, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+
 
 def save_config_overrides(updates):
     """Merges `updates` (dict of the CONFIGURABLE_SERVICES keys) into the config file
@@ -981,8 +999,7 @@ def save_config_overrides(updates):
         except Exception:
             existing = {}
     existing.update({k: v for k, v in updates.items() if k in CONFIGURABLE_SERVICES})
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(existing, f, indent=2)
+    _write_config_file(existing)
     if 'FISH_AUDIO_URL' in updates: FISH_AUDIO_URL = updates['FISH_AUDIO_URL'] or FISH_AUDIO_URL
     if 'FISH_AUDIO_API_KEY' in updates: FISH_AUDIO_API_KEY = updates['FISH_AUDIO_API_KEY']
     if 'WHISPER_URL' in updates: WHISPER_URL = updates['WHISPER_URL'] or WHISPER_URL
@@ -10022,7 +10039,7 @@ def api_branding_get():
                    theme_colors=cfg['theme_colors'],
                    themes={k: v for k, v in THEME_PRESETS.items()},
                    has_logo=bool(cfg['logo_filename']), has_favicon=bool(cfg['favicon_filename']),
-                   landing_enabled=cfg['landing_enabled'])
+                   landing_enabled=cfg['landing_enabled'], registration_enabled=cfg['registration_enabled'])
 
 @app.route('/api/branding', methods=['POST'])
 def api_branding_post():
@@ -10044,6 +10061,9 @@ def api_branding_post():
     landing = request.form.get('landing_enabled')
     if landing is not None:
         save_branding_landing(landing.strip().lower() in ('1', 'true', 'on', 'yes'))
+    registration = request.form.get('registration_enabled')
+    if registration is not None:
+        save_branding_registration(registration.strip().lower() in ('1', 'true', 'on', 'yes'))
     theme_name = request.form.get('theme_name')
     if theme_name:
         _, err = save_branding_theme(theme_name)
@@ -10071,7 +10091,8 @@ def api_branding_post():
     if request.form.get('reset_accent_color') == '1':
         clear_branding_color()
     cfg = load_branding()
-    changed = [k for k in ('name', 'tagline', 'footer', 'theme_name', 'accent_color', 'landing_enabled')
+    changed = [k for k in ('name', 'tagline', 'footer', 'theme_name', 'accent_color', 'landing_enabled',
+                           'registration_enabled')
                if request.form.get(k)] + \
               [f'{k}_upload' for k in ('logo', 'favicon') if request.files.get(k) and request.files[k].filename] + \
               [f'reset_{k}' for k in ('logo', 'favicon', 'accent_color') if request.form.get(f'reset_{k}') == '1']
@@ -10081,7 +10102,7 @@ def api_branding_post():
                    accent_color=cfg['accent_color'], theme_name=cfg['theme_name'],
                    theme_colors=cfg['theme_colors'], themes={k: v for k, v in THEME_PRESETS.items()},
                    has_logo=bool(cfg['logo_filename']), has_favicon=bool(cfg['favicon_filename']),
-                   landing_enabled=cfg['landing_enabled'])
+                   landing_enabled=cfg['landing_enabled'], registration_enabled=cfg['registration_enabled'])
 
 @app.route('/api/health')
 def api_health():

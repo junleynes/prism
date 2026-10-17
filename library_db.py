@@ -6,6 +6,7 @@ Split out of the original monolith -- self-contained aside from `app`
 import os, uuid, time, json, shutil, re
 from core import app
 import database
+import secretbox
 
 # ---- Persistent trailer library ----
 # UPLOAD_FOLDER above is a fresh tempdir every process start, so anything that
@@ -21,6 +22,28 @@ def library_db_init():
     schema file covers accounts, jobs, chat memory and templates too -- each of
     those modules also calls this, and it only does the work once."""
     database.init_schema()
+    _encrypt_saved_destination_passwords()
+
+
+def _encrypt_saved_destination_passwords():
+    """Destinations saved before passwords were encrypted at rest (secretbox): encrypt them once."""
+    conn = database.connect()
+    try:
+        rows = conn.execute("SELECT id, password FROM network_destinations "
+                            "WHERE password IS NOT NULL AND password <> '' AND password NOT LIKE 'enc:v1:%%'").fetchall()
+        for r in rows:
+            conn.execute('UPDATE network_destinations SET password=%s WHERE id=%s',
+                         (secretbox.encrypt(r['password']), r['id']))
+        if rows:
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _destination_row(row):
+    d = dict(row)
+    d['password'] = secretbox.decrypt_or_blank(d.get('password'))
+    return d
 
 # ---- Audit log ----
 # Deliberately a short, fixed set of columns rather than a free-form blob --
@@ -131,13 +154,13 @@ def network_destinations_list():
     conn = database.connect()
     rows = conn.execute('SELECT * FROM network_destinations ORDER BY created_at ASC').fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [_destination_row(r) for r in rows]
 
 def network_destination_get(dest_id):
     conn = database.connect()
     row = conn.execute('SELECT * FROM network_destinations WHERE id=%s', (dest_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    return _destination_row(row) if row else None
 
 def network_destination_add(name, path, username=None, password=None, delivery_kind='video',
                              include_fcpxml=False, fcpxml_audio_tracks=False):
@@ -149,7 +172,7 @@ def network_destination_add(name, path, username=None, password=None, delivery_k
         'INSERT INTO network_destinations '
         '(name, path, username, password, delivery_kind, include_fcpxml, fcpxml_audio_tracks, created_at, updated_at) '
         'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
-        (name, path, username or None, password or None, delivery_kind,
+        (name, path, username or None, secretbox.encrypt(password) or None, delivery_kind,
          int(bool(include_fcpxml)), int(bool(fcpxml_audio_tracks)), now, now))
     new_id = cur.fetchone()['id']
     conn.commit()
@@ -174,7 +197,7 @@ def network_destination_update(dest_id, name=None, path=None, username=None, pas
         (name if name is not None else existing['name'],
          path if path is not None else existing['path'],
          username if username is not None else existing['username'],
-         password if password is not None else existing['password'],
+         secretbox.encrypt(password if password is not None else existing['password']) or None,
          delivery_kind if delivery_kind is not None else existing['delivery_kind'],
          int(bool(include_fcpxml)) if include_fcpxml is not None else existing['include_fcpxml'],
          int(bool(fcpxml_audio_tracks)) if fcpxml_audio_tracks is not None else existing['fcpxml_audio_tracks'],
@@ -443,7 +466,9 @@ def load_branding():
            'accent_color': DEFAULT_BRAND_ACCENT, 'theme_name': DEFAULT_THEME_NAME,
            'logo_filename': None, 'favicon_filename': None,
            # Off: signed-out visitors get only the sign-in card, not the marketing page.
-           'landing_enabled': True}
+           'landing_enabled': True,
+           # Off: no "Request access" -- accounts are only created by an admin.
+           'registration_enabled': True}
     if os.path.exists(BRANDING_FILE):
         try:
             with open(BRANDING_FILE) as f:
@@ -456,9 +481,9 @@ def load_branding():
                 if k == 'footer':
                     if 'footer' in saved:
                         cfg['footer'] = saved['footer']
-                elif k == 'landing_enabled':
-                    if 'landing_enabled' in saved:
-                        cfg['landing_enabled'] = bool(saved['landing_enabled'])
+                elif k in ('landing_enabled', 'registration_enabled'):
+                    if k in saved:
+                        cfg[k] = bool(saved[k])
                 elif saved.get(k):
                     cfg[k] = saved[k]
         except Exception as e:
@@ -485,6 +510,13 @@ def save_branding_text(name=None, tagline=None, footer=None):
         # legitimate, common choice (most installs won't want one at all),
         # not a mistake to silently correct the way a blank name would be.
         cfg['footer'] = footer.strip()
+    _write_branding(cfg)
+    return cfg
+
+def save_branding_registration(enabled):
+    """Allows (True) or stops (False) signed-out visitors requesting an account."""
+    cfg = load_branding()
+    cfg['registration_enabled'] = bool(enabled)
     _write_branding(cfg)
     return cfg
 
@@ -648,9 +680,13 @@ def load_network_folders():
             data = json.load(f)
         out = {cat: {k: v.get(k, '') for k in _NETWORK_FOLDER_FIELDS}
                for cat, v in data.items() if cat in NETWORK_CATEGORY_KEYS and isinstance(v, dict)}
+        plain = any(r.get('password') and not secretbox.is_encrypted(r['password']) for r in out.values())
         for cat in out:
             if data[cat].get('in_place'):
                 out[cat]['in_place'] = True
+            out[cat]['password'] = secretbox.decrypt_or_blank(out[cat].get('password'))
+        if plain:
+            _write_network_folders(out)           # saved before encryption at rest: re-save encrypted
         return out
     except Exception as e:
         print(f'Network folder config load error ({NETWORK_FOLDERS_FILE}): {e}')
@@ -674,12 +710,23 @@ def save_network_folder(category, fields):
         # "Read the files where they are" rather than copy them to this server first.
         row['in_place'] = bool(fields['in_place'])
     current[category] = row
-    for r in current.values():
-        if not r.get('in_place'):
-            r.pop('in_place', None)             # kept in the file only where it is on
-    with open(NETWORK_FOLDERS_FILE, 'w') as f:
-        json.dump(current, f, indent=2)
+    _write_network_folders(current)
     return True, None
+
+
+def _write_network_folders(folders):
+    """Writes {category: row} with every password encrypted (secretbox)."""
+    out = {}
+    for cat, r in folders.items():
+        row = dict(r)
+        row['password'] = secretbox.encrypt(row.get('password') or '')
+        if not row.get('in_place'):
+            row.pop('in_place', None)             # kept in the file only where it is on
+        out[cat] = row
+    tmp = NETWORK_FOLDERS_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(out, f, indent=2)
+    os.replace(tmp, NETWORK_FOLDERS_FILE)
 
 library_db_init()
 

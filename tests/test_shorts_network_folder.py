@@ -130,7 +130,9 @@ def test_config_api_shows_saves_and_validates_it(folders):
     cats = client.get('/api/network/shares').get_json()['categories']
     assert cats['shorts']['path'] == SHORTS['path'] and cats['shorts']['has_password'] is True
     assert 'password' not in cats['shorts'], 'a saved password is never sent back'
-    assert json.loads(folders.read_text())['hires'] == HIRES
+    saved = json.loads(folders.read_text())['hires']
+    assert saved['password'].startswith('enc:v1:'), 'kept encrypted at rest'
+    assert pipeline.load_network_folders()['hires'] == HIRES, 'the other folder is left as it was'
 
 
 def test_the_shorts_tab_browses_its_own_category():

@@ -204,6 +204,7 @@ body:has(.login-panel){overflow:hidden;background:radial-gradient(900px 600px at
 }
 .rail-signout{
   flex-shrink:0;
+  background:none;cursor:pointer;
   font:600 9px 'JetBrains Mono',monospace;
   letter-spacing:.06em;
   text-transform:uppercase;
