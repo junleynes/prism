@@ -746,6 +746,15 @@ input.sh-num[type=number]{width:92px}
 .sh-end-cols{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:start;margin-top:4px;padding-top:12px;border-top:1px solid var(--line)}
 .sh-end-ctrl{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px 16px;font-size:12px;align-content:start}
 .sh-end-ctrl>span,.sh-end-ctrl>.sh-note{margin-left:0!important}
+.gm-chips{display:flex;flex-wrap:wrap;gap:5px;max-height:104px;overflow-y:auto;margin-bottom:8px}
+.gm-chip{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:2px 4px 2px 9px;border:1px solid var(--line);border-radius:999px}
+.gm-chip button{background:none;border:0;color:var(--ink-dim);cursor:pointer;font-size:14px;line-height:1;padding:0 4px}
+.gm-chip button:hover{color:var(--tally)}
+.gm-add{position:relative;max-width:320px}
+.gm-add input{width:100%;box-sizing:border-box}
+.gm-list{position:absolute;left:0;right:0;z-index:5;background:var(--bg-card,#14181d);border:1px solid var(--line);border-radius:6px;margin-top:2px;max-height:220px;overflow-y:auto;display:flex;flex-direction:column}
+.gm-list button{background:none;border:0;color:inherit;text-align:left;font-size:12px;padding:6px 10px;cursor:pointer}
+.gm-list button:hover{background:rgba(255,255,255,.07)}
 .sh-end-ctrl>.sh-note,.sh-end-ctrl>.sh-sfx,.sh-end-ctrl>.sh-overlay{grid-column:1/-1}
 .sh-sfx .net-file-chip,.sh-overlay .net-file-chip{max-width:100%;min-width:0}
 .sh-sfx .browse-btn,.sh-overlay .browse-btn{white-space:nowrap}
@@ -14802,11 +14811,7 @@ function renderUsersTab(d){
       return '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">' +
         '<input type=checkbox data-group-perm data-gid="'+g.id+'" value="'+p.key+'"'+(g.permissions.indexOf(p.key)!==-1?' checked':'')+'> '+escapeHtmlLite(p.label)+'</label>'
     }).join('')
-    var members = d.users.map(function(u){
-      return '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">' +
-        '<input type=checkbox data-group-member data-gid="'+g.id+'" value="'+u.id+'"'+((g.member_ids || []).indexOf(u.id)!==-1?' checked':'')+'> ' +
-        escapeHtmlLite(u.username)+(u.role === 'admin' ? ' <span style="opacity:.55;font-size:10px">admin</span>' : '')+'</label>'
-    }).join('')
+    var members = '<div class=gm data-gm data-gid="'+g.id+'" data-members="'+(g.member_ids || []).join(',')+'"></div>'
     return '<div class=card style="margin-top:12px">' +
       '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">' +
         '<strong>'+escapeHtmlLite(g.name)+'</strong>' +
@@ -14817,7 +14822,7 @@ function renderUsersTab(d){
       '<div style="font-size:10px;text-transform:uppercase;color:var(--ink-dim);margin:2px 0 6px">Tabs</div>' +
       '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px 14px">'+checks+'</div>' +
       '<div style="font-size:10px;text-transform:uppercase;color:var(--ink-dim);margin:14px 0 6px">Members</div>' +
-      '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px 14px">'+members+'</div>' +
+      members +
     '</div>'
   }).join('') || '<p style="font-size:12px;opacity:.7;margin:4px 0 0">No groups yet. Accounts in no group see only the Dashboard and Docs.</p>'
 
@@ -14866,6 +14871,7 @@ function renderUsersTab(d){
       '</div>' +
     '</div>'
 
+  document.querySelectorAll('[data-gm]').forEach(gmRender)
   fetch('/api/branding').then(function(r){ return r.json() }).then(function(b){
     var box = document.getElementById('cu-registration'); if(box) box.checked = b.registration_enabled !== false
   }).catch(function(){})
@@ -14875,6 +14881,44 @@ function renderUsersTab(d){
   if(tableSave) tableSave.addEventListener('click', saveAllUserRoleAndGroup)
   updateUsersTableSaveState()
 }
+
+// Group members: chips for who is in, plus a search box that suggests the rest, so a long user list never fills the card.
+function gmIds(box){
+  return (box.getAttribute('data-members') || '').split(',').filter(Boolean).map(Number)
+}
+function gmRender(box, query){
+  var ids = gmIds(box), users = (USERS_TAB_DATA && USERS_TAB_DATA.users) || []
+  var byId = {}; users.forEach(function(u){ byId[u.id] = u })
+  var chips = ids.filter(function(i){ return byId[i] }).map(function(i){
+    return '<span class=gm-chip>'+escapeHtmlLite(byId[i].username)+
+      '<button type=button data-gm-remove="'+i+'" title="Remove from this group" aria-label="Remove">×</button></span>'
+  }).join('') || '<span style="opacity:.6;font-size:11px">No members yet.</span>'
+  var q = (query || '').trim().toLowerCase()
+  var pool = users.filter(function(u){ return ids.indexOf(u.id) === -1 && (!q || u.username.toLowerCase().indexOf(q) !== -1) })
+  var list = q ? pool.slice(0, 8).map(function(u){
+    return '<button type=button data-gm-add="'+u.id+'">'+escapeHtmlLite(u.username)+(u.role==='admin'?' <span style="opacity:.55;font-size:10px">admin</span>':'')+'</button>'
+  }).join('') || '<span style="opacity:.6;font-size:11px;padding:4px 8px">No match.</span>' : ''
+  var had = box.querySelector('input')
+  var focus = had && document.activeElement === had
+  box.innerHTML = '<div class=gm-chips>'+chips+'</div>' +
+    '<div class=gm-add><input type=text data-gm-search placeholder="Add a member — type a name" autocomplete=off value="'+escapeHtmlLite(query || '')+'">' +
+    (list ? '<div class=gm-list>'+list+'</div>' : '') + '</div>'
+  if(focus){ var inp = box.querySelector('input'); inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length) }
+}
+document.addEventListener('input', function(e){
+  if(!e.target.matches || !e.target.matches('[data-gm-search]')) return
+  gmRender(e.target.closest('[data-gm]'), e.target.value)
+})
+document.addEventListener('click', function(e){
+  var add = e.target.closest('[data-gm-add]'), rm = e.target.closest('[data-gm-remove]')
+  var btn = add || rm
+  if(!btn) return
+  var box = btn.closest('[data-gm]'), ids = gmIds(box), id = +(btn.getAttribute('data-gm-add') || btn.getAttribute('data-gm-remove'))
+  ids = add ? ids.concat(ids.indexOf(id) === -1 ? [id] : []) : ids.filter(function(i){ return i !== id })
+  box.setAttribute('data-members', ids.join(','))
+  gmRender(box)
+  if(add){ var inp = box.querySelector('input'); if(inp) inp.focus() }
+})
 function usersTableHasPendingRoleGroupChanges(){
   var dirty = false
   document.querySelectorAll('[data-role-select]').forEach(function(sel){
@@ -14930,8 +14974,7 @@ document.addEventListener('click', function(e){
   if(action === 'save-group-perms'){
     var perms = Array.prototype.map.call(
       document.querySelectorAll('[data-group-perm][data-gid="'+gid+'"]:checked'), function(c){ return c.value })
-    var memberIds = Array.prototype.map.call(
-      document.querySelectorAll('[data-group-member][data-gid="'+gid+'"]:checked'), function(c){ return +c.value })
+    var memberIds = gmIds(document.querySelector('[data-gm][data-gid="'+gid+'"]'))
     return (async function(){
       var a = await usersActionQuiet('/admin/api/groups/'+gid+'/permissions', {permissions: perms})
       if(!a || !a.ok){ usersStatus((a && a.error) || 'Could not save the tabs.', true); return }

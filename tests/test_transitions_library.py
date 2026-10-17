@@ -140,3 +140,10 @@ def test_the_ending_preview_shows_the_overlay_across_the_freeze(tmp_path, with_s
     gone = c.post('/api/shorts/ending-preview', json={'ending_hold': 2, 'ending_overlay': 'net_9_gone.mov'},
                   headers=hdr)
     assert gone.status_code == 400 and 'pick it again' in gone.get_json()['error']
+
+
+def test_group_members_are_chips_with_a_search_not_a_list_of_every_user():
+    html = _page()
+    assert 'data-gm-search' in html and 'data-gm-add' in html and 'data-gm-remove' in html
+    assert '<input type=checkbox data-group-member' not in html, 'no checkbox per user in each group'
+    assert "gmIds(document.querySelector('[data-gm][data-gid=" in html, 'saved from the chips'
