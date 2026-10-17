@@ -96,8 +96,8 @@ def test_each_group_sees_only_its_own_projects(world, kind, _perm):
     p, groups = world
     drama = _create(p['anna'], kind, 'Tadhana')
     news = _create(p['cyrus'], kind, 'Balita')
-    loose = _create(p['boss'], kind, 'Unfiled', group_id='')
-    assert drama['group_id'] == groups['Drama'] and news['group_id'] == groups['News'] and loose['group_id'] is None
+    loose = _create(p['boss'], kind, 'Unfiled', group_id=str(groups['News']))   # a group_id sent is ignored
+    assert drama['group_name'] == 'Drama' and news['group_name'] == 'News' and loose['group_name'] is None
 
     assert _titles(p['anna'], kind) == _titles(p['benny'], kind) == {'Tadhana'}, 'the whole group sees it'
     assert _titles(p['cyrus'], kind) == {'Balita'}

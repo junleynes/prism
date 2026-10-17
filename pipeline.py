@@ -439,7 +439,7 @@ def _network_categories():
         # Artwork for the Schedule Plug tab: stills, not video -- a flat
         # image or a layered Photoshop file. No fallback: nothing else that
         # is configured holds images.
-        'schedule': {'exts': SCHEDULE_IMAGE_EXTENSIONS, 'label': 'Schedule plug artwork (image / PSD)'},
+        'schedule': {'exts': SCHEDULE_IMAGE_EXTENSIONS, 'label': 'Animation artwork (image / PSD)'},
         # NOTE the legacy form-field names: 'end_card_video' is the TITLE
         # card and 'schedule_video' is the END card (see TEMPLATE_SLOTS for
         # the same mapping).
@@ -5887,9 +5887,9 @@ chat_memory_db_init()
 APP_KNOWLEDGE_PROMPT = """You are the built-in AI Assistant inside PRISM (AI-Powered Media Creation), a broadcast promo/trailer generation tool. When the user asks how the app works, why something behaved a certain way, or what its limits are, answer from the information below rather than guessing. For anything genuinely outside this scope (general knowledge, writing help, etc.) just help normally -- this context only needs to shape answers about the app itself.
 
 WHAT PRISM DOES
-Generates episodic promo plugs ("trailers") from raw broadcast footage: detects scenes, scores/selects the best ones, assembles them with transitions, and can add title/end cards, background music, sound effects, and narration (VO) -- either fully automatically or with manual control at every step.
+Makes Highlights Videos (episodic promos, "trailers") from raw broadcast footage: detects scenes, scores/selects the best ones, assembles them with transitions, and can add title/end cards, background music, sound effects, and narration (VO) -- either fully automatically or with manual control at every step.
 
-MAIN WORKFLOW (Generate Promo Plug tab)
+MAIN WORKFLOW (Highlights Video tab)
 1. Supply source video: Browse Library (a configured network/SMB share) by default, or direct upload if the deployment has that enabled.
 2. Scene rating always combines OpenCV heuristics, AI vision scoring (Ollama), and dialogue transcription (faster-whisper) -- there's no mode to pick; this runs the same way for every job so cuts are never placed mid-word regardless of anything else selected.
 3. Scene selection is automatic based on what's supplied, not a mode to choose: a "What should this promo feature?" description and/or an attached script (timecoded cues) each pin the specific moments they call for, and best-scoring scenes fill in whatever's left over. Supply neither and it's best-scoring scenes for the whole thing.
@@ -10716,7 +10716,7 @@ def _run_trailer_job(jid, params):
             if check['status'] != 'up':
                 unreachable.append(f"Speech-to-text (faster-whisper at {WHISPER_URL}): {check.get('error', 'unreachable')}")
         if unreachable:
-            job_set(jid, error='Cannot generate a promo plug right now -- required service(s) unreachable: '
+            job_set(jid, error='Cannot make a highlights video right now -- required service(s) unreachable: '
                                 + '; '.join(unreachable) +
                                 '. Scene scoring and mid-word cut protection both depend on these. '
                                 'Check Config > Services (or the API tab\'s health check) and try again '
@@ -10737,7 +10737,7 @@ def _run_trailer_job(jid, params):
     trailer_duration = trailer_length
     min_required = trailer_length * 1.5
     if video_duration < min_required:
-        job_set(jid, error=f'Video is only {video_duration:.1f}s long, but a {trailer_length}s episodic promo plug requires at least {min_required:.1f}s of raw video. Upload a longer video or select a shorter length.')
+        job_set(jid, error=f'Video is only {video_duration:.1f}s long, but a {trailer_length}s highlights video requires at least {min_required:.1f}s of raw video. Upload a longer video or select a shorter length.')
         return
 
     # Measure card durations before selecting scenes
@@ -12433,7 +12433,7 @@ def _run_trailer_job(jid, params):
             detail = ' No scene clips were successfully extracted from the source video — check that ffmpeg/ffprobe are installed and on PATH, and that the uploaded video isn\'t corrupt.'
         elif last_ffmpeg_stderr:
             detail = f' Last ffmpeg error: {last_ffmpeg_stderr.strip()}'
-        job_set(jid, error=f'Episodic Promo Plug generation failed (ffmpeg output empty).{detail}')
+        job_set(jid, error=f'Highlights video generation failed (ffmpeg output empty).{detail}')
         return
     # Verify it's a valid video, and capture the ACTUAL assembled duration.
     # This is scenes + cards - crossfade overlap, which is NOT the same as
@@ -12443,7 +12443,7 @@ def _run_trailer_job(jid, params):
     # user understated the real file by the length of the cards.
     assembled_duration = probe_duration(out_path)
     if assembled_duration is None or assembled_duration <= 0:
-        job_set(jid, error='Episodic Promo Plug generation failed (invalid/corrupt output).')
+        job_set(jid, error='Highlights video generation failed (invalid/corrupt output).')
         return
 
     job_set(jid, percent=58, step='Normalizing audio levels')

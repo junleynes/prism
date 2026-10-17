@@ -1,5 +1,5 @@
 /*
- * Projects for Episodic Plug and Schedule Plug -- the same screens as the
+ * Projects for Highlights Video (episodic) and Artwork Animation (schedule) -- the same screens as the
  * Vertical Shorts projects (templates/index.html, "---- Projects ----"):
  * a list of project cards, a form for a project's details, and an open
  * project with its header. Shorts keeps its own copy of this code; this one
@@ -78,9 +78,9 @@
           '<div class="sh-proj-form" style="margin-top:10px">' +
             '<div><label for="' + P + '-title">Programme title:</label>' +
               '<input type="text" id="' + P + '-title" class="input-box" maxlength="120" placeholder="e.g. Tadhana"></div>' +
-            '<div><label for="' + P + '-episode">Episode:</label>' +
-              '<input type="text" id="' + P + '-episode" class="input-box" maxlength="40" placeholder="e.g. Ep. 101 or S01E01"></div>' +
-            '<div><label for="' + P + '-eptitle">Episode title:</label>' +
+            '<div><label for="' + P + '-episode">Program Code:</label>' +
+              '<input type="text" id="' + P + '-episode" class="input-box" maxlength="40" placeholder="e.g. TDH-101"></div>' +
+            '<div><label for="' + P + '-eptitle">Title:</label>' +
               '<input type="text" id="' + P + '-eptitle" class="input-box" maxlength="120" placeholder="e.g. Ang Pagbabalik"></div>' +
             '<div><label for="' + P + '-artists">Artist/s:</label>' +
               '<input type="text" id="' + P + '-artists" class="input-box" maxlength="300" placeholder="e.g. Juan Dela Cruz, Maria Santos"></div>' +
@@ -92,8 +92,8 @@
               '</select></div>' +
             '<div><label for="' + P + '-assign">Assigned to:</label>' +
               '<select id="' + P + '-assign" class="input-box"><option value="">Unassigned</option></select></div>' +
-            '<div id="' + P + '-group-wrap" style="display:none"><label for="' + P + '-group">Group:</label>' +
-              '<select id="' + P + '-group" class="input-box" title="Only this group\'s members (and admins) see the project and its ' + noun[1] + '"></select></div>' +
+            '<div id="' + P + '-group-wrap"><label>Group:</label>' +
+              '<div id="' + P + '-group" style="font-size:13px;padding:6px 0" title="A project belongs to the groups of whoever created it, and follows them if they change group"></div></div>' +
             '<div><label for="' + P + '-hasdue" style="display:flex;gap:8px;align-items:center;cursor:pointer">' +
               '<input type="checkbox" id="' + P + '-hasdue"> Has a Deadline</label>' +
               '<div id="' + P + '-due" style="display:none;margin-top:6px">' +
@@ -107,7 +107,7 @@
           '</div>' +
           '<label for="' + P + '-desc" style="margin-top:10px">Description:</label>' +
           '<textarea id="' + P + '-desc" class="input-box" maxlength="1000" rows="3" ' +
-            'placeholder="What the episode is about, who it is for, anything the next person should know."></textarea>' +
+            'placeholder="What it is about, who it is for, anything the next person should know."></textarea>' +
           '<p class="sh-note" style="margin-top:6px">Only the title is required.</p>' +
           '<div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">' +
             '<button type="button" class="btn" id="' + P + '-save">Create project</button>' +
@@ -138,7 +138,7 @@
       if(p.artists) bits.push(esc(p.artists))
       if(p.air_date) bits.push('airs ' + esc(dateText(p.air_date)))
       if(p.assigned_to) bits.push('assigned to ' + esc(p.assigned_to))
-      if(S.isAdmin || (S.groups || []).length > 1) bits.push(p.group_name ? 'group ' + esc(p.group_name) : 'no group')
+      if(p.group_name || S.isAdmin) bits.push(p.group_name ? 'group ' + esc(p.group_name) : 'no group')
       var due = dueText(p)
       if(due) bits.push(due)
       return bits.join(' &middot; ')
@@ -213,7 +213,6 @@
         var d = await (await fetch('/api/' + kind + '/projects')).json()
         if(!d.ok) throw new Error(d.error || 'Not allowed')
         S.projects = d.items
-        S.groups = d.groups || []
         S.isAdmin = !!d.is_admin
       }catch(e){
         S.projects = S.projects || []
@@ -310,15 +309,8 @@
       el('air').value = p ? (p.air_date || '') : ''
       el('status').value = p ? (p.status || 'new') : 'new'
       loadAssignees(p ? p.assigned_to : '', p ? p.project_id : '')
-      // Which group the project is for: admins pick any group (or none); someone in several groups picks one of
-      // theirs. With a single group there is nothing to choose and the field stays hidden.
-      var grp = el('group'), groups = S.groups || []
-      var pick = S.isAdmin || groups.length > 1
-      el('group-wrap').style.display = pick ? '' : 'none'
-      grp.innerHTML = (S.isAdmin ? '<option value="">No group</option>' : (p ? '' : '<option value="" disabled>Choose a group</option>')) +
-        groups.map(function(x){ return '<option value="' + esc(x.id) + '">' + esc(x.name) + '</option>' }).join('')
-      grp.value = p && p.group_id != null ? String(p.group_id) : ''
-      if(!S.isAdmin && !grp.value && !p) grp.selectedIndex = 0
+      // Nobody picks the group: a project belongs to its creator's current groups.
+      el('group').textContent = p ? ((p.group_name || 'no group') + ' (its creator\u2019s)') : 'Your group'
       var dl = p && p.deadline ? p.deadline.split('T') : null
       el('hasdue').checked = !!dl
       el('duedate').value = dl ? dl[0] : ''
@@ -348,10 +340,6 @@
       fd.append('air_date', el('air').value)
       fd.append('status', el('status').value)
       fd.append('assigned_to', el('assign').value)
-      if(el('group-wrap').style.display !== 'none'){
-        if(!S.isAdmin && !el('group').value){ note.textContent = 'Choose which group this project is for.'; el('group').focus(); return }
-        fd.append('group_id', el('group').value)
-      }
       if(el('hasdue').checked){
         if(!el('duedate').value){ note.textContent = 'Choose the due date, or turn off Has a Deadline.'; el('duedate').focus(); return }
         fd.append('has_deadline', '1')

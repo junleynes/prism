@@ -655,7 +655,7 @@ def api_schedule_storyboard():
     if not board:
         return jsonify(error='Pick the storyboard picture (JPEG or PNG) using Browse library.'), 400
     if not SCHEDULE_USE_LLM:
-        return jsonify(error='The AI model is switched off for the Schedule Plug on this server.'), 503
+        return jsonify(error='The AI model is switched off for Artwork Animation on this server.'), 503
     note = ' '.join((request.form.get('note') or '').split())[:300]
     try:
         board_b64, _w, _h = sk.storyboard_jpeg(board)
@@ -755,7 +755,7 @@ def api_schedule_render():
     except Exception as e:                                  # a convenience: never in the way of the render
         print(f'Schedule Plug: could not keep the last settings ({e})')
     jid = pipeline.job_new(user_id=session.get('user_id'), username=session.get('username'), kind='schedule')
-    pipeline.job_set_orig_name(jid, f'{orig} (schedule plug, {duration}s)')
+    pipeline.job_set_orig_name(jid, f'{orig} (artwork animation, {duration}s)')
     if len(_JOBS) > 500:
         for k in list(_JOBS)[:250]:
             _JOBS.pop(k, None)

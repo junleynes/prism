@@ -38,7 +38,7 @@ def test_a_group_without_docs_gets_neither_the_tab_nor_its_content(users_db):
     uid = _member('shorts-only', ['vertical_shorts'])
     html = _page(uid, 'user', 'shorts-only')
     assert TAB not in html and PANEL not in html
-    assert 'The Episodic Plug page' not in html, 'the Docs text is not sent at all, not just hidden'
+    assert 'The Highlights Video page' not in html, 'the Docs text is not sent at all, not just hidden'
     assert "switchTab('p-shorts',this)" in html
 
 

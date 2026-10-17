@@ -916,7 +916,7 @@ input.sh-num[type=number]{width:92px}
 .ws-zoom .zh::after{content:"";position:absolute;left:6px;top:8px;bottom:8px;width:4px;border-radius:2px;background:var(--accent,#4f8cff)}
 .ws-zoom .tick{position:absolute;top:0;height:9px;width:1px;background:var(--ink-dim);opacity:.6}
 .ws-zoom .zt{position:absolute;bottom:2px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--ink-dim);transform:translateX(-50%);white-space:nowrap}
-/* ---- Schedule Plug workspace ---- */
+/* ---- Artwork Animation workspace ---- */
 .sp-grid{grid-template-columns:270px minmax(0,1fr) 360px}
 .sp-grid .ws-stage{position:static}
 .sp-layer{display:grid;grid-template-columns:64px minmax(0,1fr);gap:8px;align-items:center;padding:6px;margin:0 0 3px;border:1px solid transparent;border-radius:8px;cursor:pointer}
@@ -974,7 +974,7 @@ input.sh-num[type=number]{width:92px}
 .sp-stale{font-size:12px;color:var(--amber);margin:4px 0}
 .sp-tune{display:grid;grid-template-columns:1fr 1fr;gap:8px}.sp-tune label{margin:0 0 2px}
 .sp-batch-row{display:flex;gap:8px;align-items:center;font-size:13px;padding:4px 0}
-/* Episodic Plug workspace: three screens over the existing form, review grid and result */
+/* Highlights Video workspace: three screens over the existing form, review grid and result */
 #p-trailer.tr-s-review .work-in,#p-trailer.tr-s-result .work-in{display:none}
 #p-trailer.tr-s-review .work,#p-trailer.tr-s-result .work{grid-template-columns:minmax(0,1fr)}
 #p-trailer.tr-s-review .work-out,#p-trailer.tr-s-result .work-out{position:static;max-height:none}
@@ -1062,7 +1062,7 @@ input.sh-num[type=number]{width:92px}
 .sh-sw.on{border-color:var(--ink);box-shadow:0 0 0 1px var(--ink)}
 .sh-warn{font-size:12px;line-height:1.5;padding:8px 10px;border-radius:6px;border:1px solid color-mix(in srgb,var(--amber) 45%,transparent);color:var(--amber);margin:8px 0}
 @media (max-width:640px){.sh-cand{grid-template-columns:1fr}}
-/* ---- Output peak/channel meter (Generate Promo Plug result) ---- */
+/* ---- Output peak/channel meter (Highlights Video result) ---- */
 .tr-video-row{display:flex;gap:10px;align-items:stretch}
 .peak-meter{
   flex:0 0 auto;width:78px;display:flex;flex-direction:column;align-items:center;
@@ -1195,13 +1195,13 @@ var CURRENT_USERNAME = {{ current_username|tojson }}
     <div class="tab{{ ' active' if default_tab == 'p-dashboard' else '' }}" onclick="switchTab('p-dashboard',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span><span class=tab-text>Dashboard</span></div>
     <div class="rail-section">Create</div>
     {% if current_role == 'admin' or 'promo_generation' in current_permissions %}
-    <div class="tab{{ ' active' if default_tab == 'p-trailer' else '' }}" onclick="switchTab('p-trailer',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4.5-2.5L10 9.5z"/></svg></span><span class=tab-text>Episodic Plug</span></div>
+    <div class="tab{{ ' active' if default_tab == 'p-trailer' else '' }}" onclick="switchTab('p-trailer',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4.5-2.5L10 9.5z"/></svg></span><span class=tab-text>Highlights Video</span></div>
     {% endif %}
     {% if current_role == 'admin' or 'vertical_shorts' in current_permissions %}
     <div class="tab{{ ' active' if default_tab == 'p-shorts' else '' }}" onclick="switchTab('p-shorts',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="6.5" y="3" width="11" height="18" rx="2"/><path d="M10.5 9.5v5l4-2.5-4-2.5z"/></svg></span><span class=tab-text>Vertical Shorts</span></div>
     {% endif %}
     {% if current_role == 'admin' or 'schedule_plug' in current_permissions %}
-    <div class="tab{{ ' active' if default_tab == 'p-schedule' else '' }}" onclick="switchTab('p-schedule',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4M7.5 14h4M7.5 17h7"/></svg></span><span class=tab-text>Schedule Plug</span></div>
+    <div class="tab{{ ' active' if default_tab == 'p-schedule' else '' }}" onclick="switchTab('p-schedule',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4M7.5 14h4M7.5 17h7"/></svg></span><span class=tab-text>Artwork Animation</span></div>
     {% endif %}
     {% if current_role == 'admin' or 'music_generation' in current_permissions %}
     <div class="tab{{ ' active' if default_tab == 'p-music' else '' }}" onclick="switchTab('p-music',this)" role="button" tabindex="0"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V6l11-2v12"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg></span><span class=tab-text>Music Generation</span></div>
@@ -1610,10 +1610,10 @@ document.addEventListener("DOMContentLoaded", function(){
   </div>
 </div>
 
-<!-- Episodic Promo Plug -->
+<!-- Highlights Video -->
 <div id="p-trailer" class="panel{{ ' active' if default_tab == 'p-trailer' else '' }}">
-<h2>Episodic Promo Plug Generator</h2>
-<p id="ep-intro" style="font-size:12px;opacity:.75;margin-top:-6px">Promo plugs are made inside a project: the episode they are for. Create the project first &mdash; programme, episode, air date, a description and a picture &mdash; or open one, then make its plugs there. Every plug you save for it is kept together in it, and everyone in the project&rsquo;s group can play, download and send them.</p>
+<h2>Highlights Video Generator</h2>
+<p id="ep-intro" style="font-size:12px;opacity:.75;margin-top:-6px">Highlights videos are made inside a project: the episode they are for. Create the project first &mdash; programme, program code, title, air date, a description and a picture &mdash; or open one, then make its videos there. Every video you save for it is kept together in it, and everyone in the project&rsquo;s group can play, download and send them.</p>
 <div id="ep-projects"></div>
 <div id="ep-work">
 <div id=tr-steps class=ws-steps role="tablist" aria-label="Steps">
@@ -1931,7 +1931,7 @@ document.addEventListener("DOMContentLoaded", function(){
     <audio id=vo-preview-audio controls style="display:none;width:100%;margin-top:4px"></audio>
   </div>
   <div id=vo-common-area style="display:none;margin:8px 0">
-    <span style="display:inline-flex;gap:6px;align-items:center;white-space:nowrap"><span style="font-size:12px">Start at (s into promo plug):</span>
+    <span style="display:inline-flex;gap:6px;align-items:center;white-space:nowrap"><span style="font-size:12px">Start at (s into the video):</span>
     <input type=number name=vo_start value=0 min=0 step=0.5 style="width:80px"></span>
     <span style="display:inline-flex;gap:6px;align-items:center;white-space:nowrap"><span style="font-size:12px">Audio level:</span>
     <input type=number name=vo_volume value=1.15 min=0.3 max=3.0 step=0.05 style="width:80px"></span>
@@ -3934,7 +3934,7 @@ document.addEventListener("DOMContentLoaded", function(){
 </div>
 <div id=tr-history class=card style="padding:0;margin-bottom:14px;overflow:hidden">
   <div id=tr-history-toggle style="display:flex;align-items:center;justify-content:space-between;padding:11px 16px;cursor:pointer">
-    <strong style="font-size:13px">Saved plugs <span id=tr-history-count style="opacity:.6;font-weight:400"></span></strong>
+    <strong style="font-size:13px">Saved videos <span id=tr-history-count style="opacity:.6;font-weight:400"></span></strong>
     <span id=tr-history-chevron style="opacity:.6;font-size:12px">&#9660;</span>
   </div>
   <div id=tr-history-body style="display:none;border-top:1px solid var(--line)">
@@ -4906,7 +4906,7 @@ document.addEventListener('DOMContentLoaded', function(){
   updateJobSummary()
 })
 
-// ---- Episodic Plug workspace: screens, ready check, last settings ----
+// ---- Highlights Video workspace: screens, ready check, last settings ----
 var TR = {screen: 'setup', hasReview: false, hasResult: false}
 function trEl(id){ return document.getElementById(id) }
 function trScreen(name){
@@ -7422,7 +7422,7 @@ function closeTrailerResult(){
   document.getElementById('tr-area').style.display = 'none'
   if(typeof trScreen === 'function') trScreen('setup')
   var prompt = document.getElementById('tr-prompt')
-  prompt.textContent = 'Closed. Generate a new promo, or reopen one from Recent renders / Saved plugs.'
+  prompt.textContent = 'Closed. Generate a new promo, or reopen one from Recent renders / Saved videos.'
   prompt.style.display = 'block'
 }
 // Semicolon required here, not stylistic: without it, JS's automatic
@@ -7447,7 +7447,7 @@ function episodicProjectId(){ return (window.PRISM_PROJECT || {}).episodic || nu
 function episodicProjectsInit(){
   if(EPP || !window.PrismProjects) return
   EPP = PrismProjects.create({
-    kind: 'episodic', prefix: 'ep', mount: 'ep-projects', work: 'ep-work', intro: 'ep-intro', noun: ['plug', 'plugs'],
+    kind: 'episodic', prefix: 'ep', mount: 'ep-projects', work: 'ep-work', intro: 'ep-intro', noun: ['video', 'videos'],
     onOpen: function(p, fresh, refresh){
       if(!refresh){
         // Back to the first step, with another project's result gone.
@@ -7502,7 +7502,7 @@ document.addEventListener('DOMContentLoaded', function(){
   if(p && p.classList.contains('active')) episodicOnTabOpen()
 })
 
-(function(){
+;(function(){
   var body = document.getElementById('tr-history-body')
   var toggle = document.getElementById('tr-history-toggle')
   var chevron = document.getElementById('tr-history-chevron')
@@ -7517,12 +7517,12 @@ document.addEventListener('DOMContentLoaded', function(){
 
   function refreshHistory(){
     var pid = episodicProjectId()
-    if(!pid){ countEl.textContent = ''; listEl.innerHTML = '<div class="net-modal-empty">Open a project to see its plugs.</div>'; return }
+    if(!pid){ countEl.textContent = ''; listEl.innerHTML = '<div class="net-modal-empty">Open a project to see its videos.</div>'; return }
     fetch('/api/trailer/library?project_id=' + encodeURIComponent(pid)).then(function(r){ return r.json() }).then(function(d){
       if(!d.ok || episodicProjectId() !== pid) return
       countEl.textContent = d.items.length ? '(' + d.items.length + ')' : ''
       if(!d.items.length){
-        listEl.innerHTML = '<div class="net-modal-empty">No saved plugs yet.</div>'
+        listEl.innerHTML = '<div class="net-modal-empty">No saved videos yet.</div>'
         return
       }
       listEl.innerHTML = ''
@@ -7545,7 +7545,7 @@ document.addEventListener('DOMContentLoaded', function(){
         })
         row.querySelector('.history-del').addEventListener('click', function(e){
           e.stopPropagation()
-          if(!confirm('Delete "' + (item.orig_name || 'this plug') + '" permanently? This removes the saved file too.')) return
+          if(!confirm('Delete "' + (item.orig_name || 'this video') + '" permanently? This removes the saved file too.')) return
           fetch('/api/trailer/library/' + item.id + '/delete', {method: 'POST'}).then(function(){ refreshHistory(); if(window.EPP) EPP.reload() })
         })
         listEl.appendChild(row)
@@ -7864,8 +7864,8 @@ document.getElementById('vf').addEventListener('submit', async function(e){
         <select id=sh-pf-status class=input-box><option value=new selected>New</option><option value=in_progress>In Progress</option><option value=ready_review>Ready For Review</option><option value=review_in_progress>Review In Progress</option><option value=ready_export>Ready To Export</option><option value=complete>Complete</option></select></div>
       <div><label for=sh-pf-assign>Assigned to:</label>
         <select id=sh-pf-assign class=input-box><option value="">Unassigned</option></select></div>
-      <div id=sh-pf-group-wrap style="display:none"><label for=sh-pf-group>Group:</label>
-        <select id=sh-pf-group class=input-box title="Only this group's members (and admins) see the project and its shorts"></select></div>
+      <div id=sh-pf-group-wrap><label>Group:</label>
+        <div id=sh-pf-group style="font-size:13px;padding:6px 0" title="A project belongs to the groups of whoever created it, and follows them if they change group"></div></div>
       <div><label for=sh-pf-hasdue style="display:flex;gap:8px;align-items:center;cursor:pointer"><input type=checkbox id=sh-pf-hasdue onchange="shDueToggle()"> Has a Deadline</label>
         <div id=sh-pf-due style="display:none;margin-top:6px"><label for=sh-pf-duedate>Due Date:</label>
           <input type=date id=sh-pf-duedate class=input-box>
@@ -8369,7 +8369,7 @@ function shortsOnTabOpen(){
 
 // An Audio level menu from the server's list: the levels worth choosing,
 // the one this tab uses unless told otherwise marked and selected. Shared
-// with Schedule Plug.
+// with Artwork Animation.
 function shFillLevels(sel, levels){
   if(!sel || !(levels || []).length) return
   var had = sel.value
@@ -11009,7 +11009,7 @@ function shProjectLine(p){
   if(p.artists) bits.push(escapeHtmlLite(p.artists))
   if(p.air_date) bits.push('airs ' + escapeHtmlLite(shDate(p.air_date)))
   if(p.assigned_to) bits.push('assigned to ' + escapeHtmlLite(p.assigned_to))
-  if(IS_ADMIN || (SH.groups || []).length > 1) bits.push(p.group_name ? 'group ' + escapeHtmlLite(p.group_name) : 'no group')
+  if(p.group_name || IS_ADMIN) bits.push(p.group_name ? 'group ' + escapeHtmlLite(p.group_name) : 'no group')
   var due = shDueText(p)
   if(due) bits.push(due)
   return bits.join(' &middot; ')
@@ -11087,7 +11087,6 @@ async function shortsLoadProjects(){
   try{
     var d = await (await fetch('/api/shorts/projects')).json()
     SH.projects = d.ok ? d.items : []
-    SH.groups = d.groups || []
     SH.isAdmin = !!d.is_admin
   }catch(e){
     SH.projects = SH.projects || []
@@ -11405,15 +11404,8 @@ function shProjectForm(p, hide){
   shEl('sh-pf-air').value = p ? (p.air_date || '') : ''
   shEl('sh-pf-status').value = p ? (p.status || 'new') : 'new'
   shLoadAssignees(p ? p.assigned_to : '', p ? p.project_id : '')
-  // Which group the project is for: admins pick any group (or none); someone in several groups picks one of
-  // theirs. With a single group there is nothing to choose and the field stays hidden.
-  var grp = shEl('sh-pf-group'), groups = SH.groups || []
-  var pick = SH.isAdmin || groups.length > 1
-  shEl('sh-pf-group-wrap').style.display = pick ? '' : 'none'
-  grp.innerHTML = (SH.isAdmin ? '<option value="">No group</option>' : (p ? '' : '<option value="" disabled>Choose a group</option>')) +
-    groups.map(function(x){ return '<option value="' + x.id + '">' + escapeHtmlLite(x.name) + '</option>' }).join('')
-  grp.value = p && p.group_id != null ? String(p.group_id) : ''
-  if(!SH.isAdmin && !grp.value && !p) grp.selectedIndex = 0
+  // Nobody picks the group: a project belongs to its creator's current groups.
+  shEl('sh-pf-group').textContent = p ? ((p.group_name || 'no group') + ' (its creator\u2019s)') : 'Your group'
   var dl = p && p.deadline ? p.deadline.split('T') : null
   shEl('sh-pf-hasdue').checked = !!dl
   shEl('sh-pf-duedate').value = dl ? dl[0] : ''
@@ -11444,10 +11436,6 @@ async function shProjectSave(){
   fd.append('air_date', shEl('sh-pf-air').value)
   fd.append('status', shEl('sh-pf-status').value)
   fd.append('assigned_to', shEl('sh-pf-assign').value)
-  if(shEl('sh-pf-group-wrap').style.display !== 'none'){
-    if(!SH.isAdmin && !shEl('sh-pf-group').value){ note.textContent = 'Choose which group this project is for.'; shEl('sh-pf-group').focus(); return }
-    fd.append('group_id', shEl('sh-pf-group').value)
-  }
   if(shEl('sh-pf-hasdue').checked){
     if(!shEl('sh-pf-duedate').value){ note.textContent = 'Choose the due date, or turn off Has a Deadline.'; shEl('sh-pf-duedate').focus(); return }
     fd.append('has_deadline', '1')
@@ -11586,18 +11574,18 @@ document.addEventListener('DOMContentLoaded', function(){
 })
 </script>
 
-<!-- Schedule Plug -->
+<!-- Artwork Animation -->
 <div id="p-schedule" class="panel{{ ' active' if default_tab == 'p-schedule' else '' }}">
-<h2>Schedule Plug</h2>
-<p id="sk-intro" style="font-size:12px;opacity:.75;margin-top:-6px">Schedule plugs are made inside a project: the episode they are for. Create the project first &mdash; programme, episode, air date, a description and a picture &mdash; or open one, then make its plugs there. Every plug you render for it is kept together in it, and everyone in the project&rsquo;s group can play and download them.</p>
+<h2>Artwork Animation</h2>
+<p id="sk-intro" style="font-size:12px;opacity:.75;margin-top:-6px">Artwork animations are made inside a project: the programme they are for. Create the project first &mdash; programme, program code, title, air date, a description and a picture &mdash; or open one, then make its animations there. Every animation you render for it is kept together in it, and everyone in the project&rsquo;s group can play and download them.</p>
 <div id="sk-projects"></div>
 <div id="sk-work">
 <div class="sub-tabs">
   <div class="sub-tab active" onclick="switchSubTab('p-schedule-create',this)" role="button" tabindex="0">Create</div>
-  <div class="sub-tab" onclick="switchSubTab('p-schedule-saved',this);scheduleLoadSaved()" role="button" tabindex="0">Saved plugs</div>
+  <div class="sub-tab" onclick="switchSubTab('p-schedule-saved',this);scheduleLoadSaved()" role="button" tabindex="0">Saved animations</div>
 </div>
 
-<div id="p-schedule-create" class="sub-panel active"><p style="font-size:12px;opacity:.75;margin-top:-6px">Turns a schedule still into an animated 16:9 plug with a music bed. The artwork is drawn on frame by frame &mdash; its layers wipe, slide, fade or pop into place &mdash; not regenerated, so every title, date and time stays exactly as designed.</p>
+<div id="p-schedule-create" class="sub-panel active"><p style="font-size:12px;opacity:.75;margin-top:-6px">Turns a schedule still into an 16:9 animation with a music bed. The artwork is drawn on frame by frame &mdash; its layers wipe, slide, fade or pop into place &mdash; not regenerated, so every title, date and time stays exactly as designed.</p>
 
 
 
@@ -11613,7 +11601,7 @@ document.addEventListener('DOMContentLoaded', function(){
 <label>Schedule artwork (image or layered PSD):</label>
 <div class="browse-row">
   {% if allow_local_upload %}<input type=file id=sp-image name=schedule_image accept="image/*,.psd,.psb,.tif,.tiff" data-net-field="schedule_image" style="max-width:320px">{% endif %}
-  <button type=button class="browse-btn" onclick="openNetworkBrowser('schedule_image','schedule','Schedule plug artwork')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z"/></svg>Browse library</button>
+  <button type=button class="browse-btn" onclick="openNetworkBrowser('schedule_image','schedule','Animation artwork')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z"/></svg>Browse library</button>
 </div>
 <input type=hidden id=schedule_image_network name=schedule_image_network value="">
 <span class="net-file-chip" id=schedule_image_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('schedule_image')">&#10005;</span></span>
@@ -11636,7 +11624,7 @@ document.addEventListener('DOMContentLoaded', function(){
 <p class="sh-note" style="margin-top:6px">PNG, JPEG, TIFF or a Photoshop file, ideally 1920&times;1080. In a PSD, the bottom layer is the background and stays still; each top-level layer or group above it animates on its own &mdash; group the things that should move together, and name the layers so the direction can refer to them. <b>Several schedule pages in one file:</b> put each page&rsquo;s rows in a top-level group named <b>Page 1</b>, <b>Page 2</b>, <b>Page 3</b>&hellip; They play in that order over the same background, and it does not matter which of them is showing or hidden when the file is saved.</p>
 
 </details>
-<div id=sp-note class=no-data style="margin-top:14px">Pick the artwork, a length and optionally a music bed, then choose <b>Generate schedule plug</b>. A 15-second plug takes well under a minute.</div>
+<div id=sp-note class=no-data style="margin-top:14px">Pick the artwork, a length and optionally a music bed, then choose <b>Generate animation</b>. A 15-second animation takes well under a minute.</div>
 
 </div>
 
@@ -11753,7 +11741,7 @@ document.addEventListener('DOMContentLoaded', function(){
     <div id=sp-bar-sum class="ws-trt"></div>
     <span style="flex:1"></span>
     <button class=btn type=button id=sp-cancel-btn style="display:none;color:var(--tally);border-color:var(--tally)" onclick="scheduleCancel()">Cancel</button>
-    <button class="btn btn-primary-promo" type=button id=sp-go-btn onclick="scheduleRender()">Generate schedule plug</button>
+    <button class="btn btn-primary-promo" type=button id=sp-go-btn onclick="scheduleRender()">Generate animation</button>
   </div>
 </div>
 
@@ -11766,7 +11754,7 @@ document.addEventListener('DOMContentLoaded', function(){
   <input type=hidden id=schedule_batch_network name=schedule_batch_network value="">
   <span class="net-file-chip" id=schedule_batch_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('schedule_batch')">&#10005;</span></span>
   <div class="promo-actions" style="margin-top:8px">
-    <button type=button class="btn-sm" onclick="openNetworkBrowser('schedule_batch','schedule','Schedule plug artwork')">Add a file&hellip;</button>
+    <button type=button class="btn-sm" onclick="openNetworkBrowser('schedule_batch','schedule','Animation artwork')">Add a file&hellip;</button>
     <button type=button class="btn btn-primary-promo" id=sp-batch-go onclick="spBatchRun()" disabled>Make them all</button>
   </div>
 </div>
@@ -11774,14 +11762,14 @@ document.addEventListener('DOMContentLoaded', function(){
 </div>
 
 <div id="p-schedule-saved" class="sub-panel">
-<p style="font-size:12px;opacity:.75;margin-top:-6px">Every plug made for this project is kept here until you delete it, and is shared with everyone in the project&rsquo;s group.</p>
+<p style="font-size:12px;opacity:.75;margin-top:-6px">Every animation made for this project is kept here until you delete it, and is shared with everyone in the project&rsquo;s group.</p>
 <div id=sp-saved></div>
 </div>
 </div>
 </div>
 
 <script>
-// ---- Schedule Plug ----
+// ---- Artwork Animation ----
 var SP = {busy: false, jobId: null, options: null, destinations: null,
           screen: 'art', info: null, token: null, name: '', ov: {background_upto: null, expand: [], layers: {}},
           sel: null, page: 0, readTok: 0, readTimer: null,
@@ -12297,7 +12285,7 @@ function spEasy(){
       row('decor', '', names('decor') ? '<b>' + names('decor') + '</b> keep moving' : '')
       : '<li>' + spRoleChip({role: 'picture'}) + '<span><b>One flat picture</b> &mdash; it arrives as a whole.</span></li>') + '</ul>' +
     (warn ? '<div class="sh-note" style="margin-top:8px">' + warn + (warn === 1 ? ' thing to check is' : ' things to check are') + ' listed below.</div>' : '') +
-    '<div class="sh-note" style="margin-top:8px">Right? Choose a style and a length on the right and press <b>Generate schedule plug</b>. Something sorted wrongly? ' +
+    '<div class="sh-note" style="margin-top:8px">Right? Choose a style and a length on the right and press <b>Generate animation</b>. Something sorted wrongly? ' +
     '<button type=button class="btn-sm" data-spmode=advanced>Fix it in Advanced</button></div>'
 }
 
@@ -12654,7 +12642,7 @@ function spPoll(jobId){
       catch(err){
         // Retried for about a minute, then reported -- never left hanging,
         // which would keep the button disabled until the page was reloaded.
-        if(++misses > 40){ resolve({error: 'Lost contact with the server while waiting for this job. It may still be running: check the Jobs tab, then look under Saved plugs.'}); return }
+        if(++misses > 40){ resolve({error: 'Lost contact with the server while waiting for this job. It may still be running: check the Jobs tab, then look under Saved animations.'}); return }
         setTimeout(tick, 1500); return
       }
       misses = 0
@@ -12751,7 +12739,7 @@ function spCard(p, fresh){
   }
   card.innerHTML =
     '<div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:baseline">' +
-      '<div><b>' + escapeHtmlLite(p.title || 'Schedule plug') + '</b> <span style="font-size:12px;opacity:.7">' +
+      '<div><b>' + escapeHtmlLite(p.title || 'Artwork animation') + '</b> <span style="font-size:12px;opacity:.7">' +
         (p.duration || 0) + ' s &middot; ' + escapeHtmlLite(p.format_label || '') + ' &middot; ' + spBytes(p.size || 0) +
         (when ? ' &middot; ' + when : '') +
         (IS_ADMIN && p.username && p.username !== CURRENT_USERNAME ? ' &middot; by ' + escapeHtmlLite(p.username) : '') + '</span></div>' +
@@ -12770,7 +12758,7 @@ function spCard(p, fresh){
                  (typeof p.loudness === 'number' ? ' at ' + String(p.loudness).replace('-', '&minus;') + ' LUFS' : '')
                : ' &middot; no music') +
       (p.read_by ? ' &middot; prompt read by ' + escapeHtmlLite(p.read_by) : '') + '</p>' + groups +
-    (fresh ? '<p class="sh-note">Saved under <b>Saved plugs</b>. Not what you meant? Pick another style or reword the direction and generate again &mdash; it takes under a minute.</p>' : '')
+    (fresh ? '<p class="sh-note">Saved under <b>Saved animations</b>. Not what you meant? Pick another style or reword the direction and generate again &mdash; it takes under a minute.</p>' : '')
   card.addEventListener('click', function(e){
     if(e.target.closest('[data-del]')) scheduleDelete(p.plug_id)
   })
@@ -12798,7 +12786,7 @@ async function spFillSend(host, pid, file){
     '</select>' +
     '<span style="display:inline-flex;align-items:center;gap:2px;font-size:12px">as ' +
       '<input type=text data-send-name maxlength=120 spellcheck=false aria-label="Filename at the destination" ' +
-        'title="The filename this plug gets at the destination. The saved plug keeps its own name." ' +
+        'title="The filename this animation gets at the destination. The saved animation keeps its own name." ' +
         'style="width:230px;margin:0 0 0 4px;padding:4px 8px;font-size:12px">' +
       '<span style="opacity:.7">' + escapeHtmlLite(ext) + '</span></span>' +
     '<button type=button class="btn-sm">Send</button><span data-send-out style="font-size:12px"></span>'
@@ -12828,7 +12816,7 @@ async function spFillSend(host, pid, file){
 }
 
 async function scheduleDelete(pid){
-  if(!confirm('Delete this schedule plug? This cannot be undone.')) return
+  if(!confirm('Delete this artwork animation? This cannot be undone.')) return
   try{
     var r = await (await fetch('/api/schedule/items/' + pid, {method: 'DELETE'})).json()
     if(!r.ok){ alert(r.error || 'Could not delete.'); return }
@@ -12843,16 +12831,16 @@ async function scheduleLoadSaved(){
   var host = spEl('sp-saved')
   if(!host) return
   var pid = scheduleProjectId()
-  if(!pid){ host.innerHTML = '<div class=no-data>Open a project to see its plugs.</div>'; return }
+  if(!pid){ host.innerHTML = '<div class=no-data>Open a project to see its animations.</div>'; return }
   host.innerHTML = '<div class=no-data>Loading&hellip;</div>'
   try{
     var d = await (await fetch('/api/schedule/items?project_id=' + encodeURIComponent(pid))).json()
     if(scheduleProjectId() !== pid) return                    // another project was opened meanwhile
     host.innerHTML = ''
-    if(!d.ok || !d.items.length){ host.innerHTML = '<div class=no-data>No schedule plugs in this project yet. Make one under <b>Create</b>.</div>'; return }
+    if(!d.ok || !d.items.length){ host.innerHTML = '<div class=no-data>No artwork animations in this project yet. Make one under <b>Create</b>.</div>'; return }
     d.items.forEach(function(p){ var c = spCard(p, false); c.style.marginBottom = '14px'; host.appendChild(c) })
   }catch(e){
-    host.innerHTML = '<div class=no-data><span style="color:var(--amber)">Could not load saved plugs: ' + escapeHtmlLite(String(e)) + '</span></div>'
+    host.innerHTML = '<div class=no-data><span style="color:var(--amber)">Could not load saved animations: ' + escapeHtmlLite(String(e)) + '</span></div>'
   }
 }
 
@@ -12864,7 +12852,7 @@ function scheduleProjectsInit(){
   if(SKP || !window.PrismProjects) return
   var lastOpened = null
   SKP = PrismProjects.create({
-    kind: 'schedule', prefix: 'sk', mount: 'sk-projects', work: 'sk-work', intro: 'sk-intro', noun: ['plug', 'plugs'],
+    kind: 'schedule', prefix: 'sk', mount: 'sk-projects', work: 'sk-work', intro: 'sk-intro', noun: ['animation', 'animations'],
     onOpen: function(p, fresh, refresh){
       var tabs = document.querySelectorAll('#p-schedule .sub-tabs .sub-tab')
       if(!refresh){
@@ -13408,7 +13396,7 @@ job. Configured via env vars:
   <button type="button" class="docs-tab docs-nav-item active" data-docs="docs-overview" onclick="switchDocs(this)">Overview</button>
   <button type="button" class="docs-tab docs-nav-item" data-docs="docs-workflow" onclick="switchDocs(this)">Workflow</button>
   <button type="button" class="docs-tab docs-nav-item" data-docs="docs-shorts" onclick="switchDocs(this)">Vertical Shorts</button>
-  <button type="button" class="docs-tab docs-nav-item" data-docs="docs-schedule" onclick="switchDocs(this)">Schedule Plug</button>
+  <button type="button" class="docs-tab docs-nav-item" data-docs="docs-schedule" onclick="switchDocs(this)">Artwork Animation</button>
   <button type="button" class="docs-tab docs-nav-item" data-docs="docs-media" onclick="switchDocs(this)">Media &amp; Library</button>
   <button type="button" class="docs-tab docs-nav-item" data-docs="docs-tools" onclick="switchDocs(this)">Tools</button>
   <button type="button" class="docs-tab docs-nav-item" data-docs="docs-templates" onclick="switchDocs(this)">Templates</button>
@@ -13453,7 +13441,7 @@ job. Configured via env vars:
 
     <div class="docs-pane" id="docs-workflow">
       <h3 style="margin-top:0">Workflow</h3>
-      <h3>The Episodic Plug page</h3>
+      <h3>The Highlights Video page</h3>
       <p>The page works in three steps: <strong>1 Episode &amp; settings</strong>, <strong>2 Review the cut</strong> and <strong>3 Result</strong>. You move on by themselves &mdash; a proposed cut opens the review, a finished plug opens the result &mdash; and any step you have been to can be reopened from the bar at the top. <em>&#8592; Settings</em> and <em>&#8592; Back to settings</em> return to the form with everything as you left it.</p>
       <p>Beside the form, <strong>Ready?</strong> says what is about to happen in one short list: the episode, the template (and that its settings are loaded), the length, genre and format, any steering, and the audio and cards chosen &mdash; and flags what is missing, such as no video yet, or AI Vision being unreachable (timecode cues do not need it). <strong>Use my last settings</strong> brings back the template, length, genre, format and steering of the last promo you started on this computer. The buttons stay at the bottom of the screen, with a one-line summary beside them, so they are never lost below a long form. <strong>Quick promo</strong> still hides the secondary controls; <strong>Advanced</strong> shows them all.</p>
       <h3>Cleaner edits: cuts, cards and narration</h3>
@@ -13580,8 +13568,8 @@ job. Configured via env vars:
       </ul>
       <p>Anyone who can see a batch can read its captions; changing them is for whoever rendered it and admins, like deleting it.</p>
       <h3>Projects</h3>
-      <p>Shorts are filed by project: the episode they are cut from. A project records the <strong>programme title</strong>, <strong>episode</strong>, <strong>air date</strong>, a <strong>description</strong> and a <strong>thumbnail</strong> (JPEG, PNG or WebP up to 8 MB; until one is given the project shows a frame of its newest short). A project is the only way in: choose <strong>New project</strong>, or open one, and its page has two views &mdash; <strong>Shorts in this project</strong>, every batch rendered for it, and <strong>Create shorts</strong>, the form that makes more. There is no way to start a job outside a project, so nothing is saved loose. A new project opens on <strong>Create shorts</strong>. Jobs are <strong>queued</strong>: start <strong>Preview the cut</strong>, <strong>Generate without preview</strong> or <strong>Render</strong> again while another is running and it is added to the <strong>Queue</strong> under the buttons, each with its own progress and <strong>Cancel</strong>. The server runs as many at once as its job limit allows (the same limit as Episodic Plug) and the rest show <em>Waiting</em>. A finished cut opens by itself only if no cut is open for that project; otherwise the queue offers <strong>Open the review</strong> or <strong>Show the shorts</strong>, going to its project first. Every cut is also kept under <em>Earlier cuts</em>. The queue lives in the page: reloading it forgets the list (the jobs go on, see Jobs), so reopen finished cuts from Earlier cuts.</p>
-      <p>A project belongs to one group. Everyone in that group with access to Vertical Shorts sees the project and can play, download and send what is in it; other groups do not see it at all. Someone in several groups sees the projects of all of them, and picks the <strong>Group</strong> when creating a project (with one group there is nothing to pick). Admins see every project and can move one to any group. Deleting a batch, or moving it to another project, is for whoever rendered it and admins. A project can be deleted by whoever created it or an admin, and only once it is empty: deleting a project never deletes shorts. Shorts rendered before projects existed are listed under <strong>Not in a project</strong> for their maker, with <strong>Move to</strong> to file them.</p>
+      <p>Shorts are filed by project: the episode they are cut from. A project records the <strong>programme title</strong>, <strong>episode</strong>, <strong>air date</strong>, a <strong>description</strong> and a <strong>thumbnail</strong> (JPEG, PNG or WebP up to 8 MB; until one is given the project shows a frame of its newest short). A project is the only way in: choose <strong>New project</strong>, or open one, and its page has two views &mdash; <strong>Shorts in this project</strong>, every batch rendered for it, and <strong>Create shorts</strong>, the form that makes more. There is no way to start a job outside a project, so nothing is saved loose. A new project opens on <strong>Create shorts</strong>. Jobs are <strong>queued</strong>: start <strong>Preview the cut</strong>, <strong>Generate without preview</strong> or <strong>Render</strong> again while another is running and it is added to the <strong>Queue</strong> under the buttons, each with its own progress and <strong>Cancel</strong>. The server runs as many at once as its job limit allows (the same limit as Highlights Video) and the rest show <em>Waiting</em>. A finished cut opens by itself only if no cut is open for that project; otherwise the queue offers <strong>Open the review</strong> or <strong>Show the shorts</strong>, going to its project first. Every cut is also kept under <em>Earlier cuts</em>. The queue lives in the page: reloading it forgets the list (the jobs go on, see Jobs), so reopen finished cuts from Earlier cuts.</p>
+      <p>A project belongs to the group of whoever created it &mdash; always their current group: nobody picks it, and if the creator moves to another group, their projects move with them. Everyone in that group with access to Vertical Shorts sees the project and can play, download and send what is in it; other groups do not see it at all. Someone in several groups sees the projects of all of them. Admins see every project. Deleting a batch, or moving it to another project, is for whoever rendered it and admins. A project can be deleted by whoever created it or an admin, and only once it is empty: deleting a project never deletes shorts. Shorts rendered before projects existed are listed under <strong>Not in a project</strong> for their maker, with <strong>Move to</strong> to file them.</p>
       <h3>Limits worth knowing</h3>
       <ul style="line-height:1.8;padding-left:20px">
         <li>Candidates are proposals. A local model can misjudge what stands alone &mdash; preview before rendering.</li>
@@ -13591,7 +13579,7 @@ job. Configured via env vars:
         <li>Captions are only as well timed as the transcript. A service that returns word timings gives captions that change with the words; one that returns only lines (the subtitle fallback) gives captions that change a line at a time, and if its times are to the whole second they can be up to a second early or late.</li>
       </ul>
       <h3>Reading the episode where it is</h3>
-      <p>(Episodic Plug and the Player have the same switch on the <strong>Video (HIRES)</strong> folder.)</p>
+      <p>(Highlights Video and the Player have the same switch on the <strong>Video (HIRES)</strong> folder.)</p>
       <p>By default, picking an episode from <strong>Browse library</strong> copies it to the server first. Under <strong>Config &gt; Network</strong>, switch on <strong>Read files in place</strong> for the Vertical Shorts folder and nothing is copied: the episode is analysed and rendered straight from the share, so there is no wait and no extra disk use. The account PRISM runs under must be able to open the share path itself (the login in Config is only used for browsing and copying); when it cannot, that pick is copied as before and says so on its chip. PRISM only reads the file &mdash; it never changes or deletes it &mdash; but the share has to stay reachable while you work on the project, and analyses and renders go at the speed of the share.</p>
       <h3>Episodes in more than one part</h3>
       <p>If the episode comes as several files (up to ten), add them under <strong>This episode comes in more than one part</strong>. The parts are laid end to end and read as one episode: the story model sees the whole thing, so a setup in part 1 can pay off in part 2, and the sound and picture are rated against the whole programme. A short is always cut from one part &mdash; it never runs across the break &mdash; and each moment shows which part it is in, with its times read within that part. To leave something out, name the part: <code>part 2 0:00-1:45, part 3 18:10-end</code> (a range with no part means part 1). Shorts are numbered in episode order across all the parts, and the total running time counts every part.</p>
@@ -13613,20 +13601,20 @@ POST /api/shorts/analyze now also needs project_id</pre>
     </div>
 
     <div class="docs-pane" id="docs-schedule">
-      <h3 style="margin-top:0">Schedule Plug</h3>
-      <p>Turns one schedule still into an animated 16:9 plug of 10, 15, 20 or 30 seconds with a music bed, in any of the delivery formats the promo generator offers.</p>
+      <h3 style="margin-top:0">Artwork Animation</h3>
+      <p>Turns one schedule still into an 16:9 animation of 10, 15, 20 or 30 seconds with a music bed, in any of the delivery formats the promo generator offers.</p>
       <h3>The workspace</h3>
       <p>The page works in three steps: <strong>1 Artwork</strong>, <strong>2 Layers &amp; animation</strong> and <strong>3 Result</strong>. The artwork is read as soon as it is picked (from Browse library, or from this computer where that is allowed) and the layers step opens: every top-level layer and group of the PSD, top of the stack first, as Photoshop lists them, each with a thumbnail, its kind, and the part it will play &mdash; <em>Background</em> (the bottom layer, and anything that covers the whole picture over it: still), <em>Page n</em> (a group named as a page, with how many rows it breaks into), <em>Logo &amp; text</em> (a text layer, or one named like a logo or the schedule: appears, then holds or breathes), <em>Moving</em> (everything else), or <em>Hidden</em> / <em>Left out</em>. A layer that was switched off in the file is listed and left out. The picture in the middle shows the artwork as it will rest, one tab per page, with the selected layer outlined; the line under it counts what is background, pages, logo and text, and moving layers.</p>
       <p>Select a layer and <strong>What should it do?</strong> lets you correct it: make it the <strong>Background</strong> (it and everything below it become the still backdrop), <strong>Logo or schedule text</strong>, <strong>Moving decoration</strong>, <strong>a schedule page</strong> (with its page number), or <strong>leave it out</strong>; <em>As detected</em> goes back. The list is read again after each change, so the counts and the page tabs show what will be drawn. A group shows the layers inside it.</p>
       <p><strong>Split into its layers</strong> opens a group: its layers are listed beneath it, indented, and each is sorted on its own &mdash; a header group can hold a background group (choose its last layer as <em>Background</em> to keep the whole stack still), the logo, and ornaments that move. <strong>Put the group back together</strong> undoes it. For any layer that is not the background, <strong>Animation of this layer</strong> sets how it <em>Arrives</em> (wipe, slide, fade, pop or appear at once, with a direction) and what it does <em>Then</em>: hold still, light sweep, float, pulse, wobble, <strong>shake</strong>, grow and shrink, <strong>rotate left</strong> or <strong>rotate right</strong>, sway, dance, <strong>move up</strong>, <strong>move down</strong> or breathe. What you set on a layer wins over the style and the prompt; <em>Back to the style</em> removes it. On a page it applies to every row of that page.</p>
-      <p>The <strong>Animation</strong> tab holds the length, style, how logo and text behave and the extra direction; <strong>Music &amp; file</strong> the delivery format, the music and its level. <strong>Generate schedule plug</strong> in the bar below draws it with your corrections, and the plug opens in step 3. A Photoshop file that has to be animated as one flat picture (blend modes, effects) shows as one layer with the reason above the list.</p>
+      <p>The <strong>Animation</strong> tab holds the length, style, how logo and text behave and the extra direction; <strong>Music &amp; file</strong> the delivery format, the music and its level. <strong>Generate animation</strong> in the bar below draws it with your corrections, and the plug opens in step 3. A Photoshop file that has to be animated as one flat picture (blend modes, effects) shows as one layer with the reason above the list.</p>
       <h3>Easy and Advanced</h3>
       <p>The <strong>Mode</strong> switch at the top right chooses how much you see. <strong>Easy</strong> (the default) reads the artwork, says in one short list what will happen &mdash; <em>this stays still, these pages come one after another, these appear and hold, these keep moving</em> &mdash; and lists anything worth checking in plain words: text outside the <em>title-safe</em> area (the outer 5% a television may cut off), text too small to read on a television, pages that would go by too fast. Then it asks only for a <strong>length</strong> (the server suggests one from the number of pages and rows, and picks it for you until you choose another), a <strong>style</strong> (shown as cards, each marked <em>Calm</em> or <em>Lively</em>) and the music. <strong>Advanced</strong> adds the layer list, per-layer roles, <em>Split into its layers</em> for groups, and the controls below.</p>
       <p><strong>Preview the animation</strong> draws the first seconds small and silent in a few seconds, so you see the style move before the full render; change the style, length or a layer and it redraws by itself. The preview has the player&rsquo;s own scrubber, <em>&#9664; frame</em> and <em>frame &#9654;</em> to step one frame at a time, and <strong>Safe areas</strong> to overlay the action-safe (93%) and title-safe (90%) rectangles. Words in <em>Extra direction</em> are read by keyword only in the preview; the full render may use the AI model.</p>
       <p><strong>Timing</strong> (under the style) is <em>One after another</em> by default: the layers come in in turn and their loops run a beat apart. <em>All together, same timing</em> brings every layer in on the same beat and moves them in step (pulse included); the extra direction understands it too (&ldquo;all together&rdquo;, &ldquo;at the same time&rdquo;; &ldquo;one by one&rdquo; to switch it off). A layer given its own <em>Starts later by</em> still keeps it.</p>
       <p><strong>Timing &amp; feel</strong> (Advanced, in <em>This layer</em>) gives one layer its own <em>Starts later by</em> (a moving layer given a delay then arrives, instead of being there from the first frame), <em>Takes</em> (how long it comes in), <em>Eases</em> (settle gently, smooth in and out, overshoot a little, even) and <em>Strength of the motion</em> (below 1 gentler, above 1 bigger &mdash; shake, rotate, float and the rest). On a page, <em>Gap between its rows</em> sets how far apart its rows come in. A group animates as one piece until it is split; split, each of its layers can be staggered with <em>Starts later by</em>.</p>
       <p><strong>Saved looks.</strong> <em>Save this look</em> keeps the style, length, extra direction, format and everything set on layers &mdash; roles, split groups, arrival, motion, timing &mdash; <em>by layer name</em>, so it fits next week&rsquo;s file if its layers are named the same. Picking a look applies it and says which of its layers this file does not have. Looks are shared with the team: anyone can use one, only the person who made it (or an admin) can delete or replace it. <em>Export</em> and <em>Import</em> move a look as a small file between servers. <em>Same as last time</em> is always your own latest settings.</p>
-      <p><strong>The same look for more files.</strong> After a plug is made, <em>The same look for more files</em> on the result step lists other artwork from Browse library and makes each with the same style, length, music and format, matched to the look by layer name, one after another. Each finished plug is added to the results and to <em>Saved plugs</em>, with the per-layer settings used.</p>
+      <p><strong>The same look for more files.</strong> After an animation is made, <em>The same look for more files</em> on the result step lists other artwork from Browse library and makes each with the same style, length, music and format, matched to the look by layer name, one after another. Each finished animation is added to the results and to <em>Saved animations</em>, with the per-layer settings used.</p>
       <h3>Why it is drawn, not generated</h3>
       <p>A schedule is text: titles, dates, times. A video model repaints every pixel of every frame, so that text would come back warped. Here each layer's own pixels are moved, faded or uncovered, so the logo and the text come to rest exactly as designed.</p>
       <h3>Artwork</h3>
@@ -13658,7 +13646,7 @@ POST /api/shorts/analyze now also needs project_id</pre>
       <h3>Music</h3>
       <p>Optional, from the Music network folder. Trimmed to the length with a fade out, looped if shorter, and levelled to the <strong>Audio level</strong> chosen for the plug. That menu starts on the loudness target under Config &gt; Production and offers the usual ones: &minus;14 LUFS for online video, &minus;23 (EBU R128) or &minus;24 (ATSC A/85) for broadcast. The level is the loudness of the whole plug measured over its length, not a peak; the true-peak ceiling stays the one under Config &gt; Production. A saved plug says what it was levelled to.</p>
       <h3>Setup</h3>
-      <p>Set the artwork folder under <strong>Config &gt; Network &gt; Schedule plug artwork</strong>. Photoshop files need the <code>psd-tools</code> package on the server.</p>
+      <p>Set the artwork folder under <strong>Config &gt; Network &gt; Animation artwork</strong>. Photoshop files need the <code>psd-tools</code> package on the server.</p>
       <pre>POST /api/schedule/render   + schedule_image_network, duration (10|15|20|30), delivery_format, style?, text_motion? (hold|breathe), prompt?, schedule_music_network?
 POST /api/schedule/storyboard   + schedule_image_network, schedule_storyboard_network (JPEG/PNG), layer_overrides?, note?  -> suggested settings + overrides
 GET  /api/schedule/progress/&lt;job_id&gt;
@@ -13682,10 +13670,10 @@ POST /api/schedule/items/&lt;id&gt;/send   {destination_id, filename?}</pre>
       <tr><td>SFX</td><td><code>SFX</code></td><td>Audio</td></tr>
       </table>
       <p>Each category is configured in Config &gt; Network (admin) with its own path and credentials. Network picks are copied into the work folder like uploads.</p>
-      <h3>Job monitor &amp; saved plugs</h3>
+      <h3>Job monitor &amp; saved videos</h3>
       <ul style="line-height:1.8;padding-left:20px">
-        <li><strong>Job monitor</strong> (<em>Your jobs</em>) — your active, queued, and recent episodic plug jobs with live progress. Vertical Shorts and Schedule Plug jobs are not listed here: each shows its progress in its own tab. The Dashboard counts all of yours together, and admins see every job of every kind under <strong>Jobs</strong>.</li>
-        <li><strong>Saved plugs</strong> — finished renders kept until deleted; reopen video, download, and scene breakdown.</li>
+        <li><strong>Job monitor</strong> (<em>Your jobs</em>) — your active, queued, and recent highlights video jobs with live progress. Vertical Shorts and Artwork Animation jobs are not listed here: each shows its progress in its own tab. The Dashboard counts all of yours together, and admins see every job of every kind under <strong>Jobs</strong>.</li>
+        <li><strong>Saved videos</strong> — finished renders kept until deleted; reopen video, download, and scene breakdown.</li>
       </ul>
       <h3>Player format compatibility</h3>
       <p>The Player streams directly when the browser can decode the file. Broadcast masters (ProRes, DNxHD, many MXF) may fail in-browser; the Player then calls <code>POST /api/media/playable</code> to transcode to H.264/AAC MP4 and caches the result. Conversion applies to library picks, not local-only files.</p>
@@ -13781,8 +13769,8 @@ function switchDocs(btn){
 
 <div id="p-jobs" class="panel{{ ' active' if default_tab == 'p-jobs' else '' }}">
 <h2>Jobs</h2>
-<p style="margin-top:6px;color:var(--ink-dim)">All jobs across every account and every feature &mdash; episodic plugs, Vertical Shorts and Schedule Plugs share one queue. Cancel active or queued work from here.</p>
-<p style="margin-top:-4px;color:var(--ink-dim);font-size:12px">When every slot is busy, waiting jobs start by <b>priority</b>, then in the order they came in. Episodic plugs and Schedule Plugs start at <b>High</b>, Vertical Shorts at <b>Normal</b>; change a waiting job&rsquo;s priority from its menu under <em>Queued</em> (<b>Urgent</b> puts it first). A job already running is never stopped for another.</p>
+<p style="margin-top:6px;color:var(--ink-dim)">All jobs across every account and every feature &mdash; highlights videos, Vertical Shorts and Artwork Animations share one queue. Cancel active or queued work from here.</p>
+<p style="margin-top:-4px;color:var(--ink-dim);font-size:12px">When every slot is busy, waiting jobs start by <b>priority</b>, then in the order they came in. Highlights videos and Artwork Animations start at <b>High</b>, Vertical Shorts at <b>Normal</b>; change a waiting job&rsquo;s priority from its menu under <em>Queued</em> (<b>Urgent</b> puts it first). A job already running is never stopped for another.</p>
 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
   <button type="button" class="btn" onclick="loadAdminJobs()">Refresh</button>
   <span id="config-jobs-summary" style="font-size:12px;opacity:.7"></span>
@@ -14351,7 +14339,7 @@ async function saveProductionTab(){
 }
 window.saveProductionTab = saveProductionTab
 
-var NETWORK_CATEGORY_LABELS = {hires: 'Video (HIRES)', shorts: 'Vertical Shorts video (HIRES)', captions: 'Vertical Shorts captions (SRT / VTT / SCC)', schedule: 'Schedule plug artwork (image / PSD)', tcard: 'Title card', endcard: 'End card', music: 'Music', vo: 'VO', sfx: 'SFX', script: 'Script / rundown'}
+var NETWORK_CATEGORY_LABELS = {hires: 'Video (HIRES)', shorts: 'Vertical Shorts video (HIRES)', captions: 'Vertical Shorts captions (SRT / VTT / SCC)', schedule: 'Animation artwork (image / PSD)', tcard: 'Title card', endcard: 'End card', music: 'Music', vo: 'VO', sfx: 'SFX', script: 'Script / rundown'}
 var networkFoldersLoaded = false
 var networkDestinationsLoaded = false
 async function loadNetworkFolders(){
@@ -14598,7 +14586,7 @@ async function loadAuditLog(){
     var ACTION_LABELS = {
       user_create: 'Created account', user_role_change: 'Changed role', user_enable: 'Enabled account',
       user_disable: 'Disabled account', user_2fa_reset: 'Reset 2FA', user_password_reset: 'Reset password',
-      user_delete: 'Deleted account', trailer_delete: 'Deleted plug', trailer_generate: 'Generated promo',
+      user_delete: 'Deleted account', trailer_delete: 'Deleted highlights video', trailer_generate: 'Generated highlights video',
       network_folder_change: 'Changed network folder', production_defaults_change: 'Changed production defaults',
       branding_change: 'Changed branding', job_cancel: 'Cancelled job', job_priority: 'Changed job priority'
     }
@@ -14642,7 +14630,7 @@ async function loadAdminJobs(){
     }
     function empty(t){ return '<div class="monitor-row" style="opacity:.5;font-size:12px">' + t + '</div>' }
     function kindTag(j){
-      var label = {promo: 'Episodic plug', shorts: 'Vertical Shorts', schedule: 'Schedule Plug'}[j.kind] || 'Job'
+      var label = {promo: 'Highlights video', shorts: 'Vertical Shorts', schedule: 'Artwork Animation'}[j.kind] || 'Job'
       return '<span class="monitor-kind" data-kind="' + escapeHtmlLite(j.kind || '') + '">' + label + '</span>'
     }
     function cancelBtn(jid){
@@ -16082,7 +16070,7 @@ function _dashLoadHealth(){
 function _dashLoadJobs(){
   var el = document.getElementById('dash-jobs')
   if(!el) return
-  // Every feature's jobs: on its own, /api/monitor is the episodic plug's only.
+  // Every feature's jobs: on its own, /api/monitor is the highlights video's only.
   fetch('/api/monitor?kind=all').then(function(r){
     // 403 here means this account has no promo_generation permission --
     // a real, expected case now that Dashboard is everyone's landing page,
@@ -16191,7 +16179,7 @@ function _dashLoadShows(){
     }
     var items = (d.templates || []).slice(0, 5)
     if(!items.length){
-      el.innerHTML = '<p style="opacity:.6;margin:0">No saved shows yet — save one from Episodic Plug.</p>'
+      el.innerHTML = '<p style="opacity:.6;margin:0">No saved shows yet — save one from Highlights Video.</p>'
       return
     }
     el.innerHTML = items.map(function(t){
@@ -16211,7 +16199,7 @@ function _dashLoadShows(){
   })
 }
 
-// Jumps to Generate Promo Plug with a specific saved show pre-selected --
+// Jumps to Highlights Video with a specific saved show pre-selected --
 // reuses the exact same template-selection path a manual pick from that
 // tab's own dropdown goes through (set the value, dispatch a real 'change'
 // event) rather than duplicating onTemplateSelected's logic here. The
@@ -16240,7 +16228,7 @@ function _dashLoadRecent(){
     }
     var items = (d.items || []).slice(0, 5)
     if(!items.length){
-      el.innerHTML = '<p style="opacity:.6;margin:0">No saved plugs yet.</p>'
+      el.innerHTML = '<p style="opacity:.6;margin:0">No saved videos yet.</p>'
       return
     }
     // created_at, not created -- the field this silently got wrong before,
@@ -16255,7 +16243,7 @@ function _dashLoadRecent(){
              '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtmlLite(it.orig_name || 'Untitled') + '</span>' +
              '<span style="opacity:.6;font-size:12px;white-space:nowrap">' + dur + (dur && when ? ' &middot; ' : '') + when + '</span></div>'
     }).join('')
-    // Clicking a row jumps to Generate Promo Plug and shows that exact saved
+    // Clicking a row jumps to Highlights Video and shows that exact saved
     // render -- reuses the SAME fetch + renderTrailerResult() path the
     // existing Saved Trailers history list already uses for this, rather
     // than a second implementation of "go open a past render".

@@ -614,52 +614,12 @@ def _may_change(m):
         return True
 
 
-def _groups():
-    """({user id: frozenset of group ids}, {group id: name}), read once per request."""
-    if has_request_context():
-        if not hasattr(_req, '_sh_groups'):
-            _req._sh_groups = group_membership()
-        return _req._sh_groups
-    return group_membership()
+# Who belongs to a project's group is the same rule for every feature with projects: project_routes.py.
+from project_routes import (_groups, project_groups as _project_groups, viewer_groups as _viewer_groups, group_names,
+                            may_see as _may_see_shared)
 
 
-def _project_groups(proj):
-    """The groups that may see a project, as a set: the one it was filed under, or for a project made before
-    projects had groups, every group its creator is in. {None} for no group, and for a group that has since
-    been deleted."""
-    users, groups = _groups()
-    if 'group_id' in proj:
-        gids = {proj['group_id']}
-    else:
-        gids = set(users.get(proj.get('user_id')) or ())
-    gids &= set(groups)
-    return gids or {None}
-
-
-def _project_group(proj):
-    """The one group a project is shown as filed under (None: no group, or more than one, for an old project
-    whose creator is in several -- an admin can file it under one)."""
-    gids = _project_groups(proj)
-    return next(iter(gids)) if len(gids) == 1 else None
-
-
-def _viewer_groups():
-    return set(_groups()[0].get(session.get('user_id')) or ())
-
-
-def _may_see_project(proj):
-    """A project is its group's: everyone in that group with Vertical Shorts sees it, its batches and what is
-    running in it; other groups do not. Someone in several groups sees the projects of all of them. A project
-    with no group is seen by accounts with no group (who normally cannot open Vertical Shorts) and admins.
-    Admins see every project."""
-    if not has_request_context():           # a job thread: whoever started it was allowed to
-        return True
-    if session.get('role') == 'admin':
-        return True
-    if session.get('user_id') is None:
-        return False
-    mine = _viewer_groups() or {None}
-    return bool(_project_groups(proj) & mine)
+_may_see_project = _may_see_shared
 
 
 def _visible_project(pid):
@@ -3360,7 +3320,7 @@ def _project_public(proj, counts=None, jobs=None):
             'thumb_url': own or c['poster'],
             'batches': c['batches'], 'shorts': c['shorts'], 'last_activity': c['last'] or proj.get('created'),
             'can_delete': _may_change(proj), 'jobs': (jobs or {}).get(pid) or [],
-            'group_id': _project_group(proj), 'group_name': _groups()[1].get(_project_group(proj))}
+            'group_name': ', '.join(group_names(proj)) or None}
 
 
 def _project_counts():
@@ -3379,49 +3339,6 @@ def _project_counts():
             if first.get('thumb'):
                 c['poster'] = f"/api/shorts/file/{m['batch_id']}/{first['thumb']}"
     return counts
-
-
-def _requested_group(current=None, creating=False):
-    """The group a project is to be filed under, from the form's group_id.
-
-    An admin may pick any group, or none (blank). Anyone else picks one of their own groups; when they are in
-    only one, a new project goes there without asking, and when they are in several they must say which.
-    Editing without a group_id leaves the project where it is (`current`). Raises ProjectError."""
-    mine = _viewer_groups()
-    sent = 'group_id' in request.form
-    raw = (request.form.get('group_id') or '').strip() if sent else ''
-    gid = None
-    if raw:
-        try:
-            gid = int(raw)
-        except ValueError:
-            gid = -1
-        if gid not in _groups()[1]:
-            raise sp.ProjectError('That group no longer exists. Pick another.')
-    if session.get('role') == 'admin':
-        if sent:
-            return gid
-        if creating:
-            return next(iter(mine)) if len(mine) == 1 else None
-        return current
-    if gid is not None:
-        if gid not in mine:
-            raise sp.ProjectError('You can only file a project under one of your own groups.')
-        return gid
-    if not creating:
-        return current
-    if len(mine) == 1:
-        return next(iter(mine))
-    if len(mine) > 1:
-        raise sp.ProjectError('You are in more than one group: choose which group this project is for.')
-    return None
-
-
-def _groups_to_offer():
-    """[{id, name}] a caller may file a project under: every group for an admin, their own for anyone else."""
-    names = _groups()[1]
-    ids = set(names) if session.get('role') == 'admin' else _viewer_groups()
-    return [{'id': k, 'name': names[k]} for k in sorted(ids, key=lambda k: names[k].lower())]
 
 
 def _project_thumb_upload():
@@ -3444,18 +3361,16 @@ def _project_thumb_upload():
 def api_shorts_projects():
     """The projects, most recently changed first (GET), or a new one (POST:
     title, episode, air_date, description and an optional thumbnail file).
-    Each project belongs to one group (see _may_see_project and
-    _requested_group). Everyone sees and can add to their own groups'
-    projects only; admins see all of them. `groups` lists the groups the
-    caller may file a project under."""
+    A project belongs to its creator's current groups (project_routes.
+    project_groups): nobody picks it. Everyone sees their own groups'
+    projects only; admins see all of them."""
     if request.method == 'GET':
         counts, jobs = _project_counts(), _project_jobs()
         items = [_project_public(p, counts, jobs) for p in sp.list_all(SHORTS_PROJECTS_DIR) if _may_see_project(p)]
-        return jsonify(ok=True, items=items, groups=_groups_to_offer(), is_admin=session.get('role') == 'admin')
+        return jsonify(ok=True, items=items, is_admin=session.get('role') == 'admin')
     try:
         fields = sp.clean_fields(request.form)
         thumb = _project_thumb_upload()
-        fields['group_id'] = _requested_group(creating=True)
     except sp.ProjectError as e:
         return jsonify(ok=False, error=str(e)), 400
     proj = sp.create(SHORTS_PROJECTS_DIR, fields, user_id=session.get('user_id'), username=session.get('username'),
@@ -3515,8 +3430,6 @@ def api_shorts_project(pid):
     try:
         fields = sp.clean_fields(request.form)
         thumb = _project_thumb_upload()
-        if 'group_id' in request.form:
-            fields['group_id'] = _requested_group(_project_group(proj))
     except sp.ProjectError as e:
         return jsonify(ok=False, error=str(e)), 400
     proj = sp.update(SHORTS_PROJECTS_DIR, pid, fields, thumb_jpeg=thumb,

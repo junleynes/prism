@@ -4,7 +4,7 @@ PRISM keeps its data in one PostgreSQL database. The app will not start until it
 
 | In PostgreSQL | On disk (`LIBRARY_DIR`, `TEMPLATES_DIR`, app folder) |
 |---|---|
-| User accounts, groups, permissions, 2FA | Rendered trailers, shorts, schedule plugs, uploaded assets |
+| User accounts, groups, permissions, 2FA | Rendered highlights videos, shorts, artwork animations, uploaded assets |
 | Trailer library index, audit log | Template media (music, VO, cards) |
 | Network favorites and delivery destinations | `.env`, `.secret_key` |
 | Background jobs, AI chat memory, show templates | `branding_config.json`, `network_folders.json`, `service_overrides.json`, `ai_services_config.json`, `production_defaults.json` |

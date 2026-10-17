@@ -338,9 +338,9 @@ def api_2fa_disable():
 # admin-only regardless of this permission, same reasoning as Config: it's a
 # shared global resource, not a per-job action.
 AVAILABLE_PERMISSIONS = [
-    ('promo_generation', 'Generate Promo Plug'),
+    ('promo_generation', 'Highlights Video'),
     ('vertical_shorts', 'Vertical Shorts'),
-    ('schedule_plug', 'Schedule Plug'),
+    ('schedule_plug', 'Artwork Animation'),
     ('music_generation', 'Music Generation'),
     ('text_to_sfx', 'Text to SFX'),
     ('text_to_speech', 'Text to Speech (voice cloning/narration)'),

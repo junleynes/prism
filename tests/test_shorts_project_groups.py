@@ -80,8 +80,8 @@ def test_each_group_sees_only_its_own_projects(world):
     p, groups = world
     drama = _create(p['anna'], 'Tadhana')
     news = _create(p['cyrus'], 'Balita')
-    loose = _create(p['boss'], 'Unfiled', group_id='')
-    assert drama['group_id'] == groups['Drama'] and news['group_id'] == groups['News'] and loose['group_id'] is None
+    loose = _create(p['boss'], 'Unfiled', group_id=str(groups['News']))   # a group_id sent is ignored
+    assert drama['group_name'] == 'Drama' and news['group_name'] == 'News' and loose['group_name'] is None
 
     assert _titles(p['anna']) == _titles(p['benny']) == {'Tadhana'}, 'the whole group sees it'
     assert _titles(p['cyrus']) == {'Balita'}
@@ -150,65 +150,38 @@ def test_assignees_are_the_projects_group(world):
         'anna', 'benny', 'erin', 'boss'}
 
 
-def test_who_chooses_a_projects_group(world):
+def test_a_projects_group_is_always_its_creators_current_group(world):
+    """Requested by JUN: "current group should be always the current group of user created". Nobody picks
+    it -- a group_id sent is ignored -- and it follows the creator when they change group."""
     p, groups = world
-    # A member cannot file a project under a group they are not in.
     _uid, ana, ah = p['anna']
-    r = ana.post('/api/shorts/projects', data={'title': 'Sneaky', 'group_id': str(groups['News'])}, headers=ah)
-    assert r.status_code == 400 and 'your own groups' in r.get_json()['error']
-    assert _create(p['anna'], 'Plain')['group_id'] == groups['Drama'], 'one group: no need to say'
+    sneaky = _create(p['anna'], 'Sneaky', group_id=str(groups['News']))
+    assert sneaky['group_name'] == 'Drama' and 'Sneaky' not in _titles(p['cyrus'])
+    edited = ana.post(f"/api/shorts/projects/{sneaky['project_id']}", data={'title': 'Sneaky', 'group_id': str(groups['News'])},
+                      headers=ah).get_json()['project']
+    assert edited['group_name'] == 'Drama', 'an edit cannot move it either'
+    assert 'groups' not in ana.get('/api/shorts/projects').get_json(), 'nothing to choose from'
 
-    # In two groups, they say which; either of theirs.
-    _uid, erin, eh = p['erin']
-    r = erin.post('/api/shorts/projects', data={'title': 'Which?'}, headers=eh)
-    assert r.status_code == 400 and 'choose which group' in r.get_json()['error']
-    assert _create(p['erin'], 'News one', group_id=str(groups['News']))['group_id'] == groups['News']
-    assert [g['name'] for g in erin.get('/api/shorts/projects').get_json()['groups']] == ['Drama', 'News']
-    assert [g['name'] for g in ana.get('/api/shorts/projects').get_json()['groups']] == ['Drama']
+    # Someone in two groups: both groups see what they make.
+    both = _create(p['erin'], 'Both')
+    assert both['group_name'] == 'Drama, News'
+    assert 'Both' in _titles(p['benny']) and 'Both' in _titles(p['cyrus'])
 
-    _uid, boss, bh = p['boss']
-    listing = boss.get('/api/shorts/projects').get_json()
-    assert [g['name'] for g in listing['groups']] == ['Drama', 'News'] and listing['is_admin'] is True
-
-    made = _create(p['boss'], 'For news', group_id=str(groups['News']))
-    assert made['group_id'] == groups['News'] and made['group_name'] == 'News'
-    assert 'For news' in _titles(p['cyrus'])
-
-    moved = boss.post(f"/api/shorts/projects/{made['project_id']}", data={'title': 'For news', 'group_id': str(groups['Drama'])},
-                      headers=bh).get_json()['project']
-    assert moved['group_id'] == groups['Drama']
-    assert 'For news' not in _titles(p['cyrus']) and 'For news' in _titles(p['benny'])
-
-    # A member cannot move it to a group they are not in; without a group_id the group is kept.
-    r = ana.post(f"/api/shorts/projects/{made['project_id']}", data={'title': 'Renamed', 'group_id': str(groups['News'])},
-                 headers=ah)
-    assert r.status_code == 400
-    kept = ana.post(f"/api/shorts/projects/{made['project_id']}", data={'title': 'Renamed'}, headers=ah).get_json()['project']
-    assert kept['group_id'] == groups['Drama'] and kept['title'] == 'Renamed'
-    # Someone in both groups can move it between them.
-    moved = erin.post(f"/api/shorts/projects/{made['project_id']}", data={'title': 'Renamed', 'group_id': str(groups['News'])},
-                      headers=eh).get_json()['project']
-    assert moved['group_id'] == groups['News'] and 'Renamed' in _titles(p['cyrus'])
-
-    r = boss.post('/api/shorts/projects', data={'title': 'X', 'group_id': '99999'}, headers=bh)
-    assert r.status_code == 400 and 'no longer exists' in r.get_json()['error']
+    # The creator moves to News: their projects go with them.
+    auth.user_set_groups(p['anna'][0], [groups['News']])
+    assert 'Sneaky' in _titles(p['cyrus']) and 'Sneaky' not in _titles(p['benny'])
+    # Their creator in no group: only admins see it.
+    auth.user_set_groups(p['anna'][0], [])
+    assert 'Sneaky' not in _titles(p['cyrus']) and 'Sneaky' in _titles(p['boss'])
 
 
-def test_projects_from_before_groups_follow_their_creators_group(world):
+def test_a_group_saved_by_an_earlier_version_is_ignored(world):
     p, groups = world
     old = _create(p['anna'], 'Old show')
     path = os.path.join(shorts.SHORTS_PROJECTS_DIR, old['project_id'], 'project.json')
     with open(path, encoding='utf-8') as f:
         data = json.load(f)
-    del data['group_id']                                   # saved before projects had groups
+    data['group_id'] = groups['News']                      # filed under News by the old group picker
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f)
-    assert _titles(p['benny']) == {'Old show'} and _titles(p['cyrus']) == set()
-
-    # Its creator now in two groups: both see it, until an admin files it under one.
-    auth.user_set_groups(p['anna'][0], [groups['Drama'], groups['News']])
-    assert 'Old show' in _titles(p['cyrus'])
-    _uid, boss, bh = p['boss']
-    boss.post(f"/api/shorts/projects/{old['project_id']}", data={'title': 'Old show', 'group_id': str(groups['Drama'])},
-              headers=bh)
-    assert 'Old show' not in _titles(p['cyrus']) and 'Old show' in _titles(p['benny'])
+    assert 'Old show' in _titles(p['benny']) and 'Old show' not in _titles(p['cyrus'])
