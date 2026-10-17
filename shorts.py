@@ -1343,6 +1343,15 @@ def _kept_sfx(bdir, options):
     return {'path': path, 'gain': fx.get('gain') or 0.0} if path and os.path.isfile(path) else None
 
 
+def _kept_overlay(bdir, options):
+    """A batch's cliffhanger transition overlay, as kept beside its shorts, for rendering one of them again."""
+    ov = (options or {}).get('ending_overlay') or {}
+    path = os.path.join(bdir, os.path.basename(ov.get('file') or '')) if ov.get('file') else None
+    if not (path and os.path.isfile(path)):
+        return None
+    return {'path': path, 'dur': float(ov.get('dur') or 1.0), 'audio': bool(ov.get('audio'))}
+
+
 def _chapter_numbers(a, items):
     """{index in items: chapter number} for a mini-drama render: each item
     is the chapter of the analysis it overlaps most (the editor may have
@@ -1386,8 +1395,13 @@ def _encode_short(tag, src, info, plan, cues, opts, mp4_path, delivery_path, rep
                                   audio_out=plan.get('audio_out'), audio_fade=plan.get('audio_fade'),
                                   ending_hold=opts.get('ending_hold'), ending_zoom=opts.get('ending_zoom'),
                                   ending_look=opts.get('ending_look'), ending_motion=opts.get('ending_motion'),
-                                  ending_sfx=opts.get('ending_sfx'),
+                                  ending_sfx=opts.get('ending_sfx'), ending_overlay=opts.get('ending_overlay'),
                                   ending_fade=opts.get('ending_fade'))
+        if not ok and opts.get('ending') and opts.get('ending_overlay'):
+            # An overlay ffmpeg cannot read must not cost the short: made again without it.
+            print(f'Vertical Shorts {tag}: the transition overlay could not be applied ({err}); rendering without it')
+            return _encode_short(tag, src, info, plan, cues, dict(opts, ending_overlay=None), mp4_path,
+                                 delivery_path, report=report)
     except sc.ToolTimeout as e:
         ok, err = False, f'Encoding took too long and was stopped ({e}).'
     finally:
@@ -1446,7 +1460,7 @@ def _expand_cuts(items, join):
     return out
 
 
-def _expand_reels(a, items, join=REEL_JOIN):
+def _expand_reels(a, items):
     """Items that are highlight reels become one item per scene (flagged with
     the reel and its place in it); anything else passes through. A reel is
     recognised by the analysis candidate it still matches."""
@@ -1461,42 +1475,13 @@ def _expand_reels(a, items, join=REEL_JOIN):
         for i, sc_ in enumerate(m['scenes']):
             out.append({'start': sc_['start'], 'end': sc_['end'], 'title': it['title'],
                         '_reel': it['title'], '_reel_key': m['id'], '_scene': i + 1,
-                        '_of': len(m['scenes']), '_last': i == len(m['scenes']) - 1, '_join': join})
+                        '_of': len(m['scenes']), '_last': i == len(m['scenes']) - 1})
     return out
 
 
-def _overlay_graph(n, durs, size, overlay_dur, overlay_audio):
-    """filter_complex for n hard-cut pieces with the transition overlay (inputs n .. 2n-2, one per join) played
-    across each join, centred on it: the pieces concatenated, then each copy of the overlay scaled into the
-    frame (keeping its shape, transparent around it), shifted to its join and laid on top; its sound, if it
-    has one, mixed in at the same moment. Returns (graph, video label, audio label)."""
-    w, h = size
-    ins = ''.join(f'[{i}:v][{i}:a]' for i in range(n))
-    parts = [f'{ins}concat=n={n}:v=1:a=1[b0][ba]']
-    t, prev, mix = 0.0, '[b0]', ['[ba]']
-    for k in range(1, n):
-        t += durs[k - 1]
-        start = max(0.0, t - overlay_dur / 2.0)
-        o = n + k - 1
-        parts.append(f'[{o}:v]format=rgba,scale={w}:{h}:force_original_aspect_ratio=decrease,'
-                     f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0,setpts=PTS-STARTPTS+{start:.3f}/TB[o{k}]')
-        parts.append(f'{prev}[o{k}]overlay=eof_action=pass:format=auto[b{k}]')
-        prev = f'[b{k}]'
-        if overlay_audio:
-            ms = int(round(start * 1000))
-            parts.append(f'[{o}:a]aresample=48000,adelay={ms}|{ms}[oa{k}]')
-            mix.append(f'[oa{k}]')
-    if len(mix) > 1:
-        parts.append(f'{"".join(mix)}amix=inputs={len(mix)}:duration=first:normalize=0[am]')
-        return ';'.join(parts), prev, '[am]'
-    return ';'.join(parts), prev, '[ba]'
-
-
-def _join_scenes(paths, out_path, crf, preset, join=REEL_JOIN, overlay=None):
+def _join_scenes(paths, out_path, crf, preset, join=REEL_JOIN):
     """Scenes (finished MP4s of one size and rate) into one file, each fading
-    into the next over `join` seconds; plain cuts if the fade cannot be made.
-    With `overlay` (a video with an alpha channel), hard cuts with the overlay
-    played across each join instead. (ok, error)"""
+    into the next over `join` seconds; plain cuts if the fade cannot be made. (ok, error)"""
     if len(paths) == 1:
         shutil.copy(paths[0], out_path)
         return True, None
@@ -1508,26 +1493,6 @@ def _join_scenes(paths, out_path, crf, preset, join=REEL_JOIN, overlay=None):
     enc = ['-c:v', 'libx264', '-crf', str(crf), '-preset', preset, '-pix_fmt', 'yuv420p',
            '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', out_path]
     last = ''
-    if overlay and os.path.isfile(overlay) and all(durs):
-        info = pipeline.probe_media_info(overlay)
-        vi = pipeline.get_video_info(paths[0])
-        size = (vi['width'], vi['height'])
-        od = info.get('duration') or 1.0
-        # VP9 keeps its alpha channel only through the libvpx decoder.
-        dec = ['-c:v', 'libvpx-vp9'] if overlay.lower().endswith('.webm') else []
-        ov_cmd = list(cmd)
-        for _ in range(n - 1):
-            ov_cmd += dec + ['-i', overlay]
-        graph, vl, al = _overlay_graph(n, durs, size, od, info.get('has_audio'))
-        try:
-            r = pipeline.run_ffmpeg(ov_cmd + ['-filter_complex', graph, '-map', vl, '-map', al] + enc,
-                                    timeout=pipeline.FFMPEG_LONG_TIMEOUT, label='shorts transition overlay')
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                return True, None
-            last = 'The transition overlay could not be applied: ' + sc.ffmpeg_error(getattr(r, 'stderr', ''))
-        except pipeline.MediaToolTimeout as e:
-            return False, f'Adding the transition overlay took too long and was stopped ({e}).'
-        join = 0.0                               # fall back to plain cuts, same timing as the overlay version
     if join > 0 and all(d and d > 2 * join for d in durs):
         v, au, t = [], [], 0.0
         prev_v, prev_a = '[0:v]', '[0:a]'
@@ -1566,9 +1531,7 @@ def _run_render(jid, params):
     # its place in the story, and a folder of them sorts into that order.
     items = sorted(params['items'], key=lambda it: (float(it['start']), float(it['end'])))
     items = [dict(it, title=it.get('title') or f'Short {n}') for n, it in enumerate(items, 1)]
-    overlay = params.get('transition_overlay') if params.get('cut_join') == 'overlay' else None
-    items = _expand_reels(params['analysis'], _expand_cuts(items, 0.0 if params.get('cut_join') in ('cut', 'overlay') else REEL_JOIN),
-                          join=0.0 if overlay else REEL_JOIN)
+    items = _expand_reels(params['analysis'], _expand_cuts(items, 0.0 if params.get('cut_join') == 'cut' else REEL_JOIN))
     reframe = params['reframe']
     fmt = params.get('format') if params.get('format') in SHORTS_FORMATS else 'mp4_high'
     loudness = pipeline.resolve_loudness(params.get('loudness'), SHORTS_LOUDNESS)
@@ -1632,6 +1595,15 @@ def _run_render(jid, params):
         except OSError as e:
             sfx_kept = None
             warnings.append(f'The ending sound effect could not be used ({e}); the shorts have no sound on their ending.')
+    # ...and so is its transition overlay.
+    ov_kept = None
+    if params.get('ending') == 'cliffhanger' and params.get('ending_overlay'):
+        ov_kept = 'ending_overlay' + os.path.splitext(params['ending_overlay']['path'])[1].lower()
+        try:
+            shutil.copy(params['ending_overlay']['path'], os.path.join(bdir, ov_kept))
+        except OSError as e:
+            ov_kept = None
+            warnings.append(f'The transition overlay could not be used ({e}); the endings have none.')
     stem = sc.slugify(os.path.splitext(a['orig_name'] or '')[0], 40) or 'video'
     replaced = []
     manifest = {'batch_id': bid, 'created': time.time(), 'user_id': params.get('user_id'),
@@ -1656,6 +1628,9 @@ def _run_render(jid, params):
                             'ending_fade': params.get('ending_fade') if params.get('fade_last') else None,
                             'ending_sfx': ({'file': sfx_kept, 'name': params['ending_sfx']['name'],
                                             'gain': params['ending_sfx']['gain']} if sfx_kept else None),
+                            'ending_overlay': ({'file': ov_kept, 'name': params['ending_overlay']['name'],
+                                                'dur': params['ending_overlay']['dur'],
+                                                'audio': params['ending_overlay']['audio']} if ov_kept else None),
                             'format': fmt, 'format_label': pipeline.EXPORT_FORMATS[fmt]['label'],
                             'loudness': loudness},
                 'numbering': 'episode',       # short N is the Nth of these moments in the episode
@@ -1675,7 +1650,8 @@ def _run_render(jid, params):
             'ending_look': params.get('ending_look') if ending else None,
             'ending_motion': params.get('ending_motion') if ending else None,
             'ending_sfx': ({'path': os.path.join(bdir, sfx_kept), 'gain': params['ending_sfx']['gain']}
-                           if sfx_kept else None)}
+                           if sfx_kept else None),
+            'ending_overlay': (dict(params['ending_overlay'], path=os.path.join(bdir, ov_kept)) if ov_kept else None)}
     ext = pipeline.EXPORT_FORMATS[fmt]['ext']
     total = len(items)
     unit_cache = {}
@@ -1754,6 +1730,7 @@ def _run_render(jid, params):
                                        n_frames / fps) or None
         sopts = dict(opts, badges=badges, ending=ending_k, ending_hold=opts['ending_hold'] if ending_k else None,
                      ending_sfx=opts['ending_sfx'] if ending_k else None,
+                     ending_overlay=opts['ending_overlay'] if ending_k else None,
                      ending_fade=params.get('ending_fade') if fades else None)
         ok, err = _encode_short(f'{jid}_{n}', src, info, plan, cues, sopts, out_path,
                                 os.path.join(bdir, delivery) if delivery else None,
@@ -1814,7 +1791,7 @@ def _run_render(jid, params):
 
     if any(e.get('_reel') for e in manifest['shorts']):
         report(percent=97, step='Joining the scenes of each reel')
-        _build_reels(bdir, manifest, fmt, ext, stem, burn, sfx_kept is not None, overlay=overlay)
+        _build_reels(bdir, manifest, fmt, ext, stem, burn, sfx_kept is not None)
     if not manifest['shorts']:
         first = manifest['errors'][0]['error'] if manifest['errors'] else 'unknown error'
         shutil.rmtree(bdir, ignore_errors=True)
@@ -1911,7 +1888,7 @@ def _remove_short(bid, index, keep_batch=None):
     audit_log('shorts_replaced', target=f"{m.get('orig_name')}: {s.get('title')}", ip=_client_ip())
 
 
-def _build_reels(bdir, manifest, fmt, ext, stem, burn, _unused=False, overlay=None):
+def _build_reels(bdir, manifest, fmt, ext, stem, burn, _unused=False):
     """Replaces the scene entries of each highlight reel in `manifest` with
     one entry: the scenes joined, their captions carried over to the reel's time."""
     out, groups = [], {}
@@ -1929,7 +1906,7 @@ def _build_reels(bdir, manifest, fmt, ext, stem, burn, _unused=False, overlay=No
         name = f"{stem}_{'cut' if cut else 'reel'}_{r:02d}_{sc.slugify(title, 40) or 'highlights'}"
         mp4 = os.path.join(bdir, name + '.mp4')
         ok, err = _join_scenes(paths, mp4, SHORTS_CRF if fmt == 'mp4_high' else min(SHORTS_CRF, SHORTS_MASTER_CRF),
-                               SHORTS_PRESET, join=join, overlay=(overlay or {}).get('path'))
+                               SHORTS_PRESET, join=join)
         if ok and fmt != 'mp4_high':
             try:
                 pipeline.run_ffmpeg(pipeline.build_export_cmd(mp4, os.path.join(bdir, f'{name}.{ext}'), fmt),
@@ -2246,19 +2223,24 @@ def _resolve_ending_sfx(opts):
 _OVERLAY_EXTS = {'mov', 'webm', 'mp4', 'mkv', 'avi'}
 
 
-def _resolve_transition_overlay(opts):
-    """The transition overlay as {'path', 'name'} (or None), or an error to show. Like the ending's sound
-    effect, only a name this server staged itself (Browse library) is accepted, never a path."""
-    name = opts.get('transition_overlay_name')
-    if opts.get('cut_join') != 'overlay':
+def _overlay_facts(path):
+    """{'dur', 'audio'} of an overlay video, as the render needs them."""
+    info = pipeline.probe_media_info(path) or {}
+    return {'dur': float(info.get('duration') or 1.0), 'audio': bool(info.get('has_audio'))}
+
+
+def _resolve_ending_overlay(opts):
+    """The cliffhanger's transition overlay as {'path', 'name', 'dur', 'audio'} (or None), or an error to
+    show. Like the ending's sound effect, only a name this server staged itself (Browse library) is
+    accepted, never a path."""
+    name = opts.get('ending_overlay_name')
+    if opts.get('ending') != 'cliffhanger' or not name:
         return None, None
-    if not name:
-        return None, 'Pick the transition overlay video with Browse library, or choose another join.'
     path = pipeline.staged_path(name)
     ext = os.path.splitext(name)[1].lower().lstrip('.')
     if not name.startswith('net_') or ext not in _OVERLAY_EXTS or not os.path.isfile(path):
         return None, 'The transition overlay is no longer available -- pick it again.'
-    return {'path': path, 'name': re.sub(r'^net_\d+_', '', name)}, None
+    return dict(_overlay_facts(path), path=path, name=re.sub(r'^net_\d+_', '', name)), None
 
 
 def _render_options(data):
@@ -2287,11 +2269,11 @@ def _render_options(data):
             'ending_fade': sc.clamp_fade(data.get('ending_fade')) or SHORTS_FADE,
             # ...for this long (seconds), and with this sound effect (a file picked from the
             # SFX folder, by its staged name) coming in as the action stops, this many dB up or down.
-            # How joined pieces meet (a part cut out of a moment, the scenes of a highlight reel): a short
-            # crossfade, a hard cut, or a hard cut under a transition overlay picked from the Transitions
-            # folder (a video with an alpha channel, played across each join).
-            'cut_join': data.get('cut_join') if data.get('cut_join') in ('cut', 'overlay') else 'fade',
-            'transition_overlay_name': os.path.basename(str(data.get('transition_overlay') or '').strip()),
+            # How joined pieces meet (a part cut out of a moment, the scenes of a highlight reel).
+            'cut_join': 'cut' if data.get('cut_join') == 'cut' else 'fade',
+            # The cliffhanger's transition overlay: a video with an alpha channel picked from the
+            # Transitions folder (by its staged name), played across the freeze.
+            'ending_overlay_name': os.path.basename(str(data.get('ending_overlay') or '').strip()),
             'ending_hold': sc.clamp_hold(data.get('ending_hold')) or SHORTS_CLIFF_HOLD,
             # ...and pushing in this far (the page sends a percentage).
             'ending_zoom': _clamp_zoom_pct(data.get('ending_zoom')),
@@ -2423,7 +2405,7 @@ def api_shorts_analyze():
         params['render']['ending_sfx'], sfx_err = _resolve_ending_sfx(params['render'])
         if sfx_err:
             return jsonify(error=sfx_err), 400
-        params['render']['transition_overlay'], ov_err = _resolve_transition_overlay(params['render'])
+        params['render']['ending_overlay'], ov_err = _resolve_ending_overlay(params['render'])
         if ov_err:
             return jsonify(error=ov_err), 400
         jid = _start_job('auto', _run_auto, params, f'{orig_name} (vertical shorts: analysis + render)',
@@ -3301,7 +3283,7 @@ def api_shorts_render():
     params['ending_sfx'], sfx_err = _resolve_ending_sfx(params)
     if sfx_err:
         return jsonify(error=sfx_err), 400
-    params['transition_overlay'], ov_err = _resolve_transition_overlay(params)
+    params['ending_overlay'], ov_err = _resolve_ending_overlay(params)
     if ov_err:
         return jsonify(error=ov_err), 400
     jid = _start_job('render', _run_render, params, f"{a['orig_name']} (vertical shorts: {len(items)} to render)",
@@ -4013,7 +3995,7 @@ def _run_recaption(jid, params):
             'ending_hold': o.get('ending_hold'), 'ending_zoom': o.get('ending_zoom'),
             'ending_look': o.get('ending_look'), 'ending_motion': o.get('ending_motion'),
             'ending_fade': (s.get('ending_fade') or o.get('ending_fade')) if kind == 'fade' else None,
-            'ending_sfx': _kept_sfx(bdir, o), 'badges': s.get('badges'),
+            'ending_sfx': _kept_sfx(bdir, o), 'ending_overlay': _kept_overlay(bdir, o), 'badges': s.get('badges'),
             'loudness': pipeline.resolve_loudness(o.get('loudness'), SHORTS_LOUDNESS)}
     stem = os.path.splitext(s['file'])[0]
     new_mp4 = os.path.join(bdir, f'.new_{jid}_{stem}.mp4')

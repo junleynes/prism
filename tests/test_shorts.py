@@ -742,7 +742,7 @@ def test_generate_without_preview_analyses_then_renders_everything_as_one_job(en
     assert [(s['start'], s['end']) for s in batch['shorts']] == \
         [(round(c['start'] * 25) / 25, round(c['end'] * 25) / 25) for c in a['candidates']]
     assert batch['options'] == {'reframe': 'fit', 'subtitles': False, 'subtitle_size': 'l', 'episode_labels': True, 'word_highlight': False, 'highlight_color': None, 'cut_join': None, 'face_detector': None,
-                                'speaker': False, 'ending': 'none', 'ending_hold': None, 'ending_zoom': None, 'ending_look': None, 'ending_motion': None, 'fade_last': False, 'ending_fade': None, 'ending_sfx': None, 'format': 'mp4_high',
+                                'speaker': False, 'ending': 'none', 'ending_hold': None, 'ending_zoom': None, 'ending_look': None, 'ending_motion': None, 'fade_last': False, 'ending_fade': None, 'ending_sfx': None, 'ending_overlay': None, 'format': 'mp4_high',
                                 'format_label': 'MP4 (H.264 High Profile)', 'loudness': -14.0}, \
         'the Output settings sent with the request'
     assert all(s['layouts']['fit'] >= 1 and s['layouts']['crop'] == 0 for s in batch['shorts'])
@@ -3029,6 +3029,34 @@ def _stage_sfx(tmp_path, name='boom.wav'):
     staged = f'net_{int(time.time())}_{name}'
     shutil.copy(str(p), os.path.join(main.app.config['UPLOAD_FOLDER'], staged))
     return staged
+
+
+def test_a_cliffhanger_transition_overlay_is_rendered_and_kept_with_the_batch(env, monkeypatch, tmp_path):
+    Services(monkeypatch)
+    client, headers = _client()
+    a = _analysis(client, _analyze(client, headers, env))
+    item = [{'start': 2.0, 'end': 6.0, 'title': 'Moment'}]
+    staged = f'net_{int(time.time())}_sting.mov'
+    subprocess.run(FF + ['-f', 'lavfi', '-i', 'color=c=red:s=64x64:r=25:d=0.6,format=rgba', '-c:v', 'qtrle',
+                         os.path.join(main.app.config['UPLOAD_FOLDER'], staged)], check=True, timeout=30)
+    b = _render(client, headers, a['analysis_id'], item, reframe='fit', subtitles=False, ending='cliffhanger',
+                ending_overlay=staged)['result']['batch']
+    ov = b['options']['ending_overlay']
+    assert ov['file'] == 'ending_overlay.mov' and ov['name'] == 'sting.mov' and ov['audio'] is False
+    bdir = os.path.join(shorts.SHORTS_DIR, b['batch_id'])
+    assert os.path.isfile(os.path.join(bdir, 'ending_overlay.mov')), 'kept beside the shorts'
+    assert shorts._kept_overlay(bdir, b['options'])['path'] == os.path.join(bdir, 'ending_overlay.mov')
+    assert len(b['shorts']) == 1 and not b['errors']
+    # Without the cliffhanger it is ignored.
+    plain = _render(client, headers, a['analysis_id'], item, reframe='fit', subtitles=False,
+                    ending_overlay=staged)['result']['batch']
+    assert plain['options']['ending_overlay'] is None
+    # An overlay ffmpeg cannot read costs the short nothing: it is made without it.
+    open(os.path.join(main.app.config['UPLOAD_FOLDER'], staged), 'wb').write(b'not a video')
+    monkeypatch.setattr(shorts, '_overlay_facts', lambda p: {'dur': 0.6, 'audio': False})
+    bad = _render(client, headers, a['analysis_id'], item, reframe='fit', subtitles=False, ending='cliffhanger',
+                  ending_overlay=staged)['result']['batch']
+    assert len(bad['shorts']) == 1 and not bad['errors']
 
 
 def test_a_render_takes_the_cliffhanger_hold_and_sound_effect_and_keeps_the_effect_with_the_batch(env, monkeypatch, tmp_path):

@@ -52,48 +52,57 @@ def test_the_highlights_matte_can_be_picked_from_the_library(tmp_path):
     assert "transition_matte_path = _resolve_upload('transition_matte', TRANSITION_EXTENSIONS)" in src
 
 
-def test_the_shorts_overlay_option_is_offered_and_validated():
+def test_the_overlay_is_a_cliffhanger_setting_not_a_join():
     html = _page()
-    assert '<option value=overlay>Transition overlay (from library)</option>' in html
-    assert "openNetworkBrowser('shorts_overlay','transitions','Transition overlay')" in html
-    opts = shorts._render_options({'cut_join': 'overlay', 'transition_overlay': 'net_1_sting.mov'})
-    assert opts['cut_join'] == 'overlay'
-    ov, err = shorts._resolve_transition_overlay(opts)
+    assert '<option value=overlay>' not in html, 'not under Where pieces join'
+    i = html.index('id=sh-ending-more')
+    assert html.index("openNetworkBrowser('shorts_overlay','transitions'", i) < html.index('id=sh-ending-pv', i), \
+        'with the cliffhanger\'s own settings'
+    assert shorts._render_options({'cut_join': 'overlay'})['cut_join'] == 'fade'
+    opts = shorts._render_options({'ending': 'cliffhanger', 'ending_overlay': 'net_1_sting.mov'})
+    ov, err = shorts._resolve_ending_overlay(opts)
     assert ov is None and 'no longer available' in err
     staged = os.path.join(main.app.config['UPLOAD_FOLDER'], 'net_1_sting.mov')
-    open(staged, 'wb').write(b'x')
-    ov, err = shorts._resolve_transition_overlay(opts)
-    assert err is None and ov == {'path': staged, 'name': 'sting.mov'}
-    assert shorts._resolve_transition_overlay(dict(opts, transition_overlay_name=''))[1].startswith('Pick the transition')
-    assert shorts._resolve_transition_overlay(dict(opts, cut_join='fade')) == (None, None)
-    assert shorts._render_options({'cut_join': 'bogus'})['cut_join'] == 'fade'
+    subprocess.run(FF + ['-f', 'lavfi', '-i', 'color=c=red:s=64x64:r=25:d=0.6', '-c:v', 'qtrle', staged], check=True)
+    ov, err = shorts._resolve_ending_overlay(opts)
+    assert err is None and ov['path'] == staged and ov['name'] == 'sting.mov'
+    assert abs(ov['dur'] - 0.6) < 0.1 and ov['audio'] is False
+    assert shorts._resolve_ending_overlay(dict(opts, ending_overlay_name='')) == (None, None), 'optional'
+    assert shorts._resolve_ending_overlay(dict(opts, ending='none')) == (None, None), 'only with the cliffhanger'
+    assert shorts._resolve_ending_overlay(dict(opts, ending_overlay_name='net_1_notes.txt'))[0] is None
 
 
 @pytest.mark.parametrize('with_sound', [False, True])
-def test_the_overlay_plays_across_each_join_and_nowhere_else(tmp_path, with_sound):
+def test_the_overlay_plays_over_the_freeze_and_nowhere_else(tmp_path, with_sound):
+    import shorts_core as sc
     d = str(tmp_path)
-    for name, colour, freq in (('a', 'blue', 440), ('b', 'green', 660)):
-        subprocess.run(FF + ['-f', 'lavfi', '-i', f'color=c={colour}:s=360x640:r=25:d=2', '-f', 'lavfi',
-                             '-i', f'sine=f={freq}:d=2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
-                             '-shortest', f'{d}/{name}.mp4'], check=True)
+    src = f'{d}/src.mp4'
+    subprocess.run(FF + ['-f', 'lavfi', '-i', 'color=c=blue:s=640x360:r=25:d=4', '-f', 'lavfi',
+                         '-i', 'sine=f=440:sample_rate=48000:d=4', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                         '-c:a', 'aac', '-shortest', src], check=True)
     ov = [*FF, '-f', 'lavfi', '-i', 'color=c=red:s=200x200:r=25:d=0.8,format=rgba,colorchannelmixer=aa=0.6']
     if with_sound:
         ov += ['-f', 'lavfi', '-i', 'sine=f=2000:d=0.8', '-c:a', 'pcm_s16le']
     subprocess.run(ov + ['-c:v', 'qtrle', '-shortest', f'{d}/ov.mov'], check=True)
-
-    ok, err = shorts._join_scenes([f'{d}/a.mp4', f'{d}/b.mp4'], f'{d}/out.mp4', 20, 'veryfast', join=0.0,
-                                  overlay=f'{d}/ov.mov')
+    info = sc.probe_source('ffprobe', src)
+    n = 50
+    segs = [{'a': 0, 'b': n - 1, 'layout': 'fit', 'x': None, 'keys': None}]
+    out = f'{d}/out.mp4'
+    ok, err = sc.render_short('ffmpeg', src, out, 0, n, info, segs, work_dir=d, preset='ultrafast', ending=True,
+                              ending_room=4, ending_hold=2.0,
+                              ending_overlay={'path': f'{d}/ov.mov', 'dur': 0.8, 'audio': with_sound})
     assert ok, err
-    assert abs(pipeline.probe_duration(f'{d}/out.mp4') - 4.0) < 0.15, 'hard cuts: nothing is lost to a fade'
-    cap = cv2.VideoCapture(f'{d}/out.mp4')
+    stop = sc.cliffhanger_stop(n, 25.0, 4, 0) / 25.0
+    cap = cv2.VideoCapture(out)
 
     def px(t, x, y):
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         _r, f = cap.read()
         return [int(v) for v in f[y, x]]
-    b, g, r = px(1.8, 180, 320)
-    assert r > 100 and b > 60, 'red laid over blue just before the cut'
-    b, g, r = px(2.15, 180, 320)
-    assert r > 100 and g > 30, 'red laid over green just after it'
-    assert px(1.8, 10, 10)[0] > 200, 'transparent around the overlay: the corner is still blue'
-    assert px(0.3, 180, 320)[2] < 40 and px(3.7, 180, 320)[2] < 40, 'no overlay away from the join'
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    b, g, r = px(stop + 0.1, w // 2, h // 2)
+    assert r > 100, 'red over the freeze'
+    b, g, r = px(stop - 0.2, w // 2, h // 2)
+    assert r > 100, 'starting just before it (centred on it)'
+    assert px(0.4, w // 2, h // 2)[2] < 60, 'not over the action before'
+    assert px(stop + 1.0, w // 2, h // 2)[2] < 60, 'gone once it has played'

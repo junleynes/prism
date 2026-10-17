@@ -3846,8 +3846,12 @@ def build_render_cmd(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_n
                      crf=18, preset='medium', loudness=-14.0, true_peak=-1.5, ending=False, ending_room=None,
                      ending_after=0, audio_out=None, audio_fade=None, out_w=OUT_W, out_h=OUT_H,
                      ending_hold=None, ending_sfx=None, ending_fade=None, ending_zoom=None,
-                     ending_look=None, ending_motion=None):
-    """`ending_fade` (seconds) is the fade-to-black ending instead: the last
+                     ending_look=None, ending_motion=None, ending_overlay=None):
+    """`ending_overlay` is {'path', 'dur', 'audio'} -- a video with an alpha
+    channel (a transition) played over the cliffhanger, centred on the instant
+    the action stops, scaled into the frame with its transparency kept; its
+    sound, if it has one, is mixed in with the effect. Cut off at the black.
+    `ending_fade` (seconds) is the fade-to-black ending instead: the last
     seconds of the clip itself go to black, picture and sound together, and
     the short is no longer for it.
     `ending` adds the cliffhanger ending (see cliffhanger_graph).
@@ -3885,7 +3889,8 @@ def build_render_cmd(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_n
                               ending=(n_frames, ending_room, ending_after, ending_hold, ending_zoom, ending_look, ending_motion) if ending else None,
                               fade=(n_frames, max(1, int(round(fade_s * fps)))) if fade_s else None)
     extra = cliffhanger_extra(n_frames, fps, ending_room, ending_after, ending_hold) if ending else 0
-    sfx_chain = None
+    sfx_chain = ov_chain = None
+    ov_in = None
     if ending:
         # The sound is taken out with a cubic fade (all but gone in half its
         # length, and no click), and there is nothing after it. The nothing
@@ -3912,6 +3917,20 @@ def build_render_cmd(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_n
                          f'silenceremove=start_periods=1:start_threshold=-50dB:start_duration=0.01:start_silence=0.01,volume={gain:.1f}dB,'
                          f'atrim=end={room_s:.3f},afade=t=out:st={max(0.0, room_s - ramp):.3f}:d={ramp:.3f},'
                          f'adelay={ms}|{ms},apad=whole_dur={total:.3f}')
+        if ending_overlay and ending_overlay.get('path'):
+            total = dur + extra / fps
+            od = max(0.04, float(ending_overlay.get('dur') or 1.0))
+            at = max(0.0, stop / fps - od / 2.0)        # centred on the freeze
+            ov_in = 2 if sfx_chain else 1
+            graph = graph.replace('[vout]', '[vpre]')
+            graph += (f';[{ov_in}:v]format=rgba,scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,'
+                      f'pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black@0,setpts=PTS-STARTPTS+{at:.3f}/TB[ovl];'
+                      f'[vpre][ovl]overlay=eof_action=pass:format=auto[vout]')
+            if ending_overlay.get('audio'):
+                ms = int(round(at * 1000))
+                room_s = max(0.1, total - at)
+                ov_chain = (f'[{ov_in}:a]aresample=48000,aformat=channel_layouts=stereo,atrim=end={room_s:.3f},'
+                            f'adelay={ms}|{ms},apad=whole_dur={total:.3f}')
     else:
         fade_len = fade_s if fade_s else 0.12
         fade_out = max(0.0, dur - fade_len)
@@ -3924,26 +3943,40 @@ def build_render_cmd(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_n
             polish = (f'afade=t=in:st=0:d=0.04,afade=t=out:st={fade_out:.3f}:d={fade_len:.3f},'
                       f'loudnorm=I={loudness}:TP={true_peak}:LRA=11')
     take = info.get('audio_take')
-    mix = ('[am][sfx]amix=inputs=2:normalize=0:duration=first:dropout_transition=0,alimiter=limit=0.95[aout]')
+    # The sounds laid over the dialogue: the ending's effect and the overlay's own sound.
+    extras = [(c, l) for c, l in ((sfx_chain, '[sfx]'), (ov_chain, '[ovs]')) if c]
+    over = ''.join(f';{c}{l}' for c, l in extras)
+    labels = ''.join(l for _, l in extras)
+
+    def mix(first):
+        return (f'{first}{labels}amix=inputs={len(extras) + 1}:normalize=0:duration=first:dropout_transition=0,'
+                'alimiter=limit=0.95[aout]')
     if take:
         # The channels the dialogue was found on (see take_to_stereo), not
         # whichever stream ffmpeg would pick.
-        if sfx_chain:
-            graph += f';{take_to_stereo(take)},{polish}[am];{sfx_chain}[sfx];{mix}'
+        if extras:
+            graph += f';{take_to_stereo(take)},{polish}[am]{over};{mix("[am]")}'
         else:
             graph += f';{take_to_stereo(take)},{polish}[aout]'
-    elif sfx_chain:
+    elif extras:
         if info.get('audio_index') is not None:
-            graph += f";[0:a:{info['audio_index']}]{polish}[am];{sfx_chain}[sfx];{mix}"
+            graph += f";[0:a:{info['audio_index']}]{polish}[am]{over};{mix('[am]')}"
+        elif len(extras) == 1:
+            graph += f';{extras[0][0]}[aout]'           # a silent source: the effect alone
         else:
-            graph += f';{sfx_chain}[aout]'            # a silent source: the effect alone
+            graph += f'{over};{labels}amix=inputs={len(extras)}:normalize=0:duration=first,alimiter=limit=0.95[aout]'
     cmd = [ffmpeg, '-y', '-hide_banner', '-nostats', '-loglevel', 'error',
            '-ss', f'{ss:.6f}', '-i', src]
     if sfx_chain:
         cmd += ['-i', ending_sfx['path']]
+    if ov_in:
+        # VP9 keeps its alpha channel only through the libvpx decoder.
+        if str(ending_overlay['path']).lower().endswith('.webm'):
+            cmd += ['-c:v', 'libvpx-vp9']
+        cmd += ['-i', ending_overlay['path']]
     cmd += ['-t', f'{dur + extra / fps:.6f}', '-frames:v', str(int(n_frames) + extra),
             '-filter_complex', graph, '-map', '[vout]']
-    if take or sfx_chain:
+    if take or extras:
         cmd += ['-map', '[aout]', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2']
     elif info.get('audio_index') is not None:
         cmd += ['-map', f"0:a:{info['audio_index']}", '-af', polish,
@@ -3992,7 +4025,7 @@ def render_short(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_name=
                  crf=18, preset='medium', loudness=-14.0, true_peak=-1.5, timeout=900, ending=False,
                  ending_room=None, ending_after=0, audio_out=None, audio_fade=None, out_w=OUT_W, out_h=OUT_H,
                  ending_hold=None, ending_sfx=None, ending_fade=None, ending_zoom=None,
-                 ending_look=None, ending_motion=None):
+                 ending_look=None, ending_motion=None, ending_overlay=None):
     """Renders one short. Returns (ok, error_text).
 
     Runs ffmpeg with `work_dir` as its working directory and refers to the
@@ -4007,7 +4040,7 @@ def render_short(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_name=
                            ending_room=ending_room, ending_after=ending_after, audio_out=audio_out,
                            audio_fade=audio_fade, out_w=out_w, out_h=out_h, ending_hold=ending_hold,
                            ending_sfx=ending_sfx, ending_fade=ending_fade, ending_zoom=ending_zoom,
-                           ending_look=ending_look, ending_motion=ending_motion)
+                           ending_look=ending_look, ending_motion=ending_motion, ending_overlay=ending_overlay)
     try:
         r = run_tool(cmd, timeout, cwd=work_dir, label='shorts render')
     except ToolTimeout:
