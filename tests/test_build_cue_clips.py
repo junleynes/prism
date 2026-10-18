@@ -103,18 +103,24 @@ def test_stretch_ceiling_for_the_last_cue_in_a_material_is_the_files_own_duratio
     assert clips[0]['duration'] == 290.0  # 300s file - 10s start
 
 
-def test_rebalancing_after_build_cue_clips_can_stretch_both_cues_proportionally(two_materials):
+def test_rebalancing_leaves_cues_with_material_in_and_out_exactly_as_written(two_materials):
     cues = [
         {'time': 213, 'out': 217, 'desc': 'M1', 'material': 1},
         {'time': 35, 'out': 42, 'desc': 'M2', 'material': 2},
     ]
     clips = pipeline.build_cue_clips(cues, two_materials)
     rebalanced = pipeline._rebalance_selected_durations(clips, target_duration=15.0, min_seg_dur=0.8)
-    total = sum(c['selected_dur'] for c in rebalanced)
-    assert abs(total - 15.0) < 0.01
-    # Both grew (proportionally) from their original 4s/7s spans, not just one.
-    assert rebalanced[0]['selected_dur'] > 4.0
-    assert rebalanced[1]['selected_dur'] > 7.0
+    assert [c['selected_dur'] for c in rebalanced] == [4.0, 7.0]
+
+
+def test_rebalancing_still_stretches_cues_that_gave_only_a_start(two_materials):
+    cues = [
+        {'time': 213, 'desc': 'M1', 'material': 1},
+        {'time': 35, 'desc': 'M2', 'material': 2},
+    ]
+    clips = pipeline.build_cue_clips(cues, two_materials)
+    rebalanced = pipeline._rebalance_selected_durations(clips, target_duration=15.0, min_seg_dur=0.8)
+    assert abs(sum(c['selected_dur'] for c in rebalanced) - 15.0) < 0.01
 
 
 def test_cue_naming_a_material_outside_the_loaded_range_is_skipped(two_materials):
