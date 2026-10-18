@@ -189,3 +189,18 @@ def test_scene_captions_come_from_the_vision_model(monkeypatch):
     s = [{'source_path': '/x.mp4', 'start': 40.0, 'selected_dur': 4.0}, {'ai_desc': 'kept', 'start': 1.0}]
     pipeline._caption_selected(s)
     assert s[0]['ai_desc'] == 'A woman looks shocked at a phone. Close-up.' and s[1]['ai_desc'] == 'kept'
+
+
+def test_material_is_the_one_whose_whole_recording_says_the_line_best():
+    cue = {'order': 0, 'time': 71.0, 'out': 74.0, 'kind': 'sot', 'desc': 'CAN YOU DO SOMETHING FOR ME'}
+    tr = {1: _words('can you do something', 71.2) + _words('totally different words follow now', 80.0),
+          2: _words('hello can you do something for me please', 71.0)}
+    out, _ = cl.locate_cues([cue], tr, 2)
+    assert out[0]['material'] == 2 and out[0]['time'] == 71.0 and out[0]['out'] == 74.0
+
+
+def test_line_said_far_from_its_written_time_moves_to_where_it_is_said():
+    cue = {'order': 0, 'time': 71.0, 'out': 74.0, 'kind': 'sot', 'desc': 'CAN YOU DO SOMETHING FOR ME'}
+    tr = {1: _words('nothing here', 5.0), 2: _words('can you do something for me', 140.0)}
+    out, _ = cl.locate_cues([cue], tr, 2)
+    assert out[0]['material'] == 2 and out[0]['located'] and out[0]['time'] > 130

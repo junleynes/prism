@@ -36,14 +36,6 @@ def locate_cues(cues, transcripts, n_materials=None):
         said = (c['dialog'] or c.get('speech') or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else (c.get('speech') or c.get('desc'))     # the language model's reading, else the raw line
         want = cutcraft.norm_tokens(said or '')
         best = None
-        if not c.get('material') and c.get('out') is not None and len(want) >= MIN_TOKENS and transcripts and n_materials > 1:
-            # Written in and out, no material: which material is it in? The one where these words are said there.
-            mat = _material_by_ear(c, said, transcripts)
-            if mat:
-                c['material'], c['material_by'] = mat, 'heard'
-                notes.append(f'"{c["desc"][:40]}" is said in material {mat} at {c["time"]:.0f}s: cut as written.')
-                out.append(c)
-                continue
         if len(want) >= MIN_TOKENS:
             for mat, words in transcripts.items():
                 if c.get('material') and mat != c['material']:
@@ -60,6 +52,13 @@ def locate_cues(cues, transcripts, n_materials=None):
                     best = (key, mat, float(w0['start']), float(w1['end']), r['score'])
         if best:
             _k, mat, a, b, score = best
+            if not c.get('material') and c.get('out') is not None and n_materials > 1 and abs(a - float(c['time'])) <= WINDOW + 1.0:
+                # Written in and out, no material: the speech of every loaded material was searched for these words,
+                # and they are said there, at the written time. That identifies the material; the cut stays as written.
+                c['material'], c['material_by'] = mat, 'heard'
+                notes.append(f'"{c["desc"][:40]}" is said in material {mat} at {a:.1f}s (score {score:.2f}): cut as written.')
+                out.append(c)
+                continue
             span = (c['out'] - c['time']) if c.get('out') else 0.0
             c['material'] = mat
             c['written_time'] = c['time']
