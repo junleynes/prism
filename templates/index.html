@@ -1558,7 +1558,19 @@ document.addEventListener("DOMContentLoaded", function(){
     {% if current_role == 'admin' or 'promo_generation' in current_permissions %}
     <button type=button class="btn" onclick="switchTab('p-trailer', document.querySelector('.tab[onclick*=p-trailer]'))">
       <span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4.5-2.5L10 9.5z"/></svg></span>
-      Generate a promo
+      Generate Highlights
+    </button>
+    {% endif %}
+    {% if current_role == 'admin' or 'vertical_shorts' in current_permissions %}
+    <button type=button class="btn" onclick="switchTab('p-shorts', document.querySelector('.tab[onclick*=p-shorts]'))">
+      <span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="6.5" y="3" width="11" height="18" rx="2"/><path d="M10.5 9.5v5l4-2.5-4-2.5z"/></svg></span>
+      Generate Shorts
+    </button>
+    {% endif %}
+    {% if current_role == 'admin' or 'schedule_plug' in current_permissions %}
+    <button type=button class="btn" onclick="switchTab('p-schedule', document.querySelector('.tab[onclick*=p-schedule]'))">
+      <span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4M7.5 14h4M7.5 17h7"/></svg></span>
+      Generate Artwork Animation
     </button>
     {% endif %}
   </div>
