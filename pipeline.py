@@ -29,6 +29,7 @@ from smbprotocol.exceptions import SharingViolation
 
 from core import app, ALLOWED_EXTENSIONS, _job_submit_limiter, _client_ip, _RateLimiter
 import cutcraft
+import highlights_core as hc
 import scriptbrief
 from schedule_core import IMAGE_EXTENSIONS as SCHEDULE_IMAGE_EXTENSIONS
 from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, library_get_row, library_delete,
@@ -6590,6 +6591,14 @@ def api_trailer():
     # job thread, which has no access to request.files.
     priority_prompt = (request.form.get('priority_prompt') or '').strip()
     negative_prompt = (request.form.get('negative_prompt') or '').strip()
+    # Scenes the person pinned in an earlier preview of this same footage: they go in the cut first,
+    # whatever the new settings would have scored them.
+    pinned_scenes = []
+    try:
+        for pin in (json.loads(request.form.get('pinned_scenes') or '[]') or [])[:40]:
+            pinned_scenes.append({'material': pin.get('material'), 'start': float(pin['start'])})
+    except (ValueError, TypeError, KeyError, AttributeError):
+        pinned_scenes = []
     # Set by the frontend after combining multiple HIRES files via Browse
     # Library's multi-select -- each segment's own duration, in combine
     # order, as a JSON list. Turned into {segment_number: cumulative_offset}.
@@ -7092,7 +7101,7 @@ def api_trailer():
                   scene_threshold=scene_threshold, min_scene_len_sec=min_scene_len_sec,
                   detector=detector, adaptive_threshold=adaptive_threshold,
                   priority_prompt=priority_prompt,
-                  negative_prompt=negative_prompt,
+                  negative_prompt=negative_prompt, pinned_scenes=pinned_scenes,
                   script_cues=script_cues, script_brief=script_brief,
                   transition=transition, xfade_dur=xfade_dur, transition_matte_path=transition_matte_path,
                   target_loudness=target_loudness, true_peak=true_peak, music_duck_db=music_duck_db, duck_depth_db=duck_depth_db, duck_release_hold=duck_release_hold, beat_match=beat_match, broadcast_stereo=broadcast_stereo, model=model,
@@ -11213,6 +11222,28 @@ def _run_trailer_job(jid, params):
                 if not ret:
                     return None
                 dur = tc_seconds(end) - tc_seconds(start)
+                # More than the middle frame: a scene that peaks late, or blinks at its midpoint, is rated
+                # on what it really shows. The extra frames are kept small (they only go to the vision
+                # model), and the movement between them is read here while they are in hand.
+                thumbs, grays = [], []
+                try:
+                    f0, f1 = tc_frames(start), tc_frames(end)
+                    for frac in hc.sample_fractions(dur):
+                        if abs(frac - 0.5) < 1e-6:
+                            fr = frame
+                        else:
+                            local_cap.set(cv2.CAP_PROP_POS_FRAMES, int(f0 + (f1 - f0) * frac))
+                            ok_, fr = local_cap.read()
+                            if not ok_:
+                                continue
+                        sm_ = fr if fr.shape[1] <= hc.THUMB_WIDTH else cv2.resize(
+                            fr, (hc.THUMB_WIDTH, int(fr.shape[0] * hc.THUMB_WIDTH / fr.shape[1])))
+                        thumbs.append(cv2.imencode('.jpg', sm_, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
+                        grays.append(cv2.cvtColor(cv2.resize(fr, (64, 36)), cv2.COLOR_BGR2GRAY))
+                except Exception as e:
+                    print(f'Extra scene frames skipped: {e}')
+                motion = hc.motion_amount(grays)
+                hist = hc.color_hist(frame)
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 lap = cv2.Laplacian(gray, cv2.CV_64F).var()
                 bri = float(np.mean(gray))
@@ -11239,6 +11270,7 @@ def _run_trailer_job(jid, params):
                     'edge_ratio': round(edge_ratio, 3), 'mean_hue': round(mean_hue, 1),
                     'mean_sat': round(mean_sat, 1), 'mean_val': round(mean_val, 1),
                     'has_face': has_face, 'frame': frame, 'frame_idx': mid_f,
+                    'thumbs': thumbs, 'motion': round(motion, 4), 'hist': hist,
                     'material': mat_num, 'source_path': src_path,
                 }
             finally:
@@ -11282,6 +11314,32 @@ def _run_trailer_job(jid, params):
             # contract the AI/dialogue weights are balanced against.
             s['quality_score'] = max(1, min(3, score))
 
+        if hc.ENERGY_WEIGHT > 0 and not (params.get('script_cues') or []):
+            # How loud and how busy each scene is, against the rest of the episode: a shout, a held beat
+            # before a line, a lot of movement. Added to the score below, and used to pick the clip's
+            # window inside a scene.
+            job_set(jid, percent=17, step='Measuring loudness and movement')
+            try:
+                import shorts_core
+                _levels = {}
+                for s in scenes_data:
+                    sp = s.get('source_path')
+                    if sp not in _levels:
+                        try:
+                            _db = shorts_core.read_envelope(FFMPEG, sp, {'audio_index': 0}, hop=hc.ENVELOPE_STEP, timeout=600)
+                        except Exception as e:
+                            print(f'Loudness read skipped for {sp}: {e}')
+                            _db = None
+                        _levels[sp] = (_db, float(np.percentile(_db, 60)) if _db is not None and len(_db) else None)
+                    _db, _speech = _levels[sp]
+                    s['audio'] = hc.scene_audio_stats(_db, s['start'], s['end'], hop=hc.ENVELOPE_STEP, speech_db=_speech)
+                    s['motion_t'] = s['start'] + s['duration'] / 2.0
+                hc.energy_scores(scenes_data)
+            except Exception as e:
+                print(f'Energy scoring skipped: {e}')
+                for s in scenes_data:
+                    s['energy_score'] = 0.0
+
         if mode == 'ai' and not (params.get('script_cues') or []):
             # Skipped entirely when timecode cues are present: user-requested
             # and confirmed -- the cue-exclusive selection path further down
@@ -11302,7 +11360,7 @@ def _run_trailer_job(jid, params):
             # by the min_gap spacing rule during selection, leaving nothing to pick.
             ai_pool = scenes_data
             if len(scenes_data) > AI_SCORE_LIMIT:
-                ranked = sorted(scenes_data, key=lambda s: s['quality_score'], reverse=True)
+                ranked = sorted(scenes_data, key=lambda s: s['quality_score'] + s.get('energy_score', 0.0), reverse=True)
                 chosen = {id(s): s for s in ranked[:max(1, AI_SCORE_LIMIT // 2)]}
                 n_buckets = max(1, min(AI_SCORE_LIMIT // 4, 12))
                 span = max(video_duration, 1e-6)
@@ -11312,7 +11370,7 @@ def _run_trailer_job(jid, params):
                     buckets.setdefault(b, []).append(s)
                 per_bucket = max(1, (AI_SCORE_LIMIT - len(chosen)) // n_buckets)
                 for b in sorted(buckets):
-                    for s in sorted(buckets[b], key=lambda x: x['quality_score'], reverse=True)[:per_bucket]:
+                    for s in sorted(buckets[b], key=lambda x: x['quality_score'] + x.get('energy_score', 0.0), reverse=True)[:per_bucket]:
                         if len(chosen) >= AI_SCORE_LIMIT:
                             break
                         chosen.setdefault(id(s), s)
@@ -11342,6 +11400,13 @@ def _run_trailer_job(jid, params):
             _ai_progress_lock = threading.Lock()
 
             def _ask_vision(b64, budget, allow_thinking, structured=True):
+                imgs = list(b64) if isinstance(b64, (list, tuple)) else [b64]
+                pr = ai_prompt
+                if len(imgs) > 1:
+                    pr = (f'The {len(imgs)} images are frames from ONE shot, in order. Rate the shot as a whole, '
+                          f'by the strongest moment it contains.\n\n') + pr
+                if structured and AI_STRUCTURED_OK:
+                    pr += hc.tag_prompt_suffix()
                 """One /api/generate call. Returns (text, response_json).
 
                 Two things fight us on a chatty reasoning model like qwen3-vl:
@@ -11358,7 +11423,7 @@ def _run_trailer_job(jid, params):
                 `structured=False` is the fallback for older Ollama builds that
                 reject the `format` field."""
                 payload = {
-                    'model': model, 'prompt': ai_prompt, 'stream': False, 'images': [b64],
+                    'model': model, 'prompt': pr, 'stream': False, 'images': imgs,
                     # Near-greedy decoding: scene ranking should be reproducible
                     # across runs of the same source, and the default sampling
                     # temperature made scores jitter between jobs.
@@ -11370,6 +11435,8 @@ def _run_trailer_job(jid, params):
                         'properties': {
                             'score': {'type': 'integer', 'minimum': 1, 'maximum': 5},
                             'desc': {'type': 'string'},
+                            'tags': {'type': 'array', 'maxItems': 3,
+                                     'items': {'type': 'string', 'enum': list(hc.TAGS)}},
                         },
                         'required': ['score', 'desc'],
                     }
@@ -11440,8 +11507,11 @@ def _run_trailer_job(jid, params):
                 return desc, (int(score_m.group(1)) if score_m else None)
 
             def _score_one_ai(ai_i, s):
-                _, buf = cv2.imencode('.jpg', s['frame'], [cv2.IMWRITE_JPEG_QUALITY, 85])
-                b64 = base64.b64encode(buf.tobytes()).decode()
+                if len(s.get('thumbs') or []) > 1:
+                    b64 = [base64.b64encode(t).decode() for t in s['thumbs']]
+                else:
+                    _, buf = cv2.imencode('.jpg', s['frame'], [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    b64 = base64.b64encode(buf.tobytes()).decode()
                 global AI_STRUCTURED_OK
                 try:
                     # Retry on an UNPARSEABLE reply, not merely an empty one: a
@@ -11476,7 +11546,9 @@ def _run_trailer_job(jid, params):
                               f'raw={txt[:300]!r}')
                     s['ai_desc'] = desc
                     s['vision_score'] = score if score is not None else AI_NEUTRAL_SCORE
-                    s['total_score'] = s['quality_score'] + s['vision_score']
+                    s['tags'] = hc.parse_tags(txt)
+                    s['tag_bonus'] = hc.tag_bonus(s['tags'], genre)
+                    s['total_score'] = s['quality_score'] + s['vision_score'] + s['tag_bonus']
                 except Exception as e:
                     print(f'AI vision request failed for scene {ai_i+1}, defaulting to {AI_NEUTRAL_SCORE}: {e}')
                     s['vision_score'] = AI_NEUTRAL_SCORE
@@ -11493,6 +11565,34 @@ def _run_trailer_job(jid, params):
             # reasonable default for a typical self-hosted single-GPU setup.
             with ThreadPoolExecutor(max_workers=min(AI_SCORE_WORKERS, n_scenes_ai or 1)) as ex:
                 list(ex.map(lambda pair: _score_one_ai(*pair), enumerate(ai_pool)))
+
+            # A 1-5 score per frame bunches around 3-4, so the front-runners are compared directly: one
+            # request shows the model the best few side by side and asks for an order.
+            if hc.RANK_TOP >= 3:
+                try:
+                    _top = sorted([x for x in ai_pool if x.get('thumbs') and x.get('vision_score')],
+                                  key=lambda x: x['total_score'] + x.get('energy_score', 0.0), reverse=True)[:hc.RANK_TOP]
+                    if len(_top) >= 3:
+                        job_set(jid, percent=30, step='Comparing the best candidates')
+                        _imgs = [base64.b64encode(x['thumbs'][len(x['thumbs']) // 2]).decode() for x in _top]
+                        _rp = {'model': model, 'stream': False, 'images': _imgs,
+                               'prompt': hc.build_rank_prompt(len(_top), genre, params.get('priority_prompt'),
+                                                              params.get('negative_prompt')),
+                               'options': {'temperature': 0.1, 'num_predict': 120}, 'think': False}
+                        if AI_STRUCTURED_OK:
+                            _rp['format'] = {'type': 'object', 'required': ['order'],
+                                             'properties': {'order': {'type': 'array', 'items': {'type': 'integer'}}}}
+                        _rr = requests.post(f'{OLLAMA_URL}/api/generate', json=_rp, timeout=240).json()
+                        _order = hc.parse_order((_rr.get('response') or '').strip(), len(_top))
+                        if _order:
+                            for pos, idx in enumerate(_order):
+                                b = hc.rank_bonus(pos, len(_top))
+                                _top[idx]['rank_bonus'] = b
+                                _top[idx]['total_score'] += b
+                        else:
+                            print('Ranking pass gave no usable order; scores unchanged.')
+                except Exception as e:
+                    print(f'Ranking pass skipped: {e}')
             # Scoring for this job is now genuinely finished -- every frame's
             # /api/generate call above has returned, since list(ex.map(...))
             # blocks until they all have. Transcription (faster-whisper,
@@ -11506,6 +11606,8 @@ def _run_trailer_job(jid, params):
         else:
             for s in scenes_data:
                 s['total_score'] = s['quality_score']
+        for s in scenes_data:
+            s['total_score'] += s.get('energy_score', 0.0) * hc.ENERGY_WEIGHT
 
         # Dialogue transcription (faster-whisper) — improves scene selection and
         # cutting several ways:
@@ -11574,6 +11676,15 @@ def _run_trailer_job(jid, params):
                 # behavior below rather than half-applying it.
                 transcribe_for_cuts = False
                 whisper_enhance = False
+
+        for pin in params.get('pinned_scenes') or []:
+            for s in scenes_data:
+                if s.get('material') == pin.get('material') and abs(s['start'] - pin['start']) < 0.15:
+                    s['pinned'] = True
+        if not (params.get('script_cues') or []):
+            _dups = hc.dedupe_penalties(scenes_data)
+            if _dups:
+                job_set(jid, step=f'{_dups} near-identical shot(s) ranked below different ones')
 
         # "Edit to music": prep the BGM *before* picking scenes so cut points can be
         # snapped onto its beat grid. Only worth the extra generation pass when the
@@ -11723,7 +11834,7 @@ def _run_trailer_job(jid, params):
                 # us from filling the duration budget, it's better to allow some
                 # clustering than to ship a trailer that's noticeably short.
                 min_gap = max(1.0, base_min_gap - pass_attempt * (base_min_gap / 4))
-                scenes_data.sort(key=lambda x: x['total_score'], reverse=True)
+                scenes_data.sort(key=lambda x: (1 if x.get('pinned') else 0, x['total_score']), reverse=True)
                 # Start from narration's picks (if any), not from empty -- the
                 # min_gap check below against every scene already in `selected`
                 # naturally excludes both those exact scenes (distance 0 from
@@ -11755,13 +11866,17 @@ def _run_trailer_job(jid, params):
                     # scene happened to land at a numerically close local
                     # timecode -- exactly the shape of "script detected the
                     # cue but didn't select it" a real report described.
-                    if any(abs(s['start'] - c['start']) < min_gap and s.get('material') == c.get('material')
-                           for c in selected):
+                    if not s.get('pinned') and any(
+                            abs(s['start'] - c['start']) < min_gap and s.get('material') == c.get('material')
+                            for c in selected):
                         continue
                     seg_dur = min(s['duration'], remaining)
                     if max_scene_dur:
                         seg_dur = min(seg_dur, max_scene_dur)
                     seg_start = s['start']
+                    if seg_dur < s['duration'] - 0.3:
+                        # Using only part of the scene: take the part with the peak, not its first seconds.
+                        seg_start = hc.pick_window(s, seg_dur)
                     if transcribe_for_cuts and word_starts:
                         # Don't start playback mid-word — nudge the in-point forward to
                         # the start of the nearest word within this scene (capped so we
@@ -11827,7 +11942,7 @@ def _run_trailer_job(jid, params):
         # the flash-cut problem that rule exists to prevent.
         if selected and shortfall > 0.15:
             last = selected[-1]
-            slack = last['duration'] - last['selected_dur']
+            slack = (last['start'] + last['duration']) - (last.get('trim_start', last['start']) + last['selected_dur'])
             if slack > 0.05:
                 grow = min(slack, shortfall)
                 new_end = last['trim_start'] + last['selected_dur'] + grow
@@ -11887,6 +12002,8 @@ def _run_trailer_job(jid, params):
                 if seg_dur < min_seg_dur:
                     continue
                 seg_start = cand['start']
+                if seg_dur < cand['duration'] - 0.3:
+                    seg_start = hc.pick_window(cand, seg_dur)
                 if transcribe_for_cuts and word_starts:
                     snapped_start = nearest_word_boundary(seg_start, word_starts, max_snap=0.45, hard_limit=seg_start + seg_dur)
                     if seg_start < snapped_start < seg_start + seg_dur:
@@ -12008,6 +12125,11 @@ def _run_trailer_job(jid, params):
                 delta = step * (head / total_head)
                 delta = min(delta, head) if delta > 0 else max(delta, -head)
                 s['selected_dur'] += delta
+                # A clip taken from the middle of its scene (the window around the peak) that grows past the
+                # scene's end moves earlier instead, so it never asks for footage the scene does not have.
+                _scene_end = s['start'] + s['duration']
+                if s.get('trim_start', s['start']) + s['selected_dur'] > _scene_end + 1e-6:
+                    s['trim_start'] = max(s['start'], _scene_end - s['selected_dur'])
                 total_sel += delta
                 residual -= delta
 
@@ -12134,7 +12256,8 @@ def _run_trailer_job(jid, params):
                     continue
                 cand = dict(cand)
                 cand.setdefault('selected_dur', min(cand['duration'], max_scene_dur or cand['duration']))
-                cand.setdefault('trim_start', cand['start'])
+                if 'trim_start' not in cand:
+                    cand['trim_start'] = hc.pick_window(cand, cand['selected_dur'])
                 alternates.append(cand)
 
         def _thumb(scene, tag, i):
@@ -12205,7 +12328,9 @@ def _run_trailer_job(jid, params):
                      'ai_desc': s.get('ai_desc', ''), 'has_face': s.get('has_face', False),
                      'vo_beat': s.get('vo_beat'), 'vo_match': s.get('vo_match'), 'cut': s.get('cut'),
                      'script_boost': s.get('script_boost'), 'script_desc': s.get('script_desc'),
-                     'edge_ratio': s.get('edge_ratio', 0), 'mean_hue': s.get('mean_hue', 0)}
+                     'edge_ratio': s.get('edge_ratio', 0), 'mean_hue': s.get('mean_hue', 0),
+                     'energy_score': s.get('energy_score', 0), 'tags': s.get('tags') or [],
+                     'pinned': bool(s.get('pinned'))}
                     for s in rows]
 
         slim = _slim(selected)
@@ -12253,6 +12378,10 @@ def _run_trailer_job(jid, params):
                 reasons.append(f'Script cue (+{s.get("script_boost"):.1f}): "{desc_txt}"')
             if s.get('vision_score'):
                 reasons.append(f"AI vision {s.get('vision_score')}")
+            if s.get('tags'):
+                reasons.append('tagged ' + ', '.join(s['tags']))
+            if s.get('energy_score'):
+                reasons.append(f"energy +{s['energy_score']:g}")
             if s.get('has_face'):
                 reasons.append('face present')
             if not reasons:
@@ -12277,7 +12406,9 @@ def _run_trailer_job(jid, params):
             video_filename=video_filename,
             selection=selection_info,
             scenes=[{'scene': i + 1, 'start': round(s['start'], 1), 'end': round(s['end'], 1),
-                     'quality': s['total_score'], 'duration': round(s['selected_dur'], 1),
+                     'quality': round(s['total_score'], 1), 'duration': round(s['selected_dur'], 1),
+                     'pinned': bool(s.get('pinned')), 'tags': s.get('tags') or [],
+                     'energy': s.get('energy_score') or 0,
                      'quality_score': s.get('quality_score', 0),
                      'vision_score': s.get('vision_score'),
                      'speech_score': s.get('speech_score', 0),
@@ -12302,7 +12433,8 @@ def _run_trailer_job(jid, params):
                      'description': _scene_desc(s), 'thumb': thumbs[i]}
                     for i, s in enumerate(selected)],
             alternates=[{'alt': i + 1, 'start': round(s['start'], 1), 'end': round(s['end'], 1),
-                         'quality': s['total_score'], 'duration': round(s['selected_dur'], 1),
+                         'quality': round(s['total_score'], 1), 'duration': round(s['selected_dur'], 1),
+                         'tags': s.get('tags') or [], 'energy': s.get('energy_score') or 0,
                          'quality_score': s.get('quality_score', 0),
                          'vision_score': s.get('vision_score'),
                          'speech_score': s.get('speech_score', 0),

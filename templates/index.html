@@ -4800,6 +4800,8 @@ async function submitTrailer(previewOnly){
   }
 
   if(episodicProjectId()) fd.append('project_id', episodicProjectId())
+  var _pinsHere = (window._pins || []).filter(function(p){ return p.src === _trSourceKey() })
+  if(_pinsHere.length) fd.append('pinned_scenes', JSON.stringify(_pinsHere))
 
   let startData
   try{
@@ -5225,6 +5227,8 @@ function buildSceneCard(s, cls, num, checked, badge, overlayPlay){
   if(s.vision_score != null) chips.push('<span class="score-chip" title="AI vision">AI '+s.vision_score+'</span>')
   if(s.speech_score) chips.push('<span class="score-chip speech" title="Dialogue">Dlg '+s.speech_score+'</span>')
   if(s.has_face) chips.push('<span class="score-chip face" title="Face detected">Face</span>')
+  if(s.energy) chips.push('<span class="score-chip" title="Loud peak, held beat or movement in this scene">Energy +'+s.energy+'</span>')
+  ;(s.tags || []).forEach(function(t){ chips.push('<span class="score-chip" title="What the AI saw in the shot">'+escapeHtmlLite(t)+'</span>') })
   if(s.script_boost) chips.push('<span class="score-chip script" title="Boosted by a matched script/manual timecode">Script +'+s.script_boost+'</span>')
   if(s.cut){
     var cin = s.cut['in'], cout = s.cut.out, rank = {clean: 0, silent: 0, word: 1, tight: 2, clipped: 3}
@@ -5249,7 +5253,63 @@ function buildSceneCard(s, cls, num, checked, badge, overlayPlay){
     (s.script_desc ? '<div class="vo-beat-line" title="Script/manual timecode cue this clip was matched to">Cue: '+escapeHtmlLite(s.script_desc)+'</div>' : '') +
     '<div style="opacity:.6;margin-top:4px">'+escapeHtmlLite(s.description||'')+'</div>' +
     '</div>'
+  if(cls === 'tr-preview-pick') addSceneActions(card, s)
   return card
+}
+
+// Pin keeps a scene in the cut through every later Preview of this footage; Swap trades a scene for the
+// best runner-up that is not already in.
+window._pins = window._pins || []
+// What the footage is, so a pin made on one source is never applied to another.
+function _trSourceKey(){
+  var fi = document.getElementById('tr-file-input'), net = document.getElementById('tr-network-file'),
+      mats = document.getElementById('tr-materials-network')
+  if(fi && fi.files && fi.files[0]) return 'f:' + fi.files[0].name + ':' + fi.files[0].size
+  return 'n:' + ((net && net.value) || '') + '|' + ((mats && mats.value) || '')
+}
+function _pinIndex(s){
+  for(var i = 0; i < window._pins.length; i++){
+    var p = window._pins[i]
+    if(p.src === _trSourceKey() && p.material === s.material && Math.abs(p.start - s.start) < 0.15) return i
+  }
+  return -1
+}
+function addSceneActions(card, s){
+  var bar = document.createElement('div')
+  bar.className = 'scene-actions'
+  bar.style.cssText = 'display:flex;gap:6px;align-items:center;padding:0 10px 8px;font-size:10px'
+  bar.innerHTML = '<button type=button class="btn scene-swap" style="padding:3px 8px;font-size:10px">Swap</button>' +
+                  '<button type=button class="btn scene-pin" style="padding:3px 8px;font-size:10px"></button>' +
+                  '<span class="scene-note" style="opacity:.7"></span>'
+  card.appendChild(bar)
+  var cb = card.querySelector('input[type=checkbox]')
+  var swap = bar.querySelector('.scene-swap'), pin = bar.querySelector('.scene-pin'), note = bar.querySelector('.scene-note')
+  if(s.pinned && _pinIndex(s) < 0) window._pins.push({material: s.material, start: s.start, src: _trSourceKey()})
+  function paint(){
+    var on = _pinIndex(s) >= 0
+    pin.textContent = on ? 'Pinned' : 'Pin'
+    pin.title = on ? 'Stays in the cut when you preview again. Click to release.' : 'Keep this scene in the cut when you preview again.'
+    pin.style.borderColor = on ? 'var(--amber)' : ''
+    swap.disabled = on
+    if(on){ cb.checked = true }
+    cb.disabled = on
+    updatePreviewKept()
+  }
+  pin.addEventListener('click', function(){
+    var i = _pinIndex(s)
+    if(i >= 0) window._pins.splice(i, 1); else window._pins.push({material: s.material, start: s.start, src: _trSourceKey()})
+    note.textContent = ''
+    paint()
+  })
+  swap.addEventListener('click', function(){
+    var next = altPicks().filter(function(c){ return !c.checked })[0]
+    if(!next){ note.textContent = 'No more clips to swap in'; return }
+    next.checked = true
+    cb.checked = false
+    note.textContent = 'Swapped for Alt ' + next.dataset.scene
+    updatePreviewKept()
+  })
+  paint()
 }
 
 function toggleAlternates(){
