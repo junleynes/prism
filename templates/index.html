@@ -13824,6 +13824,7 @@ function switchDocs(btn){
   <div class="sub-tab" onclick="switchSubTab('p-config-branding',this)" role="button" tabindex="0">Branding</div>
   <div class="sub-tab" onclick="switchSubTab('p-config-security',this)" role="button" tabindex="0">Security</div>
   <div class="sub-tab" onclick="switchSubTab('p-config-users',this)" role="button" tabindex="0">Users</div>
+  <div class="sub-tab" onclick="switchSubTab('p-config-storage',this); if(typeof loadStorageTab==='function') loadStorageTab()" role="button" tabindex="0">Storage</div>
   <div class="sub-tab" onclick="switchSubTab('p-config-audit',this); if(typeof loadAuditLog==='function') loadAuditLog()" role="button" tabindex="0">Audit Log</div>
 </div>
 
@@ -13988,6 +13989,13 @@ function switchDocs(btn){
 <p style="margin-top:6px;color:var(--ink-dim)">Full user and group management, right here.</p>
 <div id="config-users-status"></div>
 <div id="config-users-rows"><p style="opacity:.7">Loading&hellip;</p></div>
+</div>
+
+<div id="p-config-storage" class="sub-panel">
+<h3 style="margin-top:0">Storage</h3>
+<p style="margin-top:6px;color:var(--ink-dim)">What is using the drive, how long finished work is kept, and the free-space floor below which a render is refused. Admin only.</p>
+<div id="storage-body"><p style="opacity:.7">Loading&hellip;</p></div>
+<span id="storage-status" style="font-size:12px"></span>
 </div>
 
 <div id="p-config-audit" class="sub-panel">
@@ -14748,6 +14756,86 @@ async function loadAdminJobs(){
   }
 }
 window.loadAdminJobs = loadAdminJobs
+
+
+// ---- Config > Storage ----
+function stFmt(b){
+  if(b >= 1024*1024*1024*1024) return (b/(1024*1024*1024*1024)).toFixed(2) + ' TB'
+  if(b >= 1024*1024*1024) return (b/(1024*1024*1024)).toFixed(1) + ' GB'
+  if(b >= 1024*1024) return (b/(1024*1024)).toFixed(0) + ' MB'
+  return Math.max(0, Math.round(b/1024)) + ' KB'
+}
+function stStatus(msg, bad){
+  var el = document.getElementById('storage-status')
+  if(el){ el.textContent = msg || ''; el.style.color = bad ? 'var(--tally)' : 'var(--phosphor)' }
+}
+async function loadStorageTab(){
+  var box = document.getElementById('storage-body')
+  if(!box) return
+  try{
+    var d = await (await fetch('/api/admin/storage')).json()
+    if(!d.ok){ box.innerHTML = '<p style="color:var(--amber)">' + escapeHtmlLite(d.error || 'Not available.') + '</p>'; return }
+    var vols = d.volumes.map(function(v){
+      var used = v.total - v.free, pct = v.total ? Math.round(100 * used / v.total) : 0
+      return '<div style="margin:0 0 10px"><div style="font-size:12px;margin-bottom:4px">' + escapeHtmlLite(v.labels.join(' + ')) +
+        ' <span style="opacity:.65">&mdash; ' + stFmt(v.free) + ' free of ' + stFmt(v.total) + '</span></div>' +
+        '<div style="height:8px;border-radius:4px;background:var(--sunken);overflow:hidden"><div style="height:100%;width:' + pct + '%;background:' +
+        (pct > 90 ? 'var(--tally)' : 'var(--phosphor)') + '"></div></div></div>'
+    }).join('')
+    var kinds = Object.keys(d.kinds).map(function(k){
+      var g = d.kinds[k]
+      var rows = g.largest.map(function(i){
+        var age = i.created ? Math.max(0, Math.round((Date.now()/1000 - i.created) / 86400)) + ' d' : '—'
+        return '<tr><td style="padding:4px 8px">' + escapeHtmlLite(i.name) + (i.owner ? ' <span style="opacity:.55">' + escapeHtmlLite(i.owner) + '</span>' : '') +
+          '</td><td style="padding:4px 8px;white-space:nowrap">' + stFmt(i.bytes) + '</td><td style="padding:4px 8px">' + age + '</td>' +
+          '<td style="padding:4px 8px"><label style="cursor:pointer;white-space:nowrap"><input type=checkbox data-st-pin="' + k + ':' + escapeHtmlLite(i.id) + '"' +
+          (i.pinned ? ' checked' : '') + '> keep</label></td></tr>'
+      }).join('')
+      return '<div class=card style="margin-top:12px"><div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">' +
+        '<strong style="flex:1;min-width:180px">' + escapeHtmlLite(g.label) + ' <span style="font-weight:400;opacity:.65">&mdash; ' + g.count + ' &middot; ' + stFmt(g.bytes) + '</span></strong>' +
+        '<label style="font-size:12px">Keep for <input type=number min=0 max=3650 class=input-box data-st-days="' + k + '" value="' + g.retention_days + '" style="width:80px;margin:0 4px"> days <span style="opacity:.6">(0 = forever)</span></label></div>' +
+        (rows ? '<div style="overflow-x:auto;margin-top:8px"><table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="text-align:left;opacity:.6"><th style="padding:4px 8px">Largest items</th><th style="padding:4px 8px">Size</th><th style="padding:4px 8px">Age</th><th></th></tr>' + rows + '</table></div>' : '') +
+        '</div>'
+    }).join('')
+    box.innerHTML = '<div class=card>' + vols +
+      '<p style="font-size:12px;margin:8px 0 0">Temp / uploads folder: <strong>' + stFmt(d.temp.bytes) + '</strong> &middot; files older than ' + d.temp.ttl_hours +
+      ' h are swept automatically' + (d.temp.cap_gb ? ' &middot; capped at ' + d.temp.cap_gb + ' GB' : '') + '.</p>' +
+      '<p style="font-size:12px;margin:10px 0 0">Refuse a render when less than <input type=number min=0 step=0.5 class=input-box id=st-minfree value="' + d.min_free_gb +
+      '" style="width:80px;margin:0 4px"> GB is free (0 = never refuse).</p></div>' + kinds +
+      '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px">' +
+      '<button type=button class=btn id=st-save>Save retention &amp; limit</button>' +
+      '<button type=button class=btn id=st-clean style="color:var(--tally);border-color:var(--tally)">Clean now</button>' +
+      '<span style="font-size:12px;opacity:.7">' + (d.due.items ? d.due.items + ' item(s), ' + stFmt(d.due.bytes) + ' are past their retention and will go' : 'Nothing is past its retention.') +
+      ' Anything marked <em>keep</em> is never removed.</span></div>'
+    document.getElementById('st-save').onclick = saveStorageSettings
+    document.getElementById('st-clean').onclick = function(){
+      if(!confirm('Delete everything past its retention now (' + d.due.items + ' item(s), ' + stFmt(d.due.bytes) + ')? This cannot be undone.')) return
+      stClean()
+    }
+    box.querySelectorAll('[data-st-pin]').forEach(function(c){
+      c.onchange = async function(){
+        var r = await (await fetch('/api/admin/storage/pin', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({key: c.getAttribute('data-st-pin'), pinned: c.checked})})).json()
+        if(!r.ok){ stStatus(r.error || 'Could not change that.', true); c.checked = !c.checked }
+      }
+    })
+  }catch(e){ box.innerHTML = '<p style="color:var(--amber)">Error: ' + e + '</p>' }
+}
+async function saveStorageSettings(){
+  var days = {}
+  document.querySelectorAll('[data-st-days]').forEach(function(i){ days[i.getAttribute('data-st-days')] = i.value })
+  var r = await (await fetch('/api/admin/storage/settings', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({retention_days: days, min_free_gb: document.getElementById('st-minfree').value})})).json()
+  stStatus(r.ok ? 'Saved.' : (r.error || 'Could not save.'), !r.ok)
+  if(r.ok) loadStorageTab()
+}
+async function stClean(){
+  stStatus('Cleaning…')
+  var r = await (await fetch('/api/admin/storage/clean', {method:'POST'})).json()
+  stStatus(r.ok ? 'Removed ' + r.items + ' item(s), freed ' + stFmt(r.bytes + r.temp_bytes) + (r.failed ? '; ' + r.failed + ' in use and skipped.' : '.') : (r.error || 'Failed.'), !r.ok)
+  loadStorageTab()
+}
+window.loadStorageTab = loadStorageTab
 
 var usersTabLoaded = false
 var USERS_TAB_DATA = null  // last-fetched users/groups/permissions, reused by action handlers below without a re-fetch

@@ -1902,6 +1902,14 @@ def run_trailer_job_gated(jid, params, runner=None):
         with GATE.cond:
             GATE.cond.notify_all()            # the next in line may now be within reach of a free slot
         job_set(jid, step='Starting', percent=1, status='running')
+        try:
+            import storage
+            low = storage.low_space_error()
+        except Exception:                                       # noqa: BLE001 -- the guard must never block work by itself failing
+            low = None
+        if low:
+            job_set(jid, error=low)
+            return
         (runner or run_trailer_job)(jid, params)
     finally:
         # Only release a slot this job actually acquired -- a real,

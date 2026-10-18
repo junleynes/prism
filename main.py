@@ -19,6 +19,7 @@ from pipeline import (
 import pipeline         # noqa: F401 -- exposed as main.pipeline (tests patch it)
 import shorts           # noqa: F401 -- registers the Vertical Shorts tab's /api/shorts/* routes
 import schedule         # noqa: F401 -- registers the Schedule Plug tab's /api/schedule/* routes
+import storage          # noqa: F401 -- Config > Storage: retention, disk guard, usage
 
 
 @app.route('/')
@@ -113,6 +114,7 @@ load_config_overrides()
 if __name__ == '__main__':
     print(' * Server starting...')
     threading.Thread(target=_sweeper_loop, daemon=True).start()
+    storage.start_background()
     sweep_upload_folder()
     _free = free_disk_mb()
     if _free is not None:
