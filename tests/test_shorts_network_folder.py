@@ -51,7 +51,7 @@ def _admin():
 def test_it_is_a_video_category_of_its_own():
     assert 'shorts' in library_db.NETWORK_CATEGORY_KEYS
     cats = pipeline._network_categories()
-    assert cats['shorts']['exts'] == cats['hires']['exts'] and cats['shorts']['fallback'] == 'hires'
+    assert cats['shorts']['exts'] == set(cats['hires']['exts']) | {'mxf'} and cats['shorts']['fallback'] == 'hires'
     assert set(cats) == set(library_db.NETWORK_CATEGORY_KEYS), 'every stored category is browsable and vice versa'
     assert pipeline._network_category('shorts') is not pipeline._network_category('hires')
 
@@ -287,3 +287,22 @@ def test_the_captions_folder_reads_the_shorts_folder_and_through_it_hires(folder
     library_db.save_network_folder('shorts', dict(SHORTS))
     assert pipeline._network_share_root('captions') == pipeline._network_share_root('shorts')
     assert pipeline._network_categories()['captions']['exts'] == {'srt', 'vtt', 'scc'}
+
+
+def test_title_and_end_card_picks_can_be_read_in_place_too(folders, monkeypatch):
+    client, headers = _admin()
+    for cat in ('tcard', 'endcard'):
+        r = client.post('/api/network/shares', json={'category': cat, 'path': r'\\fileserver\media\cards',
+                                                     'username': 'promo', 'password': 'p1', 'in_place': True}, headers=headers)
+        assert r.status_code == 200
+        row = client.get('/api/network/shares').get_json()['categories'][cat]
+        assert row['can_in_place'] is True and row['in_place'] is True
+    monkeypatch.setattr(pipeline, '_readable_in_place', lambda p: True)
+    monkeypatch.setattr(pipeline.os.path, 'getsize', lambda p: 123)
+    copied = []
+    monkeypatch.setattr(pipeline, 'fetch_network_file', lambda *a, **k: copied.append(a))
+    with mock.patch.object(pipeline.smbclient, 'register_session'):
+        got = pipeline.stage_network_file('TCARD_101.mov', 'tcard', '')
+    assert got['in_place'] and not copied
+    assert pipeline.staged_path(got['local_name']) == got['path'] == r'\\fileserver\media\cards\TCARD_101.mov'
+    assert not pipeline.inside_uploads(got['path']), 'a card read in place is never cleaned up like a copy'

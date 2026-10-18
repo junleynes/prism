@@ -696,7 +696,7 @@ def staged_origin(local_name):
 # for browsing and copying is a library inside this process, not something
 # ffmpeg or OpenCV can read through); when it cannot, the pick falls back to
 # a copy, so the setting can never make a file unusable.
-INPLACE_CATEGORIES = ('shorts', 'hires')
+INPLACE_CATEGORIES = ('shorts', 'hires', 'tcard', 'endcard')
 INPLACE = {}            # staged name -> {'path', 'category', 'subpath', 'name'}
 INPLACE_ORIGINS = {}    # path on the share -> {'category', 'subpath', 'name'}
 
