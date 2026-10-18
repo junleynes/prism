@@ -3996,7 +3996,7 @@ def test_caption_lines_take_their_in_and_out_from_the_playhead_and_the_sound_eff
     client, _ = _client()
     html = client.get('/').get_data(as_text=True)
     for needle in ('data-bar="in"', 'data-bar="out"', 'function setEdge(', "ev.key !== '[' && ev.key !== ']'",
-                   'class="sh-sfx"', '.sh-end-ctrl>.sh-note,.sh-end-ctrl>.sh-sfx{grid-column:1/-1}'):
+                   'class="sh-sfx"', '.sh-end-ctrl>.sh-note,.sh-end-ctrl>.sh-sfx,.sh-end-ctrl>.sh-overlay{grid-column:1/-1}'):
         assert needle in html, needle
 
 
