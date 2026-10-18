@@ -3,6 +3,7 @@
 Split out of the original monolith -- self-contained aside from `app`
 (for the upload folder path), `database` (the PostgreSQL pool) and stdlib.
 """
+import settings_store
 import os, uuid, time, json, shutil, re
 from core import app
 import database
@@ -476,10 +477,9 @@ def load_branding():
            'landing_enabled': True,
            # Off: no "Request access" -- accounts are only created by an admin.
            'registration_enabled': True}
-    if os.path.exists(BRANDING_FILE):
+    saved = settings_store.load(BRANDING_FILE)
+    if isinstance(saved, dict):
         try:
-            with open(BRANDING_FILE) as f:
-                saved = json.load(f)
             for k in cfg:
                 # 'footer' deliberately allows an explicit '' to be read back
                 # (clearing it is a real, valid state, not "unset" the way a
@@ -503,8 +503,7 @@ def _write_branding(cfg):
     # the presets themselves editable in code without stale resolved values
     # lingering in old branding_config.json files.
     to_write = {k: v for k, v in cfg.items() if k != 'theme_colors'}
-    with open(BRANDING_FILE, 'w') as f:
-        json.dump(to_write, f, indent=2)
+    settings_store.save(BRANDING_FILE, to_write)
 
 def save_branding_text(name=None, tagline=None, footer=None):
     cfg = load_branding()
@@ -638,11 +637,10 @@ def load_disabled_services():
     """Set of service names an admin has manually disabled. Never raises --
     a missing or corrupt file just means nothing is disabled, same as a
     fresh install."""
-    if not os.path.exists(SERVICE_OVERRIDES_FILE):
+    data = settings_store.load(SERVICE_OVERRIDES_FILE)
+    if not isinstance(data, dict):
         return set()
     try:
-        with open(SERVICE_OVERRIDES_FILE) as f:
-            data = json.load(f)
         return {s for s in data.get('disabled', []) if s in KNOWN_SERVICES}
     except Exception as e:
         print(f'Service overrides load error ({SERVICE_OVERRIDES_FILE}): {e}')
@@ -656,8 +654,7 @@ def set_service_disabled(name, disabled):
         current.add(name)
     else:
         current.discard(name)
-    with open(SERVICE_OVERRIDES_FILE, 'w') as f:
-        json.dump({'disabled': sorted(current)}, f, indent=2)
+    settings_store.save(SERVICE_OVERRIDES_FILE, {'disabled': sorted(current)})
     return True, None
 
 # ---- Per-folder network paths ----
@@ -680,11 +677,10 @@ def load_network_folders():
     callers should treat that the same as one present with every field
     blank (not reachable until configured), there is no fallback source to
     pull from."""
-    if not os.path.exists(NETWORK_FOLDERS_FILE):
+    data = settings_store.load(NETWORK_FOLDERS_FILE)
+    if not isinstance(data, dict):
         return {}
     try:
-        with open(NETWORK_FOLDERS_FILE) as f:
-            data = json.load(f)
         out = {cat: {k: v.get(k, '') for k in _NETWORK_FOLDER_FIELDS}
                for cat, v in data.items() if cat in NETWORK_CATEGORY_KEYS and isinstance(v, dict)}
         plain = any(r.get('password') and not secretbox.is_encrypted(r['password']) for r in out.values())
@@ -730,10 +726,7 @@ def _write_network_folders(folders):
         if not row.get('in_place'):
             row.pop('in_place', None)             # kept in the file only where it is on
         out[cat] = row
-    tmp = NETWORK_FOLDERS_FILE + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(out, f, indent=2)
-    os.replace(tmp, NETWORK_FOLDERS_FILE)
+    settings_store.save(NETWORK_FOLDERS_FILE, out)
 
 library_db_init()
 

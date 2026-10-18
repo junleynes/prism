@@ -212,3 +212,10 @@ CREATE TABLE IF NOT EXISTS show_templates (
     end_card_vo_file    TEXT,
     end_card_vo_name    TEXT
 );
+
+-- Saved settings (Config tab, production defaults, branding, network folders, storage): see settings_store.py.
+CREATE TABLE IF NOT EXISTS app_settings (
+    name        TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  DOUBLE PRECISION NOT NULL
+);

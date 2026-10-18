@@ -21,6 +21,7 @@ import time
 from flask import jsonify, request, session
 
 import core
+import settings_store
 from core import app, _client_ip
 import library_db
 from library_db import LIBRARY_DIR, audit_log
@@ -44,10 +45,8 @@ _PIN_KEY = re.compile(r'^(trailers|shorts|schedule):[\w.-]{1,80}$')
 
 def load_settings():
     cfg = {'retention_days': {k: 0 for k in KINDS}, 'min_free_gb': DEFAULT_MIN_FREE_GB, 'pinned': []}
-    try:
-        with open(CONFIG_FILE, encoding='utf-8') as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
+    raw = settings_store.load(CONFIG_FILE)
+    if raw is None:
         return cfg
     if not isinstance(raw, dict):
         return cfg
@@ -66,10 +65,7 @@ def load_settings():
 
 def save_settings(cfg):
     with _LOCK:
-        tmp = CONFIG_FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, indent=1)
-        os.replace(tmp, CONFIG_FILE)
+        settings_store.save(CONFIG_FILE, cfg)
 
 
 # --------------------------------------------------------------------------

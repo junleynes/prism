@@ -14,6 +14,7 @@ safer done incrementally against a real render on the actual server, where
 the AI services, ffmpeg, and real footage can actually be exercised --
 not blind in a sandbox that has none of those available.
 """
+import settings_store
 import os, cv2, numpy as np, tempfile, threading, time, pathlib, base64, json, requests, subprocess, shutil, re, uuid, secrets, io, mimetypes, hashlib
 from xml.sax.saxutils import escape as xml_escape
 from concurrent.futures import ThreadPoolExecutor
@@ -966,13 +967,8 @@ def load_config_overrides():
     """Applies any saved Config-tab overrides on top of the env-var defaults above.
     Called once at startup, after every constant it might touch is already defined."""
     global FISH_AUDIO_URL, FISH_AUDIO_API_KEY, WHISPER_URL, OLLAMA_URL, ACE_STEP_URL, ACE_STEP_API_KEY, WOOSH_URL
-    if not os.path.exists(CONFIG_FILE):
-        return
-    try:
-        with open(CONFIG_FILE) as f:
-            cfg = json.load(f)
-    except Exception as e:
-        print(f'Config file load error ({CONFIG_FILE}): {e}')
+    cfg = settings_store.load(CONFIG_FILE)
+    if not isinstance(cfg, dict):
         return
     # API keys are kept encrypted (secretbox); a file saved before that is re-saved encrypted.
     if any(cfg.get(k) and not secretbox.is_encrypted(cfg[k]) for k in _SECRET_CONFIG_KEYS):
@@ -993,23 +989,16 @@ _SECRET_CONFIG_KEYS = ('FISH_AUDIO_API_KEY', 'ACE_STEP_API_KEY')
 
 def _write_config_file(cfg):
     out = {k: (secretbox.encrypt(v) if k in _SECRET_CONFIG_KEYS else v) for k, v in cfg.items()}
-    tmp = CONFIG_FILE + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(out, f, indent=2)
-    os.replace(tmp, CONFIG_FILE)
+    settings_store.save(CONFIG_FILE, out)
 
 
 def save_config_overrides(updates):
     """Merges `updates` (dict of the CONFIGURABLE_SERVICES keys) into the config file
     and applies them to the live module globals immediately — no restart needed."""
     global FISH_AUDIO_URL, FISH_AUDIO_API_KEY, WHISPER_URL, OLLAMA_URL, ACE_STEP_URL, ACE_STEP_API_KEY, WOOSH_URL
-    existing = {}
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                existing = json.load(f)
-        except Exception:
-            existing = {}
+    existing = settings_store.load(CONFIG_FILE)
+    if not isinstance(existing, dict):
+        existing = {}
     existing.update({k: v for k, v in updates.items() if k in CONFIGURABLE_SERVICES})
     _write_config_file(existing)
     if 'FISH_AUDIO_URL' in updates: FISH_AUDIO_URL = updates['FISH_AUDIO_URL'] or FISH_AUDIO_URL
@@ -1080,10 +1069,9 @@ def load_production_defaults():
     built-ins for anything never configured. Always returns a complete dict so
     callers never need their own fallback logic."""
     values = {k: v['default'] for k, v in PRODUCTION_DEFAULT_SPEC.items()}
-    if os.path.exists(PRODUCTION_DEFAULTS_FILE):
+    saved = settings_store.load(PRODUCTION_DEFAULTS_FILE)
+    if isinstance(saved, dict):
         try:
-            with open(PRODUCTION_DEFAULTS_FILE) as f:
-                saved = json.load(f)
             for k, spec in PRODUCTION_DEFAULT_SPEC.items():
                 if k not in saved:
                     continue
@@ -1154,8 +1142,7 @@ def save_production_defaults(updates):
                     current[k] = raw
         except (TypeError, ValueError):
             continue
-    with open(PRODUCTION_DEFAULTS_FILE, 'w') as f:
-        json.dump(current, f, indent=2)
+    settings_store.save(PRODUCTION_DEFAULTS_FILE, current)
     return current
 
 # ---- Branding ----
