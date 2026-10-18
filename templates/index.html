@@ -2029,8 +2029,8 @@ document.addEventListener("DOMContentLoaded", function(){
   <div class="overlay-art-box" style="margin-top:12px">
     <label>Artwork overlay <span style="opacity:.6;font-weight:400">(optional)</span>:</label>
     <div class="browse-row">
-      {% if allow_local_upload %}<input type=file name=overlay_art accept="image/*,video/*" data-net-field="overlay_art">{% endif %}
-      <button type=button class="browse-btn" onclick="openNetworkBrowser('overlay_art','transitions','Overlay artwork')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z"/></svg>Browse library</button>
+      {% if allow_local_upload %}<input type=file name=overlay_art accept="image/*,.psd,.psb" data-net-field="overlay_art">{% endif %}
+      <button type=button class="browse-btn" onclick="openNetworkBrowser('overlay_art','schedule','Animation artwork (image / PSD)')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z"/></svg>Browse library</button>
     </div>
     <input type=hidden id=overlay_art_network name=overlay_art_network value="">
     <span class="net-file-chip" id=overlay_art_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('overlay_art')">&#10005;</span></span>
@@ -2047,7 +2047,7 @@ document.addEventListener("DOMContentLoaded", function(){
         <div><label style="font-size:11px">Holds for (s)</label><input type=number name=overlay_hold value=0 min=0 step=0.5 style="width:80px" title="0 = until the end of the promo"></div>
         <div><label style="font-size:11px">Move takes (s)</label><input type=number name=overlay_anim_dur value=0.5 min=0.1 max=3 step=0.1 style="width:80px"></div>
       </div>
-      <p style="font-size:11px;opacity:.65;margin:4px 0 0">A PNG with transparency, or a video with an alpha channel (ProRes 4444 / QuickTime Animation <code>.mov</code>, VP9 <code>.webm</code>), from the <b>Transitions</b> folder. It appears, holds, then leaves, over the finished promo &mdash; cards included. Holds for 0 means until the end.</p>
+      <p style="font-size:11px;opacity:.65;margin:4px 0 0">A PNG with transparency, a JPEG, or a Photoshop file (its visible layers are flattened, transparency kept), from the <b>Animation artwork</b> folder. It appears, holds, then leaves, over the finished promo &mdash; cards included. Holds for 0 means until the end.</p>
     </div>
   </div>
   <div class="adv-only">

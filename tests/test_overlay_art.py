@@ -72,3 +72,30 @@ def test_corner_artwork_is_scaled_and_placed(tmp_path):
     red = (a[:, :, 0] > 180) & (a[:, :, 1] < 80)
     ys, xs = np.nonzero(red)
     assert xs.min() > 300 and ys.max() < 190          # the half-size artwork sits in the top-right quarter, margin kept
+
+
+def test_photoshop_file_is_flattened_with_transparency(tmp_path):
+    from PIL import Image
+    from psd_tools import PSDImage
+    from psd_tools.api.layers import PixelLayer
+    psd = PSDImage.new('RGBA', (640, 360))
+    psd.append(PixelLayer.frompil(Image.new('RGBA', (260, 70), (255, 0, 0, 255)), psd, 'bar', top=260, left=40))
+    src = str(tmp_path / 'art.psd')
+    psd.save(src)
+    png, tmp = oa.prepare(src, str(tmp_path))
+    im = Image.open(png)
+    assert tmp == png and im.mode == 'RGBA' and im.getpixel((100, 290))[:1] == (255,) and im.getpixel((5, 5))[3] == 0
+    base, _ = _fixtures(tmp_path)
+    dst = str(tmp_path / 'p.mp4')
+    o = oa.clean_options({'overlay_anim': 'fade', 'overlay_start': '1', 'overlay_hold': '3'})
+    assert oa.apply(FF, base, png, dst, o, 6.0)[0]
+    assert _red_at(dst, 0.5) == 0 and _red_at(dst, 2.5) > 5000 and _red_at(dst, 5.5) == 0
+
+
+def test_plain_images_pass_through_and_a_bad_psd_says_so(tmp_path):
+    base, art = _fixtures(tmp_path)
+    assert oa.prepare(art, str(tmp_path)) == (art, None)
+    bad = tmp_path / 'bad.psd'
+    bad.write_bytes(b'not a psd')
+    with pytest.raises(ValueError):
+        oa.prepare(str(bad), str(tmp_path))

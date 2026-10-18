@@ -11,6 +11,25 @@ IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff'}
 MARGIN = 0.04               # of the frame's width, kept between the artwork and the edge
 
 
+def prepare(art, workdir):
+    """(path ffmpeg can read, temp file to delete or None). A Photoshop file is flattened to a PNG with its
+    transparency kept: every visible layer composed as it shows in Photoshop. Raises ValueError when it cannot be read."""
+    if os.path.splitext(art)[1].lower() not in ('.psd', '.psb'):
+        return art, None
+    try:
+        from psd_tools import PSDImage
+    except ImportError as e:
+        raise ValueError('Photoshop files need the psd-tools package on the server (pip install psd-tools); '
+                         'a PNG of the same artwork works now.') from e
+    try:
+        img = PSDImage.open(art).composite(force=True, alpha=0.0)
+        dst = os.path.join(workdir, f'overlay_psd_{os.getpid()}_{int(os.path.getmtime(art) * 1000)}.png')
+        img.convert('RGBA').save(dst)
+    except Exception as e:
+        raise ValueError(f'This Photoshop file could not be flattened ({e}).') from e
+    return dst, dst
+
+
 def clean_options(form):
     """The artwork settings from a form (or any .get-able), clamped to what makes sense."""
     def f(k, d, lo, hi):

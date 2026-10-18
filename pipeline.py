@@ -6754,7 +6754,7 @@ def api_trailer():
                 # than fail the whole job over a missing optional asset.
                 transition = 'fade'
     # Artwork laid over the finished promo (a still or an alpha video), picked with Browse library.
-    overlay_art_path = _resolve_upload('overlay_art', TRANSITION_EXTENSIONS)
+    overlay_art_path = _resolve_upload('overlay_art', SCHEDULE_IMAGE_EXTENSIONS)
     overlay_opts = overlay_art.clean_options(request.form) if overlay_art_path else None
 
     def _prod_float(field):
@@ -13301,15 +13301,20 @@ def _run_trailer_job(jid, params):
         job_set(jid, percent=96, step='Laying the artwork over the promo')
         _total = probe_duration(out_path) or assembled_duration
         _tmp = os.path.join(app.config['UPLOAD_FOLDER'], f'overlay_{base_ts}.mp4')
+        _flat = None
         try:
-            _ok, _err = overlay_art.apply(FFMPEG, out_path, _art, _tmp, params['overlay_opts'], _total, timeout=FFMPEG_LONG_TIMEOUT)
+            _art_png, _flat = overlay_art.prepare(_art, app.config['UPLOAD_FOLDER'])
+            _ok, _err = overlay_art.apply(FFMPEG, out_path, _art_png, _tmp, params['overlay_opts'], _total, timeout=FFMPEG_LONG_TIMEOUT)
         except Exception as e:
             _ok, _err = False, str(e)
+        finally:
+            if _flat and os.path.exists(_flat):
+                os.remove(_flat)
         if _ok:
             os.replace(_tmp, out_path)
             overlay_note = f'Artwork "{_asset_display_name(_art)}" laid over the promo from {params["overlay_opts"]["start"]:g}s.'
         else:
-            overlay_note = 'The artwork could not be laid over the promo; it was left out.'
+            overlay_note = 'The artwork could not be laid over the promo; it was left out. ' + (_err or '')[:200]
             print(f'Overlay artwork failed: {_err}')
             if os.path.exists(_tmp):
                 os.remove(_tmp)
