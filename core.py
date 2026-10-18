@@ -4,7 +4,7 @@ Everything else in this app (auth, the trailer library, the media pipeline)
 imports `app` from here. Kept dependency-free of the other modules so there's
 no risk of circular imports.
 """
-import os, tempfile, threading, time, secrets, hmac
+import os, shutil, tempfile, threading, time, secrets, hmac
 from collections import deque
 from flask import Flask, request, jsonify, session, redirect, url_for
 from flask.sessions import SecureCookieSessionInterface
@@ -23,7 +23,59 @@ if os.environ.get('TRUST_PROXY_HEADERS', '').lower() in ('1', 'true', 'yes'):
     _proxy_hops = int(os.environ.get('TRUST_PROXY_HOPS', 1))
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_proxy_hops, x_proto=_proxy_hops,
                              x_host=_proxy_hops, x_prefix=_proxy_hops)
-app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp()
+UPLOAD_DIR_PREFIX = 'prism_up_'
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True            # exists, just not ours to signal (or Windows: be conservative)
+    return True
+
+
+def reap_stale_upload_dirs(parent, keep=None):
+    """Deletes the per-run upload folders (prism_up_*) that earlier runs of this
+    app left behind. Each run makes a fresh folder and nothing ever removed the
+    old ones, so every restart or crash orphaned whatever staging and render
+    files were in it -- the way the system temp folder grew without limit.
+    A folder is stale when the process named in its .pid file is gone."""
+    freed = 0
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return 0
+    for name in names:
+        p = os.path.join(parent, name)
+        if not name.startswith(UPLOAD_DIR_PREFIX) or p == keep or not os.path.isdir(p) or os.path.islink(p):
+            continue
+        try:
+            with open(os.path.join(p, '.pid')) as f:
+                pid = int(f.read().strip())
+            if pid == os.getpid() or _pid_alive(pid):
+                continue
+        except (OSError, ValueError):
+            pass                       # no readable pid: only reap if it has been idle a while
+            try:
+                if time.time() - os.path.getmtime(p) < 6 * 3600:
+                    continue
+            except OSError:
+                continue
+        for dp, _dn, fn in os.walk(p):
+            for x in fn:
+                try:
+                    freed += os.path.getsize(os.path.join(dp, x))
+                except OSError:
+                    pass
+        shutil.rmtree(p, ignore_errors=True)
+    if freed:
+        print(f'Removed {freed / (1024**3):.2f} GB of upload folders left by earlier runs')
+    return freed
+
+
+app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp(prefix=UPLOAD_DIR_PREFIX)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024 * 1024
 
 _upload_temp_dir = os.environ.get('UPLOAD_TEMP_DIR', '').strip()
@@ -42,7 +94,7 @@ if _upload_temp_dir:
     # depends on, just relocates WHERE that fresh folder lives.
     try:
         os.makedirs(_upload_temp_dir, exist_ok=True)
-        app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp(dir=_upload_temp_dir)
+        app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp(prefix=UPLOAD_DIR_PREFIX, dir=_upload_temp_dir)
     except OSError as e:
         # Deliberately does not fall back silently: silently using the
         # system temp location anyway is exactly the outcome this setting
@@ -54,6 +106,27 @@ if _upload_temp_dir:
         print(' Falling back to the system temp location for this run --')
         print(' fix the path or its permissions, then restart.')
         print('=' * 64)
+
+def _claim_upload_folder():
+    """Marks this run's folder with our pid, clears the dead runs' folders from
+    the same parent, and removes our own on a clean exit."""
+    import atexit
+    folder = app.config['UPLOAD_FOLDER']
+    try:
+        with open(os.path.join(folder, '.pid'), 'w') as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    parent = os.path.dirname(folder)
+    for par in {parent, tempfile.gettempdir()}:
+        try:
+            reap_stale_upload_dirs(par, keep=folder)
+        except Exception as e:
+            print(f'Upload folder cleanup error: {e}')
+    atexit.register(lambda: shutil.rmtree(folder, ignore_errors=True))
+
+
+_claim_upload_folder()
 
 _SECRET_KEY_FILE = os.environ.get('SECRET_KEY_FILE',
     os.path.join(os.path.dirname(os.path.abspath(__file__)), '.secret_key'))

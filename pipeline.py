@@ -10344,6 +10344,38 @@ def api_vo_preview():
 UPLOAD_TTL = int(os.environ.get('UPLOAD_TTL', 6 * 3600))  # seconds
 _SWEEP_INTERVAL = int(os.environ.get('UPLOAD_SWEEP_INTERVAL', 900))
 
+UPLOAD_MAX_GB = float(os.environ.get('UPLOAD_MAX_GB', 0) or 0)   # 0 = no size cap, only the age limit
+_CAP_MIN_AGE = 1800     # never touch anything modified in the last 30 minutes: a render may be using it
+
+
+def _enforce_upload_cap(folder, now):
+    """If UPLOAD_MAX_GB is set and the folder is over it, deletes the oldest
+    files (never anything touched in the last half hour) until it is under."""
+    if UPLOAD_MAX_GB <= 0:
+        return 0
+    files, total = [], 0
+    for dp, _dn, fn in os.walk(folder):
+        for x in fn:
+            fp = os.path.join(dp, x)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            total += st.st_size
+            files.append((st.st_mtime, st.st_size, fp))
+    limit, freed = UPLOAD_MAX_GB * 1024 ** 3, 0
+    for mtime, size, fp in sorted(files):
+        if total - freed <= limit or now - mtime < _CAP_MIN_AGE:
+            break
+        if os.path.basename(fp) == '.pid':
+            continue
+        try:
+            os.remove(fp)
+            freed += size
+        except OSError:
+            pass
+    return freed
+
 def sweep_upload_folder(ttl=None):
     """Deletes anything in UPLOAD_FOLDER older than `ttl` seconds.
 
@@ -10361,9 +10393,25 @@ def sweep_upload_folder(ttl=None):
     except OSError:
         return 0
     for name in entries:
+        if name == '.pid':
+            continue                   # marks this run's folder as live (core.reap_stale_upload_dirs)
         p = os.path.join(folder, name)
         try:
-            if not os.path.isfile(p):
+            if os.path.islink(p):
+                continue
+            if os.path.isdir(p):
+                # A work folder: old only when nothing inside it has been touched for the ttl.
+                newest, size = os.path.getmtime(p), 0
+                for dp, _dn, fn in os.walk(p):
+                    for x in fn:
+                        try:
+                            st = os.stat(os.path.join(dp, x))
+                            newest, size = max(newest, st.st_mtime), size + st.st_size
+                        except OSError:
+                            pass
+                if now - newest >= ttl:
+                    shutil.rmtree(p, ignore_errors=True)
+                    freed += size
                 continue
             if now - os.path.getmtime(p) < ttl:
                 continue
@@ -10372,6 +10420,7 @@ def sweep_upload_folder(ttl=None):
             freed += size
         except OSError:
             pass
+    freed += _enforce_upload_cap(folder, now)
     if freed:
         print(f'Upload sweeper reclaimed {freed / (1024*1024):.1f} MB of files older than {ttl}s')
     return freed
