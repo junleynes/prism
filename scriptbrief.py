@@ -254,7 +254,10 @@ def _read_page(L, R, brief):
     tail = [ln for ln in rest if not ln.get('_owned')]
     tblocks = _blocks(tail, lambda a, b: True)
     if tblocks:
-        last = max(tblocks, key=lambda b: (len(b), b[0]['y0']))        # the biggest block under the clips
+        cards = [b for b in tblocks if any(l['ul'] for l in b) or len(b) >= 2]
+        # Under the clips the script lists the cards' words: with two blocks the first is the title card's (it carries
+        # the show's title, which the narrator says over it) and the second the end card's; with one, that is the card.
+        last = sorted(cards, key=lambda b: b[0]['y0'])[0] if len(cards) >= 2 else max(tblocks, key=lambda b: (len(b), b[0]['y0']))
         if not brief['tcard'] and (any(l['ul'] for l in last) or len(last) >= 2):
             brief['tcard'] = {'title': _clean(last[0]['text']), 'lines': [_clean(l['text']) for l in last],
                               'highlighted': [_clean(l['text']) for l in last if l['hl']],

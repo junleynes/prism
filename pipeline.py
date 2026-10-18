@@ -11092,6 +11092,31 @@ def _run_trailer_job(jid, params):
                     _cues0[_k0] = _new0
                     _notes0.append(f'"{_c0["desc"][:40]}" matched by picture at {_new0["time"]:.1f}s (written {_c0["time"]:.1f}s).')
             _cues0.sort(key=lambda c: (c.get('order', 0), c.get('material') or 1, c['time']))
+        # The sound itself has the last word on where a spoken cue starts and ends: each edge that falls in speech
+        # moves into the nearest pause, so no word is cut in half (word times from speech-to-text can be a little off).
+        for _k2, _c2 in enumerate(_cues0):
+            if not (cue_locate.is_spoken(_c2) and _c2.get('material') and _c2.get('out') is not None):
+                continue
+            try:
+                _src2 = _mats0[min(_c2['material'], len(_mats0)) - 1]
+                _w0 = max(0.0, float(_c2['time']) - 1.6)
+                _wav2 = os.path.join(app.config['UPLOAD_FOLDER'], f'sotwin_{jid}_{_k2}.wav')
+                subprocess.run([FFMPEG, '-y', '-v', 'error', '-ss', f'{_w0:.3f}', '-t', f'{float(_c2["out"]) - _w0 + 2.2:.3f}',
+                                '-i', _src2, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', _wav2],
+                               capture_output=True, timeout=120)
+                if os.path.isfile(_wav2) and os.path.getsize(_wav2) > 0:
+                    _sil2 = [(a_ + _w0, b_ + _w0) for a_, b_ in _detect_silence_intervals(_wav2, noise_db=-32, min_dur=0.08, timeout=60, sample_rate=16000)]
+                    _new2 = cue_locate.snap_to_silence(_c2, _sil2)
+                    if _new2 is not _c2:
+                        _notes0.append(f'"{(_c2.get("desc") or "")[:40]}" edges moved to the nearest pause in the sound: '
+                                       f'{float(_c2["time"]):.2f}-{float(_c2["out"]):.2f}s -> {_new2["time"]:.2f}-{_new2["out"]:.2f}s.')
+                        _cues0[_k2] = _new2
+                try:
+                    os.remove(_wav2)
+                except OSError:
+                    pass
+            except Exception as e:
+                print(f'Pause snap for a spoken cue failed ({e})')
         params['script_cues'] = _cues0
         for _n0 in _notes0:
             print('Script cue:', _n0)

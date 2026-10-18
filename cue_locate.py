@@ -44,7 +44,7 @@ def locate_cues(cues, transcripts, n_materials=None):
                     continue                                   # a labelled cue is only looked for on its own material
                 if not words:
                     continue
-                r = cutcraft.align_script([{'text': said}], words, min_score=MIN_SCORE)[0]
+                r = align_best(said, words)
                 if r['w0'] is None:
                     continue
                 w0, w1 = words[r['w0']], words[r['w1']]
@@ -54,7 +54,7 @@ def locate_cues(cues, transcripts, n_materials=None):
                     best = (key, mat, float(w0['start']), float(w1['end']), r['score'])
         if best:
             _k, mat, a, b, score = best
-            if not c.get('material') and c.get('out') is not None and n_materials > 1 and abs(a - float(c['time'])) <= WINDOW + 1.0:
+            if not c.get('material') and c.get('out') is not None and n_materials > 1 and inside(a, b, c['time'], c['out']):
                 # Written in and out, no material: the speech of every loaded material was searched for these words,
                 # and they are said there, at the written time. That identifies the material; the cut stays as written.
                 c['material'], c['material_by'] = mat, 'heard'
@@ -78,6 +78,51 @@ def locate_cues(cues, transcripts, n_materials=None):
         out.append(c)
     out.sort(key=lambda c: (c.get('order', 0), c.get('material') or 1, c['time']))
     return out, notes
+
+
+def align_best(said, words):
+    """cutcraft.align_script's answer for the line, trying the whole line and then its beginning (a transcript often loses
+    the tail of a line, or hears it differently): the best-scoring result, the whole line winning a tie."""
+    toks = str(said or '').split()
+    variants = [' '.join(toks)]
+    if len(toks) > 6:
+        variants.append(' '.join(toks[:max(4, len(toks) // 2 + 1)]))
+    best = None
+    for v in variants:
+        r = cutcraft.align_script([{'text': v}], words, min_score=MIN_SCORE)[0]
+        if r['w0'] is not None and (best is None or r['score'] > best['score'] + 1e-9):
+            best = r
+    return best or cutcraft.align_script([{'text': variants[0]}], words, min_score=MIN_SCORE)[0]
+
+
+def inside(a, b, t, o, slack=0.4):
+    """True when the spoken span a..b lies inside the written cut t..o (give or take `slack`)."""
+    return a >= float(t) - slack and b <= float(o) + slack
+
+
+def snap_to_silence(c, silences, slack=1.5):
+    """A spoken cue's edges moved into the pauses of the real sound: an edge that falls in speech moves to the nearest
+    pause (the start back, the end forward, within `slack` seconds). `silences` are (start, end) in the footage's time."""
+    if c.get('time') is None or c.get('out') is None or not silences:
+        return c
+    sil = sorted((float(a), float(b)) for a, b in silences if b > a)
+    t, o = float(c['time']), float(c['out'])
+
+    def in_pause(x):
+        return any(a - 0.01 <= x <= b + 0.01 for a, b in sil)
+    if not in_pause(t):
+        before = [(a, b) for a, b in sil if b <= t and t - b <= slack]
+        if before:
+            a, b = before[-1]
+            t = max(a, b - 0.06)
+    if not in_pause(o):
+        after = [(a, b) for a, b in sil if a >= o and a - o <= slack]
+        if after:
+            a, b = after[0]
+            o = a + min(0.25, (b - a) / 2.0)
+    if (t, o) == (float(c['time']), float(c['out'])) or o <= t:
+        return c
+    return dict(c, time=round(t, 3), out=round(o, 3), snapped='sound')
 
 
 def is_spoken(c):
@@ -126,10 +171,12 @@ def verify_spoken(c, words, notes):
     lo, hi = float(c['time']) - WINDOW, float(c['out']) + WINDOW
     near = [w for w in words if lo <= float(w['start']) <= hi]
     if near:
-        r = cutcraft.align_script([{'text': said}], near, min_score=MIN_SCORE)[0]
+        r = align_best(said, near)
         if r['w0'] is not None:
-            return snap_edges(c, words, notes)                 # said at the written time: as written
-    r = cutcraft.align_script([{'text': said}], words, min_score=MIN_SCORE)[0]
+            a, b = float(near[r['w0']]['start']), float(near[r['w1']]['end'])
+            if inside(a, b, c['time'], c['out']):
+                return snap_edges(c, words, notes)             # said inside the written cut: as written
+    r = align_best(said, words)
     if r['w0'] is None:
         return snap_edges(c, words, notes)
     a, b = float(words[r['w0']]['start']), float(words[r['w1']]['end'])
@@ -145,20 +192,6 @@ def verify_spoken(c, words, notes):
 
 
 WINDOW = 4.0            # seconds around a written cut in which its words are listened for
-
-
-def _material_by_ear(c, said, transcripts):
-    """The material whose speech, around the cue's written time, best matches the words; None when none does."""
-    lo, hi = float(c['time']) - WINDOW, float(c['out']) + WINDOW
-    best = None
-    for mat, words in transcripts.items():
-        near = [w for w in (words or []) if lo <= float(w['start']) <= hi]
-        if not near:
-            continue
-        r = cutcraft.align_script([{'text': said}], near, min_score=MIN_SCORE)[0]
-        if r['w0'] is not None and (best is None or r['score'] > best[0]):
-            best = (r['score'], mat)
-    return best[1] if best else None
 
 
 def merge_overlaps(cues):

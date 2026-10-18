@@ -220,11 +220,11 @@ def test_edges_inside_a_word_move_to_the_gap_beside_it():
     assert same['time'] == 10.45 and same['out'] == 11.95       # edges in gaps stay
 
 
-def test_written_sot_that_is_said_there_keeps_its_cut_but_no_word_is_cut():
+def test_written_sot_cut_into_its_line_is_widened_to_the_whole_line():
     ws = _sentence(70.0, 'can you do something for me') + _sentence(80.0, 'other words here')
     c = {'time': 70.6, 'out': 72.8, 'material': 1, 'kind': 'sot', 'desc': 'CAN YOU DO SOMETHING FOR ME'}
     out, notes = cl.locate_cues([c], {1: ws}, 1)
-    assert not out[0].get('located') and out[0]['time'] <= 70.5 and out[0]['out'] >= 72.9
+    assert out[0]['time'] <= 69.9 and out[0]['out'] >= 72.9          # the line began before the written in: the whole line is kept
 
 
 def test_written_sot_not_said_at_its_time_moves_to_where_it_is_said():
@@ -232,3 +232,31 @@ def test_written_sot_not_said_at_its_time_moves_to_where_it_is_said():
     c = {'time': 71.0, 'out': 74.0, 'material': 1, 'kind': 'sot', 'desc': 'CAN YOU DO SOMETHING FOR ME'}
     out, notes = cl.locate_cues([c], {1: ws}, 1)
     assert out[0]['located'] and 119 < out[0]['time'] < 120.5 and out[0]['out'] > 122.5
+
+
+def test_spoken_line_longer_than_written_cut_moves_out_to_cover_the_whole_line():
+    ws = _sentence(0.0, 'mom i need money', step=0.4, dur=0.35)          # runs to 1.55
+    c = {'time': 0.0, 'out': 1.0, 'material': 1, 'kind': 'sot', 'desc': 'MOM I NEED MONEY'}
+    out, _ = cl.locate_cues([c], {1: ws}, 2)
+    assert out[0]['out'] >= 1.55 and out[0]['time'] == 0.0
+
+
+def test_sot_said_elsewhere_than_its_written_range_uses_where_it_is_said_even_close_by():
+    ws = _sentence(47.0, "nina anak what's our password")           # written 40-45, said 47-49.1
+    c = {'time': 40.0, 'out': 45.0, 'material': 1, 'kind': 'shot', 'speech': "NINA, ANAK, WHAT'S OUR PASSWORD PASSWORD?", 'desc': 'WIDE REACTS'}
+    out, _ = cl.locate_cues([c], {1: ws}, 2)
+    assert out[0]['located'] and 46.5 < out[0]['time'] < 47.0 and out[0]['out'] > 49.1
+
+
+def test_line_heard_only_in_part_still_found_by_its_beginning():
+    ws = _sentence(47.0, "nina anak what's our")                    # transcript lost the tail
+    r = cl.align_best("NINA ANAK WHAT'S OUR PASSWORD PASSWORD", ws)
+    assert r['w0'] == 0
+
+
+def test_edges_in_speech_move_into_pauses_of_the_sound():
+    sil = [(9.0, 9.6), (11.0, 11.5), (12.0, 12.2)]
+    c = {'time': 9.9, 'out': 10.9}
+    out = cl.snap_to_silence(c, sil)
+    assert 9.5 <= out['time'] <= 9.6 and 11.0 <= out["out"] <= 11.3
+    assert cl.snap_to_silence({'time': 9.2, 'out': 11.2}, sil) == {'time': 9.2, 'out': 11.2}     # both already in pauses
