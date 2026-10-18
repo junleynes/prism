@@ -11043,10 +11043,10 @@ def _run_trailer_job(jid, params):
         except Exception as e:
             print(f'Cue analysis by the language model failed ({e}); using the cue lines as written.')
         params['script_cues'] = _cues0
-    if any(not cue_locate.is_complete(c) for c in _cues0):
+    if any((not cue_locate.is_complete(c)) or cue_locate.is_spoken(c) for c in _cues0):
         _mats0 = [p_ for p_ in (params.get('materials_paths') or [path]) if p_ and os.path.isfile(p_)] or [path]
         _tr0 = {}
-        if any(len(cutcraft.norm_tokens((c['dialog'] or c.get('speech') if 'dialog' in c else (c.get('speech') or c.get('desc'))) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not cue_locate.is_complete(c)):
+        if any(len(cutcraft.norm_tokens(cue_locate._spoken_words(c) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if (not cue_locate.is_complete(c)) or cue_locate.is_spoken(c)):
             job_set(jid, percent=3, step='Listening to the footage for the script\'s dialogue')
             for _i0, _p0 in enumerate(_mats0, 1):
                 try:

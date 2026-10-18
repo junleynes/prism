@@ -92,7 +92,7 @@ def test_labelled_spoken_line_is_looked_for_only_on_its_own_material():
 
 
 def test_a_complete_cue_is_cut_exactly_as_written():
-    c = {'time': 218.0, 'out': 223.0, 'material': 1, 'kind': 'sot', 'desc': 'TRAYDOR KA'}
+    c = {'time': 218.0, 'out': 223.0, 'material': 1, 'kind': 'shot', 'desc': 'TRAYDOR KA'}      # a shot: its words are not speech
     assert cl.is_complete(c)
     out, notes = cl.locate_cues([c], {1: W('traydor ka', 230)}, 2)
     assert out[0]['time'] == 218.0 and out[0]['out'] == 223.0 and not notes
@@ -196,7 +196,7 @@ def test_material_is_the_one_whose_whole_recording_says_the_line_best():
     tr = {1: _words('can you do something', 71.2) + _words('totally different words follow now', 80.0),
           2: _words('hello can you do something for me please', 71.0)}
     out, _ = cl.locate_cues([cue], tr, 2)
-    assert out[0]['material'] == 2 and out[0]['time'] == 71.0 and out[0]['out'] == 74.0
+    assert out[0]['material'] == 2 and out[0]['time'] == 71.0 and 74.0 <= out[0]['out'] < 75.0
 
 
 def test_line_said_far_from_its_written_time_moves_to_where_it_is_said():
@@ -204,3 +204,31 @@ def test_line_said_far_from_its_written_time_moves_to_where_it_is_said():
     tr = {1: _words('nothing here', 5.0), 2: _words('can you do something for me', 140.0)}
     out, _ = cl.locate_cues([cue], tr, 2)
     assert out[0]['material'] == 2 and out[0]['located'] and out[0]['time'] > 130
+
+
+def _sentence(t0, text, step=0.5, dur=0.4):
+    return [{'word': w, 'start': t0 + i * step, 'end': t0 + i * step + dur} for i, w in enumerate(text.split())]
+
+
+def test_edges_inside_a_word_move_to_the_gap_beside_it():
+    ws = _sentence(10.0, 'one two three four five')            # two: 10.5-10.9, four: 11.5-11.9
+    c = {'time': 10.7, 'out': 11.7, 'desc': 'x'}
+    out = cl.snap_edges(c, ws)
+    assert out['time'] <= 10.5 and out['time'] >= 10.4          # before "two" starts, after "one" ends (10.4)
+    assert out['out'] >= 11.9 and out['out'] <= 12.0            # after "four" ends, before "five" starts (12.0)
+    same = cl.snap_edges({'time': 10.45, 'out': 11.95, 'desc': 'x'}, ws)
+    assert same['time'] == 10.45 and same['out'] == 11.95       # edges in gaps stay
+
+
+def test_written_sot_that_is_said_there_keeps_its_cut_but_no_word_is_cut():
+    ws = _sentence(70.0, 'can you do something for me') + _sentence(80.0, 'other words here')
+    c = {'time': 70.6, 'out': 72.8, 'material': 1, 'kind': 'sot', 'desc': 'CAN YOU DO SOMETHING FOR ME'}
+    out, notes = cl.locate_cues([c], {1: ws}, 1)
+    assert not out[0].get('located') and out[0]['time'] <= 70.5 and out[0]['out'] >= 72.9
+
+
+def test_written_sot_not_said_at_its_time_moves_to_where_it_is_said():
+    ws = _sentence(5.0, 'nothing relevant at all') + _sentence(120.0, 'can you do something for me')
+    c = {'time': 71.0, 'out': 74.0, 'material': 1, 'kind': 'sot', 'desc': 'CAN YOU DO SOMETHING FOR ME'}
+    out, notes = cl.locate_cues([c], {1: ws}, 1)
+    assert out[0]['located'] and 119 < out[0]['time'] < 120.5 and out[0]['out'] > 122.5

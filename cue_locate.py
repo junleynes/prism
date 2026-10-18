@@ -31,6 +31,8 @@ def locate_cues(cues, transcripts, n_materials=None):
     for c in cues:
         c = dict(c)
         if is_complete(c):
+            if is_spoken(c) and (transcripts or {}).get(c['material']):
+                c = verify_spoken(c, transcripts[c['material']], notes)
             out.append(c)
             continue
         said = (c['dialog'] or c.get('speech') or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else (c.get('speech') or c.get('desc'))     # the language model's reading, else the raw line
@@ -57,6 +59,7 @@ def locate_cues(cues, transcripts, n_materials=None):
                 # and they are said there, at the written time. That identifies the material; the cut stays as written.
                 c['material'], c['material_by'] = mat, 'heard'
                 notes.append(f'"{c["desc"][:40]}" is said in material {mat} at {a:.1f}s (score {score:.2f}): cut as written.')
+                c = snap_edges(c, transcripts.get(mat) or [], notes)
                 out.append(c)
                 continue
             span = (c['out'] - c['time']) if c.get('out') else 0.0
@@ -66,6 +69,7 @@ def locate_cues(cues, transcripts, n_materials=None):
             c['out'] = round(max(b + TAIL, c['time'] + span), 3)
             c['located'] = True
             notes.append(f'"{c["desc"][:40]}" found in material {mat} at {a:.1f}s (written {c["written_time"]:.1f}s).')
+            c = snap_edges(c, transcripts.get(mat) or [], notes)
         else:
             if not c.get('material') and not (c.get('out') is not None and (n_materials or 1) > 1):
                 c['material'] = 1                              # (written in/out with several materials: looked for next)
@@ -74,6 +78,70 @@ def locate_cues(cues, transcripts, n_materials=None):
         out.append(c)
     out.sort(key=lambda c: (c.get('order', 0), c.get('material') or 1, c['time']))
     return out, notes
+
+
+def is_spoken(c):
+    """A cue whose sound matters: a spoken line (SOT), alone or joined to a shot."""
+    return c.get('kind') == 'sot' or bool(c.get('speech'))
+
+
+def _spoken_words(c):
+    return (c.get('dialog') or c.get('speech') or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else (c.get('speech') or c.get('desc'))
+
+
+def snap_edges(c, words, notes=None):
+    """A spoken cue's in and out never fall inside a word: an edge that does moves out to the gap beside that word
+    (the word's start less LEAD, its end plus TAIL), never into the next or the previous word."""
+    if c.get('time') is None or c.get('out') is None or not words:
+        return c
+    ws = sorted(words, key=lambda w: float(w['start']))
+    t, o = float(c['time']), float(c['out'])
+    t0, o0 = t, o
+    for i, w in enumerate(ws):
+        a, b = float(w['start']), float(w['end'])
+        if a + 0.03 < t < b - 0.03:
+            prev_end = max((float(x['end']) for x in ws[:i]), default=0.0)
+            t = max(a - LEAD, min(prev_end + 0.01, a), 0.0)
+            break
+    for i, w in enumerate(ws):
+        a, b = float(w['start']), float(w['end'])
+        if a + 0.03 < o < b - 0.03:
+            nxt = min((float(x['start']) for x in ws[i + 1:]), default=b + TAIL)
+            o = min(b + TAIL, max(nxt - 0.01, b))
+            break
+    if (t, o) != (t0, o0) and o > t:
+        c = dict(c, time=round(t, 3), out=round(o, 3))
+        if notes is not None:
+            notes.append(f'"{(c.get("desc") or "")[:40]}" cut moved from {t0:.2f}-{o0:.2f}s to {t:.2f}-{o:.2f}s so no word is cut in half.')
+    return c
+
+
+def verify_spoken(c, words, notes):
+    """A spoken cue with material, in and out written. Its words are looked for around the written time: found there, the
+    written cut stands; not there but said elsewhere in the same material, the cut moves to where it is said; not
+    heard at all, the written cut stands. Either way no word is cut in half."""
+    said = _spoken_words(c)
+    if len(cutcraft.norm_tokens(said or '')) < MIN_TOKENS or not words:
+        return snap_edges(c, words, notes)
+    lo, hi = float(c['time']) - WINDOW, float(c['out']) + WINDOW
+    near = [w for w in words if lo <= float(w['start']) <= hi]
+    if near:
+        r = cutcraft.align_script([{'text': said}], near, min_score=MIN_SCORE)[0]
+        if r['w0'] is not None:
+            return snap_edges(c, words, notes)                 # said at the written time: as written
+    r = cutcraft.align_script([{'text': said}], words, min_score=MIN_SCORE)[0]
+    if r['w0'] is None:
+        return snap_edges(c, words, notes)
+    a, b = float(words[r['w0']]['start']), float(words[r['w1']]['end'])
+    span = float(c['out']) - float(c['time'])
+    c = dict(c)
+    c['written_time'] = c['time']
+    c['time'] = round(max(0.0, a - LEAD), 3)
+    c['out'] = round(max(b + TAIL, c['time'] + span), 3)
+    c['located'] = True
+    notes.append(f'"{(c.get("desc") or "")[:40]}" is not said at its written time ({c["written_time"]:.1f}s); '
+                 f'it is said in material {c["material"]} at {a:.1f}s: cut there.')
+    return snap_edges(c, words, notes)
 
 
 WINDOW = 4.0            # seconds around a written cut in which its words are listened for
