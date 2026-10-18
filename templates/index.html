@@ -2026,6 +2026,30 @@ document.addEventListener("DOMContentLoaded", function(){
     <p style="font-size:11px;opacity:.65;margin:4px 0 0">A black-and-white matte (video or still) that wipes from one scene to the next, from the <b>Transitions</b> folder.</p>
   </div>
   </div>
+  <div class="overlay-art-box" style="margin-top:12px">
+    <label>Artwork overlay <span style="opacity:.6;font-weight:400">(optional)</span>:</label>
+    <div class="browse-row">
+      {% if allow_local_upload %}<input type=file name=overlay_art accept="image/*,video/*" data-net-field="overlay_art">{% endif %}
+      <button type=button class="browse-btn" onclick="openNetworkBrowser('overlay_art','transitions','Overlay artwork')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z"/></svg>Browse library</button>
+    </div>
+    <input type=hidden id=overlay_art_network name=overlay_art_network value="">
+    <span class="net-file-chip" id=overlay_art_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('overlay_art')">&#10005;</span></span>
+    <div id=overlay-art-options style="margin-top:6px">
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:end">
+        <div><label style="font-size:11px">Appears</label>
+          <select name=overlay_anim><option value=fade>Fade in</option><option value=slide_left>Slide in from left</option><option value=slide_right>Slide in from right</option><option value=slide_up>Slide up</option><option value=slide_down>Slide down</option><option value=pop>Pop</option><option value=none>Cut in</option></select></div>
+        <div><label style="font-size:11px">Leaves</label>
+          <select name=overlay_out><option value=fade>Fade out</option><option value=none>Cut out</option></select></div>
+        <div><label style="font-size:11px">Position</label>
+          <select name=overlay_pos><option value=full>Full frame</option><option value=center>Centre</option><option value=top_left>Top left</option><option value=top_right>Top right</option><option value=bottom_left>Bottom left</option><option value=bottom_right>Bottom right</option></select></div>
+        <div><label style="font-size:11px">Size (% of width)</label><input type=number name=overlay_scale value=100 min=5 max=100 step=5 style="width:80px"></div>
+        <div><label style="font-size:11px">Starts at (s)</label><input type=number name=overlay_start value=1 min=0 step=0.5 style="width:80px"></div>
+        <div><label style="font-size:11px">Holds for (s)</label><input type=number name=overlay_hold value=0 min=0 step=0.5 style="width:80px" title="0 = until the end of the promo"></div>
+        <div><label style="font-size:11px">Move takes (s)</label><input type=number name=overlay_anim_dur value=0.5 min=0.1 max=3 step=0.1 style="width:80px"></div>
+      </div>
+      <p style="font-size:11px;opacity:.65;margin:4px 0 0">A PNG with transparency, or a video with an alpha channel (ProRes 4444 / QuickTime Animation <code>.mov</code>, VP9 <code>.webm</code>), from the <b>Transitions</b> folder. It appears, holds, then leaves, over the finished promo &mdash; cards included. Holds for 0 means until the end.</p>
+    </div>
+  </div>
   <div class="adv-only">
   <label>Audio &amp; beat sync:</label>
   <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:8px 0">
@@ -2663,7 +2687,7 @@ document.addEventListener("DOMContentLoaded", function(){
   // the preview lists what was actually adjusted instead of a bare count.
   var TPL_SETTING_LABELS = {
     trailer_length: 'Duration', genre: 'Genre',
-    transition: 'Transition', xfade_dur: 'Crossfade', transition_matte: 'Transition matte',
+    transition: 'Transition', xfade_dur: 'Crossfade', transition_matte: 'Transition matte', overlay_art: 'Artwork overlay',
     max_scene_dur: 'Max clip length', scene_threshold: 'Cut sensitivity',
     min_scene_len_sec: 'Min scene length', min_scene_len: 'Min scene length',
     model: 'AI Vision model', prompt: 'Vision prompt',
@@ -7263,6 +7287,7 @@ function renderTrailerResult(d){
   }
   if(fallbackUsed) gates.push('AI music/SFX used a placeholder \u2014 replace before air if possible.')
   if(d.vo_error) gates.push('Voiceover note: '+d.vo_error)
+  if(d.overlay_note) gates.push(d.overlay_note)
 
   var gatesHtml = gates.length
     ? '<ul class="qa-gates">'+gates.map(function(g){ return '<li>'+esc(g)+'</li>' }).join('')+'</ul>'
@@ -7279,6 +7304,7 @@ function renderTrailerResult(d){
   var psRows = []
   if(d.orig_name) psRows.push(['HIRES source', esc(d.orig_name)])
   if(ps.transition) psRows.push(['Transition', ps.transition + (ps.transition_matte ? ' (matte: ' + esc(ps.transition_matte) + ')' : '')])
+  if(ps.overlay_art) psRows.push(['Artwork overlay', esc(ps.overlay_art)])
   if(ps.title_card) psRows.push(['Title card', esc(ps.title_card)])
   if(ps.schedule_card) psRows.push(['Schedule card', esc(ps.schedule_card)])
   if(ps.vo_file) psRows.push(['VO file', esc(ps.vo_file)])

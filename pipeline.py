@@ -31,6 +31,7 @@ from core import app, ALLOWED_EXTENSIONS, _job_submit_limiter, _client_ip, _Rate
 import cutcraft
 import highlights_core as hc
 import cue_locate
+import overlay_art
 import vo_fit
 import scriptbrief
 from schedule_core import IMAGE_EXTENSIONS as SCHEDULE_IMAGE_EXTENSIONS
@@ -86,6 +87,7 @@ TEMPLATE_SLOT_KEYS = list(TEMPLATE_SLOTS.keys())
 # schema migration.
 TEMPLATE_SETTING_FIELDS = [
     'genre', 'transition', 'xfade_dur', 'transition_matte',
+    'overlay_anim', 'overlay_out', 'overlay_pos', 'overlay_start', 'overlay_hold', 'overlay_anim_dur', 'overlay_scale',
     'trailer_length', 'max_scene_dur', 'scene_threshold', 'min_scene_len_sec',
     'detector', 'adaptive_threshold',
     'mode', 'model', 'prompt',
@@ -6751,6 +6753,10 @@ def api_trailer():
                 # Selected "Custom" but didn't upload anything — fall back rather
                 # than fail the whole job over a missing optional asset.
                 transition = 'fade'
+    # Artwork laid over the finished promo (a still or an alpha video), picked with Browse library.
+    overlay_art_path = _resolve_upload('overlay_art', TRANSITION_EXTENSIONS)
+    overlay_opts = overlay_art.clean_options(request.form) if overlay_art_path else None
+
     def _prod_float(field):
         raw = request.form.get(field)
         if raw is None or raw == '':
@@ -7162,6 +7168,7 @@ def api_trailer():
                   negative_prompt=negative_prompt, pinned_scenes=pinned_scenes,
                   script_cues=script_cues, script_brief=script_brief,
                   transition=transition, xfade_dur=xfade_dur, transition_matte_path=transition_matte_path,
+                  overlay_art_path=overlay_art_path, overlay_opts=overlay_opts,
                   target_loudness=target_loudness, true_peak=true_peak, music_duck_db=music_duck_db, duck_depth_db=duck_depth_db, duck_release_hold=duck_release_hold, beat_match=beat_match, broadcast_stereo=broadcast_stereo, model=model,
                   sfx_mode=sfx_mode, sfx_upload_path=sfx_upload_path,
                   sfx_upload_trim_start=sfx_upload_trim_start, sfx_upload_trim_end=sfx_upload_trim_end,
@@ -10649,7 +10656,7 @@ def _cleanup_job_temp(jid, params, keep_basename=None):
     # Explicit per-job inputs (source video, staged template copies, uploads).
     for key in ('path', 'sfx_upload_path', 'vo_upload_path', 'vo_ref_upload_path',
                 'scoring_audio_path', 'end_card_path', 'schedule_card_path',
-                'title_card_vo_path', 'end_card_vo_path', 'transition_matte_path'):
+                'title_card_vo_path', 'end_card_vo_path', 'transition_matte_path', 'overlay_art_path'):
         p = params.get(key)
         # scoring_audio_path carries the sentinel 'GENERATE' rather than a path.
         if not (isinstance(p, str) and p != 'GENERATE' and os.path.isabs(p)):
@@ -13287,8 +13294,29 @@ def _run_trailer_job(jid, params):
         if vo_ready_path and os.path.exists(vo_ready_path):
             os.remove(vo_ready_path)
 
+    # Artwork over the finished promo: appears, holds, leaves. Laid on last so it sits over the cards and the cuts alike.
+    overlay_note = None
+    _art = params.get('overlay_art_path')
+    if _art and os.path.exists(_art) and params.get('overlay_opts'):
+        job_set(jid, percent=96, step='Laying the artwork over the promo')
+        _total = probe_duration(out_path) or assembled_duration
+        _tmp = os.path.join(app.config['UPLOAD_FOLDER'], f'overlay_{base_ts}.mp4')
+        try:
+            _ok, _err = overlay_art.apply(FFMPEG, out_path, _art, _tmp, params['overlay_opts'], _total, timeout=FFMPEG_LONG_TIMEOUT)
+        except Exception as e:
+            _ok, _err = False, str(e)
+        if _ok:
+            os.replace(_tmp, out_path)
+            overlay_note = f'Artwork "{_asset_display_name(_art)}" laid over the promo from {params["overlay_opts"]["start"]:g}s.'
+        else:
+            overlay_note = 'The artwork could not be laid over the promo; it was left out.'
+            print(f'Overlay artwork failed: {_err}')
+            if os.path.exists(_tmp):
+                os.remove(_tmp)
+
     result = dict(
         status='ok', trailer_url=f'/uploads/{filename}',
+        overlay_note=overlay_note,
         orig_name=orig_name,
         # The resolved source video actually rendered from -- the single
         # original HIRES file, or the already-combined multi-file result if
@@ -13358,6 +13386,7 @@ def _run_trailer_job(jid, params):
             transition=params.get('transition'),
             xfade_dur=params.get('xfade_dur'),
             transition_matte=_asset_display_name(params.get('transition_matte_path')),
+            overlay_art=(_asset_display_name(params.get('overlay_art_path')) + ' (' + (params.get('overlay_opts') or {}).get('anim', '') + ')') if params.get('overlay_art_path') else None,
             title_card=params.get('end_card_orig_name') or _asset_display_name(params.get('end_card_path')),
             schedule_card=params.get('schedule_card_orig_name') or _asset_display_name(params.get('schedule_card_path')),
             vo_file=(params.get('vo_upload_orig_name') or _asset_display_name(params.get('vo_upload_path'))) if params.get('vo_mode') == 'upload' else None,
