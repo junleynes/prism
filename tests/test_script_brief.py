@@ -181,7 +181,7 @@ def test_the_title_cards_line_goes_to_the_title_card_and_the_end_cards_line_to_t
     assert sb.card_targets(['TASKFORCE FIREWALL', '8:50PM ON GMA PRIME'], 1) == [0, 0], 'one card: all on it'
     vo = [{'text': 'TASKFORCE FIREWALL', 'anchor': {'kind': 'card'}}, {'text': 'WEEKNIGHTS 8:50PM ON GMA PRIME', 'anchor': {'kind': 'card'}}]
     lines, _ = sb.place_lines(vo, [], [], [10.0, 13.0], xfade=0.3, card_jcut=0.5)
-    assert _ats(lines) == [9.7, 13.2], 'the card lead is for the title card line only'
+    assert _ats(lines) == [9.7, None], 'a led title line is followed by the end card line'
     lines, _ = sb.place_lines(vo, [], [], [10.0])
     assert _ats(lines) == [10.2, None], 'with one card the second line follows the first'
 
@@ -662,3 +662,14 @@ def test_snap_to_voice_on_real_audio_leaves_the_breath_out(tmp_path):
     env = pipeline._voice_envelope(str(f))
     lo, hi = pipeline._snap_to_voice(env, 0.05, 2.2)      # the transcript wrongly ends the first line at 2.2
     assert 1.45 < hi < 1.8, hi
+
+
+def test_end_card_line_follows_led_title_line():
+    import scriptbrief as sb
+    vo = [{'text': 'TASKFORCE FIREWALL', 'anchor': {'kind': 'card', 'label': ''}},
+          {'text': '8:50PM ON GMA PRIME', 'anchor': {'kind': 'card', 'label': ''}}]
+    clips = [{'material': 1, 'start': 0.0, 'selected_dur': 5.0}]
+    led, _ = sb.place_lines(vo, clips, [0.0], [10.5, 12.5], 0.3, card_jcut=1.9)
+    assert led[0]['at'] < 10.5 and led[1]['at'] is None            # title line led; the end line follows it
+    plain, _ = sb.place_lines(vo, clips, [0.0], [10.5, 12.5], 0.3, card_jcut=0.0)
+    assert plain[0]['at'] is not None and plain[1]['at'] is not None   # unchanged without a lead

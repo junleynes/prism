@@ -585,8 +585,9 @@ def place_lines(vo, clips, clip_starts, card_starts, xfade=0.3, jcut=0.0, card_j
                 # Only the title card's line is led by the cards' own lead (it is the one that has to fit them all).
                 lead_in = max(jcut, max(0.0, float(card_jcut or 0.0))) if ci == 0 else jcut
                 at = card_starts[ci] + CARD_LEAD - min(lead_in, card_starts[ci] + CARD_LEAD)
-                if ('card', ci) in taken:
-                    at = None                                  # a second line on the same card: after the first
+                if ('card', ci) in taken or (ci == 1 and ('card', 0) in taken and float(card_jcut or 0.0) > 0.0):
+                    at = None                                  # a second line on the same card, or the end card's line
+                                                               # when the title line was led: after the first
                 taken[('card', ci)] = True
                 if ci == 1:
                     notes.append(f'"{v["text"][:40]}" is said over the end card, which is where it starts.')

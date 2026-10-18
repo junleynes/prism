@@ -792,6 +792,15 @@ def staged_path(local_name):
     return os.path.join(app.config['UPLOAD_FOLDER'], local_name)
 
 
+def staged_name_of(path):
+    """The staged name the browser uses for a source path: the name it was staged under when it is read in place
+    on a share (the file's own name there can hold spaces and so is not a valid staged name), else its file name."""
+    for local, rec in list(INPLACE.items()):
+        if rec.get('path') == path:
+            return local
+    return os.path.basename(path or '')
+
+
 def origin_of_path(path):
     """Where a source path came from -- a share path read in place, or a staged copy -- or None."""
     return dict(INPLACE_ORIGINS[path]) if path in INPLACE_ORIGINS else staged_origin(os.path.basename(path or ''))
@@ -5769,7 +5778,7 @@ def api_vision():
     path = _ensure_readable(path)
     # Basename under UPLOAD_FOLDER, handed back so the frontend can play any
     # result straight from /uploads/<name> via the shared clip player.
-    video_filename = os.path.basename(path)
+    video_filename = staged_name_of(path)
 
     # Was hardcoded to threshold=30.0 regardless of what the generator form
     # (or this tab) was set to, so this tab silently stopped matching what
@@ -7269,7 +7278,7 @@ def api_trailer_preview_get(preview_id):
         return reasons
 
     return jsonify(ok=True, preview_id=preview_id, total_scenes=p['total_scenes'],
-                   video_filename=os.path.basename(p['params']['path']),
+                   video_filename=staged_name_of(p['params']['path']),
                    selection=p.get('selection'),
                    scenes=[{'scene': i + 1, 'start': round(s['start'], 1),
                             'end': round(s['end'], 1), 'quality': s['total_score'],
@@ -11215,7 +11224,21 @@ def _run_trailer_job(jid, params):
             # The tune-in line must end before the plug does. When the cards are too short for it, it starts
             # under the end of the last scene (a J-cut) by as much as it is short.
             params['card_jcut'] = 0.0
-            if need_:
+            if needs_ and len(card_files) > 1 and needs_[1]:
+                # A title line and an end line: said one after the other, so together they need the room. They run
+                # a little faster (up to 8 %) and start under the last scene (a J-cut) by what is still short; the
+                # end line may carry past the end card's start (an L-cut). The narration planner speeds up more
+                # only if that is still not enough.
+                block_ = (sum(n for n in needs_ if n) / 1.08) + 0.15 + scriptbrief.CARD_LEAD + cutcraft.VO_TAIL
+                room_ = total_card_dur - max(0, len(card_durations) - 1) * xfade_dur
+                deficit_ = block_ - room_
+                if deficit_ > 0.02:
+                    params['card_jcut'] = round(min(3.0, deficit_ + 0.25), 2)
+                    card_fit_info['notes'].append(
+                        f'The title and end card lines ({sum(n for n in needs_ if n):.1f}s together) do not fit the {room_:.1f}s of the cards: '
+                        f'the first starts {params["card_jcut"]:.1f}s under the last scene (J-cut), the second follows it '
+                        'over the end card, and the voice is sped up a little where needed.')
+            elif need_:
                 room_ = total_card_dur - max(0, len(card_durations) - 1) * xfade_dur
                 deficit_ = scriptbrief.CARD_LEAD + need_ + cutcraft.VO_TAIL - room_
                 if deficit_ > 0.02:
@@ -12517,7 +12540,7 @@ def _run_trailer_job(jid, params):
         # basename of the source video under UPLOAD_FOLDER, handed back so the
         # preview grid's Play buttons can play a selected scene straight from
         # /uploads/<name> -- same file the render step itself reads from.
-        video_filename = os.path.basename(params['path'])
+        video_filename = staged_name_of(params['path'])
 
         # ---- Selection transparency (why each scene was chosen) ----
         # Lets the UI show whether VO-led, script cues, or priority prompt
@@ -12607,7 +12630,7 @@ def _run_trailer_job(jid, params):
                      # Each scene now carries its own, matching its actual
                      # source_path, for the frontend to use instead of the
                      # single shared one.
-                     'video_filename': os.path.basename(s.get('source_path') or params.get('path', '')),
+                     'video_filename': staged_name_of(s.get('source_path') or params.get('path', '')),
                      'why': _scene_why(s),
                      'description': _scene_desc(s), 'thumb': thumbs[i]}
                     for i, s in enumerate(selected)],
@@ -12621,7 +12644,7 @@ def _run_trailer_job(jid, params):
                          'script_boost': round(s.get('script_boost') or 0, 2) or None,
                          'script_desc': s.get('script_desc') or None,
                          'material': s.get('material'),
-                         'video_filename': os.path.basename(s.get('source_path') or params.get('path', '')),
+                         'video_filename': staged_name_of(s.get('source_path') or params.get('path', '')),
                          'description': _scene_desc(s), 'thumb': alt_thumbs[i]}
                         for i, s in enumerate(alternates)])
         job_set(jid, percent=100, step='Preview ready', done=True, result=result)
