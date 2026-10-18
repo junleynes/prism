@@ -144,3 +144,48 @@ def test_flow_applies_only_without_script_order_and_summary():
     assert [c['desc'] for c in out] == ['b', 'a'] and out[0]['ai_summary'] == 'A fire.'
     ordered = [dict(c, order=i) for i, c in enumerate(cues)]
     assert [c['desc'] for c in cl.parse_analysis(reply, ordered)] == ['a', 'b']
+
+
+def _words(text, t0):
+    out = []
+    for i, w in enumerate(text.split()):
+        out.append({'word': w, 'start': t0 + i * 0.4, 'end': t0 + i * 0.4 + 0.3})
+    return out
+
+
+def test_shot_and_spoken_line_of_the_same_moment_are_one_clip():
+    cues = [{'order': 1, 'time': 40.0, 'out': 45.0, 'kind': 'sot', 'desc': 'NINA ANAK WHAT IS OUR PASSWORD'},
+            {'order': 2, 'time': 40.0, 'out': 43.0, 'kind': 'shot', 'desc': 'WIDE REACTS'},
+            {'order': 3, 'time': 71.0, 'out': 74.0, 'kind': 'sot', 'desc': 'CAN YOU DO SOMETHING FOR ME'}]
+    out = cl.merge_overlaps(cues)
+    assert len(out) == 2 and out[0]['time'] == 40.0 and out[0]['out'] == 45.0
+    assert out[0]['kind'] == 'shot' and out[0]['speech'] == 'NINA ANAK WHAT IS OUR PASSWORD' and out[0]['desc'] == 'WIDE REACTS'
+
+
+def test_written_cut_without_material_takes_the_material_it_is_said_in_and_stays_as_written():
+    cue = {'order': 0, 'time': 71.0, 'out': 74.0, 'kind': 'sot', 'desc': 'CAN YOU DO SOMETHING FOR ME'}
+    tr = {1: _words('hello there nothing relevant here at all', 70.0),
+          2: _words('can you do something for me', 71.5)}
+    out, notes = cl.locate_cues([cue], tr, 2)
+    assert out[0]['material'] == 2 and out[0]['time'] == 71.0 and out[0]['out'] == 74.0 and cl.is_complete(out[0])
+
+
+def test_unresolved_cues_take_the_previous_cues_material():
+    out = cl.fallback_materials([{'order': 0, 'time': 1.0, 'material': 2}, {'order': 1, 'time': 5.0}, {'order': 2, 'time': 9.0}])
+    assert [c['material'] for c in out] == [2, 2, 2]
+    assert cl.fallback_materials([{'order': 0, 'time': 1.0}])[0]['material'] == 1
+
+
+def test_scene_captions_come_from_the_vision_model(monkeypatch):
+    import pipeline
+    class R:
+        stdout = b'\xff\xd8jpeg'
+    class P:
+        def json(self):
+            return {'response': ' A woman looks shocked at a phone. Close-up. '}
+    monkeypatch.setattr(pipeline, '_check_service', lambda *a, **k: {'status': 'up'})
+    monkeypatch.setattr(pipeline.subprocess, 'run', lambda *a, **k: R())
+    monkeypatch.setattr(pipeline.requests, 'post', lambda *a, **k: P())
+    s = [{'source_path': '/x.mp4', 'start': 40.0, 'selected_dur': 4.0}, {'ai_desc': 'kept', 'start': 1.0}]
+    pipeline._caption_selected(s)
+    assert s[0]['ai_desc'] == 'A woman looks shocked at a phone. Close-up.' and s[1]['ai_desc'] == 'kept'

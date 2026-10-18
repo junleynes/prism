@@ -217,6 +217,7 @@ def test_preview_path_does_not_crash_with_cue_exclusive_selection(two_materials,
 
 
 def test_cue_exclusive_render_skips_scene_detection_and_ai_scoring_entirely(two_materials, monkeypatch):
+    monkeypatch.setattr(pipeline, '_caption_selected', lambda *a, **k: None)   # scene captions are a separate, optional step
     # User-requested and confirmed: when timecode cues are present, the app
     # should skip scene selection, scene rating, and AI vision rating
     # entirely -- there's already a selected scene (the cue's own in/out),
@@ -512,6 +513,7 @@ def test_lock_and_render_preserves_each_scenes_own_material_and_source(tmp_path,
 
 
 def test_generate_without_preview_direct_path_with_cues(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, '_caption_selected', lambda *a, **k: None)   # scene captions are a separate, optional step
     # Dedicated coverage for the "Generate without preview" button
     # specifically (submitTrailer(false) -- a direct /api/trailer/generate
     # call with NO preview_only flag at all), as distinct from every other

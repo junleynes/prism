@@ -33,9 +33,17 @@ def locate_cues(cues, transcripts, n_materials=None):
         if is_complete(c):
             out.append(c)
             continue
-        said = (c['dialog'] or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else c.get('desc')     # the language model's reading, else the raw line
+        said = (c['dialog'] or c.get('speech') or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else (c.get('speech') or c.get('desc'))     # the language model's reading, else the raw line
         want = cutcraft.norm_tokens(said or '')
         best = None
+        if not c.get('material') and c.get('out') is not None and len(want) >= MIN_TOKENS and transcripts and n_materials > 1:
+            # Written in and out, no material: which material is it in? The one where these words are said there.
+            mat = _material_by_ear(c, said, transcripts)
+            if mat:
+                c['material'], c['material_by'] = mat, 'heard'
+                notes.append(f'"{c["desc"][:40]}" is said in material {mat} at {c["time"]:.0f}s: cut as written.')
+                out.append(c)
+                continue
         if len(want) >= MIN_TOKENS:
             for mat, words in transcripts.items():
                 if c.get('material') and mat != c['material']:
@@ -60,12 +68,74 @@ def locate_cues(cues, transcripts, n_materials=None):
             c['located'] = True
             notes.append(f'"{c["desc"][:40]}" found in material {mat} at {a:.1f}s (written {c["written_time"]:.1f}s).')
         else:
-            c['material'] = c.get('material') or 1
-            if len(want) >= MIN_TOKENS and transcripts:
+            if not c.get('material') and not (c.get('out') is not None and (n_materials or 1) > 1):
+                c['material'] = 1                              # (written in/out with several materials: looked for next)
+            if len(want) >= MIN_TOKENS and transcripts and c.get('out') is None:
                 notes.append(f'"{c["desc"][:40]}" was not heard in the footage; kept the written time.')
         out.append(c)
     out.sort(key=lambda c: (c.get('order', 0), c.get('material') or 1, c['time']))
     return out, notes
+
+
+WINDOW = 4.0            # seconds around a written cut in which its words are listened for
+
+
+def _material_by_ear(c, said, transcripts):
+    """The material whose speech, around the cue's written time, best matches the words; None when none does."""
+    lo, hi = float(c['time']) - WINDOW, float(c['out']) + WINDOW
+    best = None
+    for mat, words in transcripts.items():
+        near = [w for w in (words or []) if lo <= float(w['start']) <= hi]
+        if not near:
+            continue
+        r = cutcraft.align_script([{'text': said}], near, min_score=MIN_SCORE)[0]
+        if r['w0'] is not None and (best is None or r['score'] > best[0]):
+            best = (r['score'], mat)
+    return best[1] if best else None
+
+
+def merge_overlaps(cues):
+    """One cue where the script wrote the same moment twice: a shot (left column) and the spoken line (right column) whose
+    times overlap are one clip, the span of both. The shot's words describe the picture, the spoken line's are what is said."""
+    out = []
+    for c in cues:
+        hit = None
+        for o in out:
+            if o.get('out') is None or c.get('out') is None or o.get('time') is None or c.get('time') is None:
+                continue
+            if o.get('material') and c.get('material') and o['material'] != c['material']:
+                continue
+            if {o.get('kind'), c.get('kind')} == {'shot', 'sot'} and c['time'] < o['out'] and o['time'] < c['out']:
+                hit = o
+                break
+        if not hit:
+            out.append(dict(c))
+            continue
+        sot, shot = (c, hit) if c.get('kind') == 'sot' else (hit, c)
+        hit['speech'] = sot.get('desc')
+        hit['desc'] = shot.get('desc') or sot.get('desc')
+        hit['kind'] = 'shot'
+        hit['time'] = min(hit['time'], c['time'])
+        hit['out'] = max(hit['out'], c['out'])
+        hit['material'] = hit.get('material') or c.get('material')
+        if not hit['material']:
+            hit.pop('material', None)
+        hit['order'] = min(hit.get('order', 0), c.get('order', 0))
+    return out
+
+
+def fallback_materials(cues):
+    """Cues still without a material take the one the cue before them (in script order) has, else material 1."""
+    prev = None
+    out = []
+    for c in sorted(cues, key=lambda x: x.get('order', 0)):
+        c = dict(c)
+        if not c.get('material'):
+            c['material'] = prev or 1
+            c['material_by'] = 'previous cue'
+        prev = c['material']
+        out.append(c)
+    return out
 
 
 # ---- by looking: cues whose words were not heard ("WIDE REACTS KUHA CP") ----
@@ -206,7 +276,7 @@ def drop_sot_when_clips_fill(cues, plug_length):
     if not sots:
         return cues, None
     shots = [c for c in cues if c.get('kind') != 'sot']
-    span = sum(max(0.0, c['out'] - c['time']) for c in shots if is_complete(c))
+    span = sum(max(0.0, c['out'] - c['time']) for c in shots if c.get('out') is not None and c.get('time') is not None)
     if span >= FILL * plug_length:
         return shots, (f'The script\'s written clips ({span:.0f}s) fill the {plug_length:g}s plug; its spoken lines (SOT) '
                        'are the sound of those shots, not extra clips.')

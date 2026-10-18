@@ -6373,6 +6373,20 @@ def api_validate_script():
             'line': line[:160],
         })
 
+    # A two-column script: what the render will really cut is what the layout reader found (both columns).
+    _sbrief = read_script_brief(raw_script, script_name, text, parse_script_cues(text, available_materials=available)) if raw_script else None
+    _lay = cue_locate.merge_overlaps(scriptbrief.cues_from_brief(_sbrief, available)) if _sbrief else []
+    if _lay:
+        kept = [{'time': c['time'], 'timecode': _seconds_to_tc(c['time']), 'raw_time': c['time'],
+                 'raw_timecode': _seconds_to_tc(c['time']),
+                 'out_timecode': _seconds_to_tc(c['out']) if c.get('out') is not None else None,
+                 'desc': (c.get('desc') or '')[:160], 'material': c.get('material'), 'status': 'ok',
+                 'note': ('shot + spoken line' if c.get('speech') else 'spoken line' if c.get('kind') == 'sot' else 'shot')
+                         + ('' if c.get('material') else ' · material found from the footage'),
+                 'line': (c.get('desc') or '')[:160]} for c in _lay]
+        skipped = []
+        lines = lines or ['x'] * len(kept)
+
     warnings = []
     if not kept:
         warnings.append(
@@ -6414,7 +6428,7 @@ def api_validate_script():
         has_segment_offsets=bool(segment_offsets),
         segment_count=len(segment_offsets) or 0,
         text_preview=(text[:500] + ('…' if len(text) > 500 else '')),
-        script_brief=(read_script_brief(raw_script, script_name, text,
+        script_brief=_sbrief if _sbrief is not None else (read_script_brief(raw_script, script_name, text,
                                         parse_script_cues(text, available_materials=available)) if raw_script else None),
     )
 
@@ -10888,13 +10902,13 @@ def select_scenes_vo_led(scenes_data, vo_text, trailer_duration, max_scene_dur, 
     return selected, total_sel
 
 
-def _look_for_cue(path, cue, model):
+def _look_for_cue(path, cue, model, offsets=None):
     """{time: 0..10} -- how well frames around the cue's written time match its description, per the vision model."""
     import base64
     t0 = float(cue['time'])
     dur = probe_duration(path) or 0
     out = {}
-    for off in cue_locate.OFFSETS:
+    for off in (offsets or cue_locate.OFFSETS):
         t = round(t0 + off, 3)
         if t < 0 or (dur and t > dur - 0.2):
             continue
@@ -10913,6 +10927,41 @@ def _look_for_cue(path, cue, model):
         except (ValueError, TypeError):
             continue
     return out
+
+
+CAPTION_PROMPT = ('This is a frame from a TV drama promo. Describe what you actually see in one plain sentence of at most 25 words: '
+                  'how many people, who they are (man, woman, older, young), what they are doing or reacting to and their expression, '
+                  'the shot size (wide, medium or close-up) and the setting. Do not mention that it is dark or monochrome unless nothing else '
+                  'can be seen. Do not guess names.')
+
+
+def _caption_selected(selected, limit=10):
+    """Gives each chosen clip a literal description from the vision model (the frame in the middle of what is used),
+    for the scene table. Clips that already have one, and all clips when the model is not reachable, are left as they are."""
+    import base64
+    todo = [s for s in selected if not s.get('ai_desc')][:limit]
+    if not todo or _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] != 'up':
+        return
+    model = load_production_defaults().get('vision_model') or 'qwen3-vl:8b'
+    for s in todo:
+        try:
+            src = s.get('source_path') or s.get('path')
+            if not src:
+                continue
+            t = float(s.get('trim_start', s.get('start', 0.0))) + float(s.get('selected_dur') or 1.0) / 2.0
+            r = subprocess.run([FFMPEG, '-v', 'error', '-ss', f'{t:.3f}', '-i', src, '-frames:v', '1', '-vf', 'scale=768:-2',
+                                '-f', 'image2pipe', '-c:v', 'mjpeg', '-'], capture_output=True, timeout=60)
+            if not r.stdout:
+                continue
+            resp = requests.post(f'{OLLAMA_URL}/api/generate', json={
+                'model': model, 'prompt': CAPTION_PROMPT, 'stream': False, 'think': False,
+                'images': [base64.b64encode(r.stdout).decode()],
+                'options': {'temperature': 0.2, 'num_predict': 80}}, timeout=120).json()
+            txt = re.sub(r'\s+', ' ', (resp.get('response') or '')).strip().strip('"')
+            if txt:
+                s['ai_desc'] = txt[:220]
+        except Exception as e:
+            print(f'Scene description failed ({e})')
 
 
 def _run_trailer_job(jid, params):
@@ -10966,6 +11015,12 @@ def _run_trailer_job(jid, params):
     _cues0 = params.get('script_cues') or []
     # The left column's clips are the cuts. The right column's timecoded lines (SOT) are the sound taken from the
     # footage: they only become cuts of their own when the written clips leave most of the plug empty.
+    _n_before = len(_cues0)
+    _cues0 = cue_locate.merge_overlaps(_cues0)           # a shot and the spoken line of the same moment are one clip
+    if len(_cues0) < _n_before:
+        _m_note = f'{_n_before - len(_cues0)} cue(s) written twice (shot and spoken line at the same time) were joined into one clip each.'
+        print('Script cue:', _m_note)
+        params.setdefault('cue_notes', []).append(_m_note)
     _cues0, _sot_note = cue_locate.drop_sot_when_clips_fill(_cues0, trailer_length)
     if _sot_note:
         print('Script cue:', _sot_note)
@@ -10991,7 +11046,7 @@ def _run_trailer_job(jid, params):
     if any(not cue_locate.is_complete(c) for c in _cues0):
         _mats0 = [p_ for p_ in (params.get('materials_paths') or [path]) if p_ and os.path.isfile(p_)] or [path]
         _tr0 = {}
-        if any(len(cutcraft.norm_tokens((c['dialog'] if 'dialog' in c else c.get('desc')) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not cue_locate.is_complete(c)):
+        if any(len(cutcraft.norm_tokens((c['dialog'] or c.get('speech') if 'dialog' in c else (c.get('speech') or c.get('desc'))) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not cue_locate.is_complete(c)):
             job_set(jid, percent=3, step='Listening to the footage for the script\'s dialogue')
             for _i0, _p0 in enumerate(_mats0, 1):
                 try:
@@ -10999,6 +11054,28 @@ def _run_trailer_job(jid, params):
                 except Exception as e:
                     print(f'Cue dialogue search: material {_i0} not transcribed ({e})')
         _cues0, _notes0 = cue_locate.locate_cues(_cues0, _tr0, len(_mats0))
+        # A cue with its times written but no material: after listening, look. Each material's picture at that
+        # time is compared with what the script describes; the best one is the cue's material.
+        _pend = [c for c in _cues0 if not c.get('material')]
+        if _pend and len(_mats0) > 1 and _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
+            job_set(jid, percent=4, step='Finding which material each cue is in')
+            _model1 = load_production_defaults().get('vision_model') or 'qwen3-vl:8b'
+            for _c1 in _pend:
+                _what = _c1.get('visual') or (_c1.get('desc') if _c1.get('kind') != 'sot' else None)
+                if not _what:
+                    continue
+                _sc1 = {}
+                for _m1, _p1 in enumerate(_mats0, 1):
+                    try:
+                        _s1 = _look_for_cue(_p1, dict(_c1, visual=_what), _model1, offsets=(0.0, 1.0, 2.0))
+                        _sc1[_m1] = max(_s1.values()) if _s1 else 0
+                    except Exception as e:
+                        print(f'Material choice by picture failed ({e})')
+                ranked = sorted(_sc1.items(), key=lambda kv: -kv[1])
+                if ranked and ranked[0][1] >= cue_locate.VISION_MIN and (len(ranked) < 2 or ranked[0][1] >= ranked[1][1] + cue_locate.VISION_MARGIN):
+                    _c1['material'], _c1['material_by'] = ranked[0][0], 'look'
+                    _notes0.append(f'"{_c1["desc"][:40]}" looks like material {ranked[0][0]} (picture match {_sc1}).')
+        _cues0 = cue_locate.fallback_materials(_cues0)
         _look = [c for c in _cues0 if not cue_locate.is_complete(c) and not c.get('located') and (c.get('visual') or (c.get('desc') if 'visual' not in c and c.get('kind') != 'sot' else None))]
         if _look and _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
             job_set(jid, percent=4, step='Looking at the footage for the script\'s shots')
@@ -12499,6 +12576,7 @@ def _run_trailer_job(jid, params):
                 print(f'Preview thumbnail {tag}{i} failed: {e}')
                 return None
 
+        _caption_selected(selected)
         thumbs = [_thumb(s, 's', i) for i, s in enumerate(selected)]
         alt_thumbs = [_thumb(s, 'a', i) for i, s in enumerate(alternates)]
 
@@ -13368,6 +13446,7 @@ def _run_trailer_job(jid, params):
             if os.path.exists(_tmp):
                 os.remove(_tmp)
 
+    _caption_selected(selected)
     result = dict(
         status='ok', trailer_url=f'/uploads/{filename}',
         overlay_note=overlay_note,
@@ -13455,7 +13534,8 @@ def _run_trailer_job(jid, params):
             script_cue_count=len(params.get('script_cues') or []) or None,
         ),
         scenes=[{
-            'scene': i+1, 'start': round(s['start'], 1), 'end': round(s['end'], 1),
+            'scene': i+1, 'start': round(s['start'], 1),
+            'end': round(s['start'] + s['selected_dur'], 1) if s.get('script_desc') else round(s['end'], 1),
             'quality': s['total_score'], 'duration': round(s['selected_dur'], 1),
             'material': s.get('material'),
             'script_desc': s.get('script_desc') or None,
