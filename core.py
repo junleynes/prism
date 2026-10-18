@@ -4,7 +4,7 @@ Everything else in this app (auth, the trailer library, the media pipeline)
 imports `app` from here. Kept dependency-free of the other modules so there's
 no risk of circular imports.
 """
-import os, shutil, tempfile, threading, time, secrets, hmac
+import os, re, shutil, tempfile, threading, time, secrets, hmac
 from collections import deque
 from flask import Flask, request, jsonify, session, redirect, url_for
 from flask.sessions import SecureCookieSessionInterface
@@ -26,50 +26,83 @@ if os.environ.get('TRUST_PROXY_HEADERS', '').lower() in ('1', 'true', 'yes'):
 UPLOAD_DIR_PREFIX = 'prism_up_'
 
 
-def _pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True            # exists, just not ours to signal (or Windows: be conservative)
-    return True
+# Runs before this module's own folder is made, so it is a plain pattern: what
+# tempfile.mkdtemp() named its folders before the prefix above existed.
+_LEGACY_DIR = re.compile(r'^tmp[a-z0-9_]{8}$')
+_HEARTBEAT_EVERY = 300          # a running instance touches its .pid this often...
+_HEARTBEAT_STALE = 1800         # ...so one untouched this long belongs to a run that is gone
+_IDLE_LEGACY = 6 * 3600         # an old-style folder nothing in has changed for this long is abandoned
 
 
-def reap_stale_upload_dirs(parent, keep=None):
-    """Deletes the per-run upload folders (prism_up_*) that earlier runs of this
-    app left behind. Each run makes a fresh folder and nothing ever removed the
-    old ones, so every restart or crash orphaned whatever staging and render
-    files were in it -- the way the system temp folder grew without limit.
-    A folder is stale when the process named in its .pid file is gone."""
-    freed = 0
+def _newest_and_size(path):
+    newest, size = os.path.getmtime(path), 0
+    for dp, _dn, fn in os.walk(path):
+        for x in fn:
+            try:
+                st = os.stat(os.path.join(dp, x))
+            except OSError:
+                continue
+            newest, size = max(newest, st.st_mtime), size + st.st_size
+    return newest, size
+
+
+def stale_upload_dirs(parent, keep=None, legacy=False, now=None):
+    """[(path, bytes)] of the per-run upload folders under `parent` that no
+    running instance owns.
+
+    Each run makes a fresh folder and nothing used to remove the old ones, so
+    every restart or crash orphaned whatever staging and render files were in
+    it -- the way the temp folder grew to 1.8 TB. A prism_up_* folder is live
+    while its .pid file is being touched (see _claim_upload_folder), and stale
+    once it has not been for half an hour. (Not by asking whether the process
+    exists: process ids are reused, quickly on Windows, and signalling a pid
+    there can kill it.) With `legacy`, folders named the way mkdtemp() named
+    them before this existed (tmpXXXXXXXX) are included once nothing in them
+    has changed for six hours -- only for the folder set in UPLOAD_TEMP_DIR,
+    which the deployment gave to this app, never for the system temp folder."""
+    now = time.time() if now is None else now
+    out = []
     try:
         names = os.listdir(parent)
     except OSError:
-        return 0
+        return out
     for name in names:
         p = os.path.join(parent, name)
-        if not name.startswith(UPLOAD_DIR_PREFIX) or p == keep or not os.path.isdir(p) or os.path.islink(p):
+        if p == keep or os.path.islink(p) or not os.path.isdir(p):
             continue
         try:
-            with open(os.path.join(p, '.pid')) as f:
-                pid = int(f.read().strip())
-            if pid == os.getpid() or _pid_alive(pid):
-                continue
-        except (OSError, ValueError):
-            pass                       # no readable pid: only reap if it has been idle a while
-            try:
-                if time.time() - os.path.getmtime(p) < 6 * 3600:
-                    continue
-            except OSError:
-                continue
-        for dp, _dn, fn in os.walk(p):
-            for x in fn:
+            if name.startswith(UPLOAD_DIR_PREFIX):
                 try:
-                    freed += os.path.getsize(os.path.join(dp, x))
+                    beat = os.path.getmtime(os.path.join(p, '.pid'))
                 except OSError:
-                    pass
+                    beat = None
+                if beat is not None:
+                    if now - beat < _HEARTBEAT_STALE:
+                        continue
+                    size = _newest_and_size(p)[1]
+                else:
+                    newest, size = _newest_and_size(p)       # no marker: only once it has sat idle a while
+                    if now - newest < _IDLE_LEGACY:
+                        continue
+            elif legacy and _LEGACY_DIR.match(name):
+                newest, size = _newest_and_size(p)
+                if now - newest < _IDLE_LEGACY:
+                    continue
+            else:
+                continue
+        except OSError:
+            continue
+        out.append((p, size))
+    return out
+
+
+def reap_stale_upload_dirs(parent, keep=None, legacy=False):
+    """Deletes what stale_upload_dirs finds. Returns bytes freed."""
+    freed = 0
+    for p, size in stale_upload_dirs(parent, keep, legacy):
         shutil.rmtree(p, ignore_errors=True)
+        if not os.path.exists(p):
+            freed += size
     if freed:
         print(f'Removed {freed / (1024**3):.2f} GB of upload folders left by earlier runs')
     return freed
@@ -107,21 +140,44 @@ if _upload_temp_dir:
         print(' fix the path or its permissions, then restart.')
         print('=' * 64)
 
+def upload_parents():
+    """[(folder, legacy)] where this app's upload folders live: the folder the
+    current one is in, and the system temp folder. Old-style names are only
+    looked for in the first, and only when UPLOAD_TEMP_DIR chose it."""
+    folder = app.config['UPLOAD_FOLDER']
+    parent = os.path.dirname(folder)
+    chosen = bool(_upload_temp_dir) and os.path.realpath(parent) == os.path.realpath(_upload_temp_dir)
+    out = [(parent, chosen)]
+    if os.path.realpath(tempfile.gettempdir()) != os.path.realpath(parent):
+        out.append((tempfile.gettempdir(), False))
+    return out
+
+
 def _claim_upload_folder():
-    """Marks this run's folder with our pid, clears the dead runs' folders from
-    the same parent, and removes our own on a clean exit."""
+    """Marks this run's folder live (a .pid file touched every few minutes),
+    clears the folders of runs that are gone, and removes our own on a clean
+    exit."""
     import atexit
     folder = app.config['UPLOAD_FOLDER']
-    try:
-        with open(os.path.join(folder, '.pid'), 'w') as f:
-            f.write(str(os.getpid()))
-    except OSError:
-        pass
-    parent = os.path.dirname(folder)
-    for par in {parent, tempfile.gettempdir()}:
+    marker = os.path.join(folder, '.pid')
+
+    def beat():
         try:
-            reap_stale_upload_dirs(par, keep=folder)
-        except Exception as e:
+            with open(marker, 'w') as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
+
+    def loop():
+        while True:
+            time.sleep(_HEARTBEAT_EVERY)
+            beat()
+    beat()
+    threading.Thread(target=loop, daemon=True, name='upload-heartbeat').start()
+    for par, legacy in upload_parents():
+        try:
+            reap_stale_upload_dirs(par, keep=folder, legacy=legacy)
+        except Exception as e:                                  # noqa: BLE001
             print(f'Upload folder cleanup error: {e}')
     atexit.register(lambda: shutil.rmtree(folder, ignore_errors=True))
 

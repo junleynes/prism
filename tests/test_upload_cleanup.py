@@ -13,25 +13,47 @@ def _age(path, secs):
     os.utime(path, (t, t))
 
 
-def test_folders_left_by_dead_runs_are_removed_and_live_ones_kept(tmp_path):
+def test_folders_of_runs_that_stopped_beating_are_removed_and_live_ones_kept(tmp_path):
     dead, live, other = (tmp_path / 'prism_up_dead'), (tmp_path / 'prism_up_live'), (tmp_path / 'unrelated')
     for d in (dead, live, other):
         d.mkdir()
         (d / 'big.bin').write_bytes(b'x' * 1000)
-    (dead / '.pid').write_text('999999999')
-    (live / '.pid').write_text(str(os.getppid()))
+    (dead / '.pid').write_text('1'); _age(dead / '.pid', 3600)      # nobody has touched it for an hour
+    (live / '.pid').write_text('1')                                 # touched just now
     freed = core.reap_stale_upload_dirs(str(tmp_path))
     assert freed >= 1000 and not dead.exists()
     assert live.exists() and other.exists(), 'a running instance and non-PRISM folders are never touched'
 
 
-def test_a_folder_with_no_pid_is_only_removed_once_idle(tmp_path):
+def test_a_folder_with_no_marker_is_only_removed_once_idle(tmp_path):
     fresh, old = tmp_path / 'prism_up_fresh', tmp_path / 'prism_up_old'
     for d in (fresh, old):
         d.mkdir()
-    _age(old, 7 * 3600)
+    (old / 'f.bin').write_bytes(b'z'); _age(old / 'f.bin', 7 * 3600); _age(old, 7 * 3600)
     core.reap_stale_upload_dirs(str(tmp_path))
     assert fresh.exists() and not old.exists()
+
+
+def test_old_style_folders_are_reaped_only_where_the_deployment_gave_the_folder_to_the_app(tmp_path):
+    """JUN: D:\\TEMP held 1.8 TB in tmpXXXXXXXX folders from before the prefix existed."""
+    legacy, busy, stranger = tmp_path / 'tmpa1b2c3d4', tmp_path / 'tmpzzzzzzzz', tmp_path / 'my_own_folder'
+    for d in (legacy, busy, stranger):
+        d.mkdir()
+        (d / 'clip.mp4').write_bytes(b'v' * 4000)
+    _age(legacy / 'clip.mp4', 9 * 3600); _age(legacy, 9 * 3600)
+    _age(stranger / 'clip.mp4', 9 * 3600); _age(stranger, 9 * 3600)
+    assert core.reap_stale_upload_dirs(str(tmp_path)) == 0 and legacy.exists(), 'not asked to: the system temp folder is not ours'
+    found = core.stale_upload_dirs(str(tmp_path), legacy=True)
+    assert [os.path.basename(p) for p, _b in found] == ['tmpa1b2c3d4'] and found[0][1] == 4000
+    assert core.reap_stale_upload_dirs(str(tmp_path), legacy=True) == 4000
+    assert not legacy.exists() and busy.exists() and stranger.exists(), 'recent and differently named folders stay'
+
+
+def test_a_running_instance_keeps_its_marker_fresh_and_nothing_signals_a_process():
+    import inspect
+    folder = core.app.config['UPLOAD_FOLDER']
+    assert os.path.exists(os.path.join(folder, '.pid'))
+    assert 'os.kill' not in inspect.getsource(core), 'on Windows signalling a pid terminates it'
 
 
 def test_the_sweeper_removes_old_work_folders_not_just_files(tmp_path):

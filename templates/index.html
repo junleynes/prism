@@ -14831,16 +14831,18 @@ async function loadStorageTab(){
     box.innerHTML = '<div class=card>' + vols +
       '<p style="font-size:12px;margin:8px 0 0">Temp / uploads folder: <strong>' + stFmt(d.temp.bytes) + '</strong> &middot; files older than ' + d.temp.ttl_hours +
       ' h are swept automatically' + (d.temp.cap_gb ? ' &middot; capped at ' + d.temp.cap_gb + ' GB' : '') + '.</p>' +
+      (d.orphans && d.orphans.count ? '<p style="font-size:12px;margin:6px 0 0;color:var(--amber)"><strong>' + d.orphans.count + ' old temp folder' + (d.orphans.count === 1 ? '' : 's') +
+        ' (' + stFmt(d.orphans.bytes) + ')</strong> left by earlier runs of the app &mdash; <em>Clean now</em> removes them, and so does every restart.</p>' : '') +
       '<p style="font-size:12px;margin:10px 0 0">Refuse a render when less than <input type=number min=0 step=0.5 class=input-box id=st-minfree value="' + d.min_free_gb +
       '" style="width:80px;margin:0 4px"> GB is free (0 = never refuse).</p></div>' + kinds +
       '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px">' +
       '<button type=button class=btn id=st-save>Save retention &amp; limit</button>' +
       '<button type=button class=btn id=st-clean style="color:var(--tally);border-color:var(--tally)">Clean now</button>' +
-      '<span style="font-size:12px;opacity:.7">' + (d.due.items ? d.due.items + ' item(s), ' + stFmt(d.due.bytes) + ' are past their retention and will go' : 'Nothing is past its retention.') +
+      '<span style="font-size:12px;opacity:.7">' + (d.due.items || (d.orphans && d.orphans.count) ? d.due.items + ' item(s) past retention' + (d.orphans && d.orphans.count ? ' and ' + d.orphans.count + ' old temp folder(s)' : '') + ' &mdash; ' + stFmt(d.due.bytes) + ' will go' : 'Nothing is past its retention.') +
       ' Anything marked <em>keep</em> is never removed.</span></div>'
     document.getElementById('st-save').onclick = saveStorageSettings
     document.getElementById('st-clean').onclick = function(){
-      if(!confirm('Delete everything past its retention now (' + d.due.items + ' item(s), ' + stFmt(d.due.bytes) + ')? This cannot be undone.')) return
+      if(!confirm('Delete everything past its retention and every old temp folder now (' + stFmt(d.due.bytes) + ')? This cannot be undone.')) return
       stClean()
     }
     box.querySelectorAll('[data-st-pin]').forEach(function(c){

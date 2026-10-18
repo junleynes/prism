@@ -20,6 +20,7 @@ import time
 
 from flask import jsonify, request, session
 
+import core
 from core import app, _client_ip
 import library_db
 from library_db import LIBRARY_DIR, audit_log
@@ -160,6 +161,13 @@ def inventory():
     return items
 
 
+def orphans():
+    """Upload folders left behind by runs that are gone: {'count', 'bytes'}."""
+    keep = pipeline.app.config['UPLOAD_FOLDER']
+    found = [x for par, legacy in core.upload_parents() for x in core.stale_upload_dirs(par, keep, legacy)]
+    return {'count': len(found), 'bytes': sum(b for _p, b in found)}
+
+
 def volumes():
     """Free and total space on each distinct drive the app writes to."""
     seen, out = set(), []
@@ -236,6 +244,9 @@ def clean(dry_run=False, now=None):
     if not dry_run:
         try:
             freed_tmp = pipeline.sweep_upload_folder()
+            keep = pipeline.app.config['UPLOAD_FOLDER']
+            for par, legacy in core.upload_parents():
+                freed_tmp += core.reap_stale_upload_dirs(par, keep=keep, legacy=legacy)
         except Exception as e:                                  # noqa: BLE001
             print(f'Storage clean: temp sweep failed: {e}')
     return {'items': gone, 'bytes': freed, 'failed': failed, 'temp_bytes': freed_tmp}
@@ -283,10 +294,11 @@ def api_admin_storage():
                     'retention_days': cfg['retention_days'][k], 'largest': mine[:20]}
     folder = pipeline.app.config['UPLOAD_FOLDER']
     would = clean(dry_run=True)
-    return jsonify(ok=True, kinds=kinds, min_free_gb=cfg['min_free_gb'], volumes=volumes(),
+    old = orphans()
+    return jsonify(ok=True, kinds=kinds, min_free_gb=cfg['min_free_gb'], volumes=volumes(), orphans=old,
                    temp={'bytes': _tree_size(folder), 'ttl_hours': round(pipeline.UPLOAD_TTL / 3600, 1),
                          'cap_gb': pipeline.UPLOAD_MAX_GB},
-                   due={'items': would['items'], 'bytes': would['bytes']})
+                   due={'items': would['items'], 'bytes': would['bytes'] + old['bytes']})
 
 
 @app.route('/api/admin/storage/settings', methods=['POST'])
