@@ -3170,7 +3170,7 @@ CARD_VO_TAIL = 0.25            # silence kept after the last word
 CARD_VO_MIN_SAVING = 0.25      # not worth a re-cut for less than this
 
 
-def _breath_threshold_db(wav, default=-38.0):
+def _breath_threshold_db(wav, default=-38.0, under_peak=27.0):
     """How quiet counts as "no speech" in this recording, in dB: a fixed distance under its own loudest
     point, not a fixed level. A breath or room tone sits some 25-35 dB under the voice whatever the
     recording level is, so a fixed -38 dB catches them in a quiet take and misses them in a hot one."""
@@ -3180,7 +3180,7 @@ def _breath_threshold_db(wav, default=-38.0):
         m = re.search(r'max_volume:\s*(-?[\d.]+) dB', r.stderr or '')
         if not m:
             return default
-        return max(-48.0, min(-34.0, float(m.group(1)) - 27.0))
+        return max(-48.0, min(-34.0, float(m.group(1)) - under_peak))
     except Exception:
         return default
 
@@ -6393,6 +6393,44 @@ def api_validate_script():
 _vo_ranges_limiter = _RateLimiter(limit=int(os.environ.get('VO_RANGES_RATE_LIMIT', 60)), window=300)
 
 
+VOICE_LEAD = 0.06    # room kept before the first sound of a selection
+VOICE_TAIL = 0.08    # room kept after the last sound of it
+
+
+def _voice_windows(path):
+    """Where the recording is louder than its own breaths and room tone: [(start, end)], or [] when it
+    can't be read (callers then fall back to the transcript's word times alone)."""
+    try:
+        dur = probe_duration(path) or 0.0
+        if dur <= 0:
+            return []
+        thr = _breath_threshold_db(path, under_peak=22.0)
+        sil = _detect_silence_intervals(path, noise_db=thr, min_dur=0.12)
+        return _active_windows_from_silence(sil, dur)
+    except Exception as e:
+        print(f'Voice windows failed: {e}')
+        return []
+
+
+def _snap_to_voice(voice, w_in, w_out):
+    """The selection for one spoken line: from just before its first sound to just after its last, found in
+    the audio rather than taken from the transcript. A speech-to-text word end often runs on through the
+    breath that follows, which is why a selection padded from it ended on a pause."""
+    lo, hi = max(0.0, w_in - 0.25), w_out + 0.35
+    if not voice:
+        return lo, hi
+    inside = [(a, b) for a, b in voice if b > w_in - 0.3 and a < w_out + 0.3]
+    if not inside:
+        return lo, hi
+    first = min(a for a, b in inside)
+    last = max(b for a, b in inside)
+    # Never reach further than the transcript allows on either side: a window that spans into the next
+    # line must not stretch this one.
+    last = min(last, w_out + 0.3)
+    first = max(first, w_in - 0.3)
+    return max(0.0, first - VOICE_LEAD), max(last, w_in + 0.1) + VOICE_TAIL
+
+
 def _narration_range_from_brief(brief, path):
     """Where the script's voice-over lines are in the narration recording: {'in', 'out', 'lines': [...]} or None.
     in/out span the first to the last line found, with a little room each side."""
@@ -6412,10 +6450,10 @@ def _narration_range_from_brief(brief, path):
     # One In/Out pair per line, in recording order, so each line is its own selection (a little room each side,
     # never reaching into the neighbouring line).
     srt = sorted(hit, key=lambda h: h['in'])
+    voice = _voice_windows(path)
     parts = []
     for k, h in enumerate(srt):
-        lo = max(0.0, h['in'] - 0.25)
-        hi = h['out'] + 0.35
+        lo, hi = _snap_to_voice(voice, h['in'], h['out'])
         if k:
             lo = max(lo, (srt[k - 1]['out'] + h['in']) / 2)
         if k + 1 < len(srt):

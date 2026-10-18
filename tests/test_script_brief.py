@@ -610,3 +610,15 @@ def test_the_plan_leads_a_line_only_where_it_does_not_fit_and_the_review_says_so
                                     lead_max=cutcraft.LEAD_AUTO_MAX)
     assert not any('lead' in l for l in roomy['lines']), 'fits: no J-cut'
     assert pipeline._plan_view({'vo_jcut_auto': True}, tight, None, 15.0, 0.3)['jcut_auto'] is True
+
+
+def test_snap_to_voice_ends_on_the_last_sound_not_the_breath_after_it():
+    import pipeline
+    voice = [(1.0, 2.5), (3.4, 5.0)]
+    # the transcript's word end (2.9) runs on through the breath; the audio says the voice stopped at 2.5
+    lo, hi = pipeline._snap_to_voice(voice, 1.05, 2.9)
+    assert abs(hi - (2.5 + pipeline.VOICE_TAIL)) < 1e-6
+    assert abs(lo - (1.0 - pipeline.VOICE_LEAD)) < 1e-6
+    # a line the audio cannot place keeps the transcript padding
+    assert pipeline._snap_to_voice([], 1.0, 2.0) == (0.75, 2.35)
+    assert pipeline._snap_to_voice(voice, 7.0, 8.0) == (6.75, 8.35)
