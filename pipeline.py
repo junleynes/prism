@@ -5303,6 +5303,7 @@ def build_cue_clips(cues, materials_paths, min_seg_dur=0.8, default_cue_dur=4.0)
                 'total_score': 10.0,
                 'script_boost': 10.0,
                 'script_desc': c.get('desc') or f'M{mat}',
+                'cue_fixed': bool(mat and c.get('out') is not None),   # material + in + out written: cut exactly so
                 'script_found': c.get('located') or None,      # True = heard (Whisper), 'look' = seen (vision), None = written time
                 'script_written': c.get('written_time'),
                 'has_face': False,
@@ -7317,7 +7318,7 @@ def _rebalance_selected_durations(selected, target_duration, min_seg_dur=0.8):
     bounds = []
     for s in scenes:
         max_avail = max(min_seg_dur, (s['start'] + s['duration']) - s.get('trim_start', s['start']))
-        bounds.append((min_seg_dur, max_avail))
+        bounds.append((s['selected_dur'], s['selected_dur']) if s.get('cue_fixed') else (min_seg_dur, max_avail))
 
     for _ in range(6):
         current_total = sum(s['selected_dur'] for s in scenes)
@@ -11910,7 +11911,19 @@ def _run_trailer_job(jid, params):
             selected = build_cue_clips(script_cues, materials, min_seg_dur=min_seg_dur)
             used_driver = 'cue'
             if selected:
-                selected = _rebalance_selected_durations(selected, trailer_duration, min_seg_dur=min_seg_dur)
+                # A cue with its material, in and out written is cut exactly so. Only the cues that gave a start
+                # (or no end) are stretched or shrunk to fill what the written cuts leave of the plug.
+                _fixed = [s for s in selected if s.get('cue_fixed')]
+                _flex = [s for s in selected if not s.get('cue_fixed')]
+                _fixed_total = sum(s['selected_dur'] for s in _fixed)
+                if _flex:
+                    _flex = _rebalance_selected_durations(_flex, max(min_seg_dur * len(_flex), trailer_duration - _fixed_total),
+                                                          min_seg_dur=min_seg_dur)
+                selected = sorted(_fixed + _flex, key=lambda s: (s.get('material') or 0, s['start']))
+                if _fixed_total > trailer_duration + 0.5:
+                    card_fit_info['notes'].append(
+                        f'The script\'s written cuts add up to {_fixed_total:.0f}s, more than the {trailer_duration:.0f}s the '
+                        f'{trailer_length:g}s plug leaves for scenes. They are followed as written; pick a longer plug to fit them.')
             total_sel = sum(s['selected_dur'] for s in selected)
             n_seg = len(selected) + len(card_files)
             xfade_loss = max(0, (n_seg - 1)) * xfade_dur
@@ -12241,11 +12254,11 @@ def _run_trailer_job(jid, params):
             if abs(residual) <= 0.01:
                 break
             if residual > 0:
-                headroom = [(s, max(0.0, s['duration'] - s['selected_dur'])) for s in selected]
+                headroom = [(s, 0.0 if s.get('cue_fixed') else max(0.0, s['duration'] - s['selected_dur'])) for s in selected]
             else:
                 headroom = []
                 for s in selected:
-                    room = max(0.0, s['selected_dur'] - min_seg_dur)
+                    room = 0.0 if s.get('cue_fixed') else max(0.0, s['selected_dur'] - min_seg_dur)
                     if transcribe_for_cuts and speech_spans:
                         clip_start = s['trim_start']
                         clip_end = clip_start + s['selected_dur']
@@ -12465,6 +12478,7 @@ def _run_trailer_job(jid, params):
                      'vo_beat': s.get('vo_beat'), 'vo_match': s.get('vo_match'), 'cut': s.get('cut'),
                      'script_boost': s.get('script_boost'), 'script_desc': s.get('script_desc'),
                      'script_found': s.get('script_found'),
+                     'cue_fixed': bool(s.get('cue_fixed')),
                      'edge_ratio': s.get('edge_ratio', 0), 'mean_hue': s.get('mean_hue', 0),
                      'energy_score': s.get('energy_score', 0), 'tags': s.get('tags') or [],
                      'pinned': bool(s.get('pinned'))}
