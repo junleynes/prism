@@ -35,7 +35,7 @@ def locate_cues(cues, transcripts, n_materials=None):
                 c = verify_spoken(c, transcripts[c['material']], notes)
             out.append(c)
             continue
-        said = (c['dialog'] or c.get('speech') or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else (c.get('speech') or c.get('desc'))     # the language model's reading, else the raw line
+        said = _spoken_words(c)
         want = cutcraft.norm_tokens(said or '')
         best = None
         if len(want) >= MIN_TOKENS:
@@ -73,7 +73,7 @@ def locate_cues(cues, transcripts, n_materials=None):
         else:
             if not c.get('material') and not (c.get('out') is not None and (n_materials or 1) > 1):
                 c['material'] = 1                              # (written in/out with several materials: looked for next)
-            if len(want) >= MIN_TOKENS and transcripts and c.get('out') is None:
+            if len(want) >= MIN_TOKENS and transcripts:
                 notes.append(f'"{c["desc"][:40]}" was not heard in the footage; kept the written time.')
         out.append(c)
     out.sort(key=lambda c: (c.get('order', 0), c.get('material') or 1, c['time']))
@@ -131,7 +131,12 @@ def is_spoken(c):
 
 
 def _spoken_words(c):
-    return (c.get('dialog') or c.get('speech') or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else (c.get('speech') or c.get('desc'))
+    """The words to listen for. The script's own spoken line comes first (it is what the writer meant, and is clean in a
+    two-column script); the language model's reading of a mixed line is the fallback."""
+    own = c.get('speech') or (c.get('desc') if c.get('kind') == 'sot' else None)
+    if own:
+        return own
+    return (c.get('dialog') or c.get('desc')) if 'dialog' in c else c.get('desc')
 
 
 def snap_edges(c, words, notes=None):

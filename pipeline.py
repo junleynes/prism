@@ -11048,11 +11048,18 @@ def _run_trailer_job(jid, params):
         _tr0 = {}
         if any(len(cutcraft.norm_tokens(cue_locate._spoken_words(c) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if (not cue_locate.is_complete(c)) or cue_locate.is_spoken(c)):
             job_set(jid, percent=3, step='Listening to the footage for the script\'s dialogue')
+            # The script's own spoken lines are given to the speech service as spelling hints (names, Taglish words).
+            _hint0 = ' '.join(str(cue_locate._spoken_words(c) or '') for c in _cues0 if cue_locate.is_spoken(c))[:400] or None
+            _heard0 = []
             for _i0, _p0 in enumerate(_mats0, 1):
                 try:
-                    _tr0[_i0] = transcribe_video(_p0)[0]
+                    _w0s, _s0s, _out0 = transcribe_video_detailed(_p0, prompt=_hint0)
+                    _tr0[_i0] = _w0s or cutcraft.words_from_segments(_s0s)       # phrase times when it gave no word times
+                    _heard0.append(f'material {_i0}: {len(_tr0[_i0])} words' + ('' if _tr0[_i0] else f' ({(_out0 or {}).get("reason") or "no speech"})'))
                 except Exception as e:
+                    _heard0.append(f'material {_i0}: not transcribed ({e})')
                     print(f'Cue dialogue search: material {_i0} not transcribed ({e})')
+            params.setdefault('cue_notes', []).append('Speech-to-text of every loaded material for the script\'s dialogue: ' + '; '.join(_heard0) + '.')
         _cues0, _notes0 = cue_locate.locate_cues(_cues0, _tr0, len(_mats0))
         # A cue with its times written but no material: after listening, look. Each material's picture at that
         # time is compared with what the script describes; the best one is the cue's material.

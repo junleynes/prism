@@ -260,3 +260,13 @@ def test_edges_in_speech_move_into_pauses_of_the_sound():
     out = cl.snap_to_silence(c, sil)
     assert 9.5 <= out['time'] <= 9.6 and 11.0 <= out["out"] <= 11.3
     assert cl.snap_to_silence({'time': 9.2, 'out': 11.2}, sil) == {'time': 9.2, 'out': 11.2}     # both already in pauses
+
+
+def test_writers_wrong_minute_is_found_in_the_other_material_by_the_line_itself():
+    # written 0:40-0:45 but the line is said at 1:40 of the second material
+    m1 = _sentence(3.0, 'unrelated chatter about something else entirely')
+    m2 = _sentence(100.0, "nina anak what's our password")
+    c = {'time': 40.0, 'out': 45.0, 'kind': 'shot', 'desc': 'WIDE REACTS KUHA CP',
+         'speech': "NINA, ANAK, WHAT'S OUR PASSWORD PASSWORD?", 'dialog': 'wide reacts'}      # model's reading must not win
+    out, notes = cl.locate_cues([c], {1: m1, 2: m2}, 2)
+    assert out[0]['material'] == 2 and out[0]['located'] and 99.5 < out[0]['time'] < 100.0 and out[0]['out'] >= 104.8
