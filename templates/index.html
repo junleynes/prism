@@ -14987,7 +14987,7 @@ function renderUsersTab(d){
       '</div>' +
     '</div>'
 
-  document.querySelectorAll('[data-gm]').forEach(gmRender)
+  document.querySelectorAll('[data-gm]').forEach(function(b){ gmRender(b) })
   fetch('/api/branding').then(function(r){ return r.json() }).then(function(b){
     var box = document.getElementById('cu-registration'); if(box) box.checked = b.registration_enabled !== false
   }).catch(function(){})
@@ -15009,7 +15009,7 @@ function gmRender(box, query){
     return '<span class=gm-chip>'+escapeHtmlLite(byId[i].username)+
       '<button type=button data-gm-remove="'+i+'" title="Remove from this group" aria-label="Remove">×</button></span>'
   }).join('') || '<span style="opacity:.6;font-size:11px">No members yet.</span>'
-  var q = (query || '').trim().toLowerCase()
+  var q = String(query == null ? '' : query).trim().toLowerCase()
   var pool = users.filter(function(u){ return ids.indexOf(u.id) === -1 && (!q || u.username.toLowerCase().indexOf(q) !== -1) })
   var list = q ? pool.slice(0, 8).map(function(u){
     return '<button type=button data-gm-add="'+u.id+'">'+escapeHtmlLite(u.username)+(u.role==='admin'?' <span style="opacity:.55;font-size:10px">admin</span>':'')+'</button>'

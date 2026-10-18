@@ -153,3 +153,9 @@ def test_graphite_is_a_branding_color_theme():
     t = library_db.THEME_PRESETS['graphite']
     assert t['label'] == 'Graphite' and library_db.resolve_theme_colors('graphite', None)['bg_dark'] == t['bg_dark']
     assert set(t) == set(library_db.THEME_PRESETS['violet'])
+
+
+def test_group_member_boxes_are_rendered_without_passing_the_index_as_a_search():
+    html = _page()
+    assert "forEach(function(b){ gmRender(b) })" in html, 'forEach hands over (el, index): the index is not a query'
+    assert "String(query == null ? '' : query).trim()" in html
