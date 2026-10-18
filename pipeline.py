@@ -4411,8 +4411,13 @@ def _suggest_card_vo_ranges(params, brief):
             al = cutcraft.align_script([{'text': t} for t in texts], words)
             hit = [(words[a['w0']]['start'], words[a['w1']]['end'], texts[i]) for i, a in enumerate(al) if a['w0'] is not None]
             if hit:
-                out[key] = {'in': round(max(0.0, min(h[0] for h in hit) - 0.25), 2),
-                            'out': round(max(h[1] for h in hit) + 0.35, 2), 'text': ' / '.join(h[2] for h in hit)}
+                env = _voice_envelope(path)
+                # The first line's start and the last line's end, found in the sound (not padded from the transcript).
+                first = min(hit, key=lambda h: h[0])
+                last = max(hit, key=lambda h: h[1])
+                lo = _snap_to_voice(env, first[0], first[1])[0]
+                hi = _snap_to_voice(env, last[0], last[1])[1]
+                out[key] = {'in': round(lo, 2), 'out': round(hi, 2), 'text': ' / '.join(h[2] for h in hit)}
         except Exception as e:
             print(f'Card narration not read for {key}: {e}')
     return out
@@ -6394,41 +6399,62 @@ def api_validate_script():
 _vo_ranges_limiter = _RateLimiter(limit=int(os.environ.get('VO_RANGES_RATE_LIMIT', 60)), window=300)
 
 
-VOICE_LEAD = 0.06    # room kept before the first sound of a selection
-VOICE_TAIL = 0.08    # room kept after the last sound of it
+VOICE_LEAD = 0.08    # room kept before the first sound of a selection
+VOICE_TAIL = 0.12    # room kept after the last sound of it (a word's own fade-out)
+BREATH_DB = 18.0     # a breath or room tone sits at least this far under the voice of the line it follows
+VOICE_RUN = 0.03     # a sound has to last this long to count (a click is not a word)
+VOICE_HOP = 0.01
 
 
-def _voice_windows(path):
-    """Where the recording is louder than its own breaths and room tone: [(start, end)], or [] when it
-    can't be read (callers then fall back to the transcript's word times alone)."""
+def _voice_envelope(path):
+    """(dB readings every VOICE_HOP seconds, hop) of the recording's sound, or None when it can't be read
+    (callers then fall back to the transcript's word times alone)."""
     try:
-        dur = probe_duration(path) or 0.0
-        if dur <= 0:
-            return []
-        thr = _breath_threshold_db(path, under_peak=22.0)
-        sil = _detect_silence_intervals(path, noise_db=thr, min_dur=0.12)
-        return _active_windows_from_silence(sil, dur)
+        import shorts_core
+        db = shorts_core.read_envelope(FFMPEG, path, {'audio_index': 0}, rate=8000, hop=VOICE_HOP, timeout=300)
+        return (np.asarray(db, dtype=np.float64), VOICE_HOP) if db is not None and len(db) else None
     except Exception as e:
-        print(f'Voice windows failed: {e}')
-        return []
+        print(f'Voice envelope failed: {e}')
+        return None
 
 
-def _snap_to_voice(voice, w_in, w_out):
+def _snap_to_voice(env, w_in, w_out):
     """The selection for one spoken line: from just before its first sound to just after its last, found in
     the audio rather than taken from the transcript. A speech-to-text word end often runs on through the
-    breath that follows, which is why a selection padded from it ended on a pause."""
+    breath that follows, which is why a selection padded from it ended on a pause.
+
+    "Sound" is judged against the line itself: louder than BREATH_DB under how loud this line is, so a hot
+    recording (whose breaths are loud in absolute terms) and a quiet one are cut the same way."""
     lo, hi = max(0.0, w_in - 0.25), w_out + 0.35
-    if not voice:
+    if not env:
         return lo, hi
-    inside = [(a, b) for a, b in voice if b > w_in - 0.3 and a < w_out + 0.3]
-    if not inside:
+    db, hop = env
+    i0, i1 = int(w_in / hop), min(len(db), int(w_out / hop) + 1)
+    if i1 - i0 < 5:
         return lo, hi
-    first = min(a for a, b in inside)
-    last = max(b for a, b in inside)
-    # Never reach further than the transcript allows on either side: a window that spans into the next
-    # line must not stretch this one.
-    last = min(last, w_out + 0.3)
-    first = max(first, w_in - 0.3)
+    ref = float(np.percentile(db[i0:i1], 75))
+    thr = ref - BREATH_DB
+    a, b = max(0, int((w_in - 0.3) / hop)), min(len(db), int((w_out + 0.3) / hop) + 1)
+    loud = db[a:b] >= thr
+    run = max(1, int(round(VOICE_RUN / hop)))
+    # indices that belong to a run of at least `run` loud readings
+    ok = np.zeros(len(loud), dtype=bool)
+    k = 0
+    while k < len(loud):
+        if loud[k]:
+            j = k
+            while j < len(loud) and loud[j]:
+                j += 1
+            if j - k >= run:
+                ok[k:j] = True
+            k = j
+        else:
+            k += 1
+    idx = np.nonzero(ok)[0]
+    if not len(idx):
+        return lo, hi
+    first = (a + idx[0]) * hop
+    last = (a + idx[-1] + 1) * hop
     return max(0.0, first - VOICE_LEAD), max(last, w_in + 0.1) + VOICE_TAIL
 
 
@@ -6451,7 +6477,7 @@ def _narration_range_from_brief(brief, path):
     # One In/Out pair per line, in recording order, so each line is its own selection (a little room each side,
     # never reaching into the neighbouring line).
     srt = sorted(hit, key=lambda h: h['in'])
-    voice = _voice_windows(path)
+    voice = _voice_envelope(path)
     parts = []
     for k, h in enumerate(srt):
         lo, hi = _snap_to_voice(voice, h['in'], h['out'])

@@ -612,13 +612,53 @@ def test_the_plan_leads_a_line_only_where_it_does_not_fit_and_the_review_says_so
     assert pipeline._plan_view({'vo_jcut_auto': True}, tight, None, 15.0, 0.3)['jcut_auto'] is True
 
 
+def _env(spec, total=10.0, hop=0.01, floor=-70.0):
+    """dB readings from [(start, end, level)] spans."""
+    import numpy as np
+    db = np.full(int(total / hop), floor)
+    for a, b, lvl in spec:
+        db[int(a / hop):int(b / hop)] = lvl
+    return db, hop
+
+
 def test_snap_to_voice_ends_on_the_last_sound_not_the_breath_after_it():
     import pipeline
-    voice = [(1.0, 2.5), (3.4, 5.0)]
-    # the transcript's word end (2.9) runs on through the breath; the audio says the voice stopped at 2.5
-    lo, hi = pipeline._snap_to_voice(voice, 1.05, 2.9)
-    assert abs(hi - (2.5 + pipeline.VOICE_TAIL)) < 1e-6
-    assert abs(lo - (1.0 - pipeline.VOICE_LEAD)) < 1e-6
+    # voice at -12 dB from 1.0 to 2.5, then a LOUD breath (-28 dB, only 16 dB under the voice) to 3.0
+    env = _env([(1.0, 2.5, -12.0), (2.5, 3.0, -31.0)])
+    lo, hi = pipeline._snap_to_voice(env, 1.05, 2.9)      # the transcript's word end runs through the breath
+    assert abs(hi - (2.5 + pipeline.VOICE_TAIL)) < 0.02
+    assert abs(lo - (1.0 - pipeline.VOICE_LEAD)) < 0.02
     # a line the audio cannot place keeps the transcript padding
-    assert pipeline._snap_to_voice([], 1.0, 2.0) == (0.75, 2.35)
-    assert pipeline._snap_to_voice(voice, 7.0, 8.0) == (6.75, 8.35)
+    assert pipeline._snap_to_voice(None, 1.0, 2.0) == (0.75, 2.35)
+
+
+def test_a_hot_recording_is_cut_the_same_as_a_quiet_one():
+    import pipeline
+    quiet = _env([(1.0, 2.5, -30.0), (2.5, 3.0, -52.0)])
+    hot = _env([(1.0, 2.5, -4.0), (2.5, 3.0, -26.0)])     # the same take 26 dB louder: its breath is far above -34 dB
+    a = pipeline._snap_to_voice(quiet, 1.05, 2.9)
+    b = pipeline._snap_to_voice(hot, 1.05, 2.9)
+    assert abs(a[1] - b[1]) < 0.02 and a[1] < 2.7
+
+
+def test_a_click_is_not_taken_for_the_end_of_the_line():
+    import pipeline
+    env = _env([(1.0, 2.5, -12.0), (2.8, 2.81, -10.0)])
+    assert pipeline._snap_to_voice(env, 1.05, 2.9)[1] < 2.7
+
+
+def test_snap_to_voice_on_real_audio_leaves_the_breath_out(tmp_path):
+    import shutil, subprocess
+    import pipeline
+    if not shutil.which('ffmpeg'):
+        pytest.skip('ffmpeg not available')
+    f = tmp_path / 'v.wav'
+    # 1.5 s voice, 0.5 s breath about 20 dB under it (a loud one), then a second line
+    subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=f=300:d=1.5,volume=4',
+                    '-f', 'lavfi', '-i', 'anoisesrc=d=0.5:a=0.05', '-f', 'lavfi', '-i', 'anullsrc=d=0.8:r=44100',
+                    '-f', 'lavfi', '-i', 'sine=f=300:d=1.2,volume=4', '-filter_complex',
+                    '[0][1][2][3]concat=n=4:v=0:a=1,aformat=sample_rates=44100:channel_layouts=mono', str(f)],
+                   check=True, timeout=60)
+    env = pipeline._voice_envelope(str(f))
+    lo, hi = pipeline._snap_to_voice(env, 0.05, 2.2)      # the transcript wrongly ends the first line at 2.2
+    assert 1.45 < hi < 1.8, hi
