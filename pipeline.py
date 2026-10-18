@@ -11143,6 +11143,17 @@ def _run_trailer_job(jid, params):
             cues_ = [c for c in (params.get('script_cues') or []) if c.get('material') and 1 <= c['material'] <= n_mat_]
             if cues_:
                 cue_time_ = sum(max(0.8, (c['out'] - c['time']) if c.get('out') else 4.0) for c in cues_)
+            if cue_time_:
+                # The script's clips and the cards' own voice lines set how long the plug has to be. A plug
+                # too short for them would crush the cards (and cut the end line off), so the plug is the
+                # next length that holds them: spoken clips cannot be shrunk without cutting words.
+                need_len_ = cue_time_ + sum(card_floors) - max(0, len(card_files) - 1) * xfade_dur
+                new_len_ = next((L_ for L_ in (15, 30, 45, 60) if L_ >= need_len_ * 0.9), 60)
+                if new_len_ > trailer_length:
+                    card_fit_info['notes'].append(
+                        f'The script\'s clips ({cue_time_:.0f}s) and the cards need about {need_len_:.0f}s, '
+                        f'so the plug is {new_len_}s, not {trailer_length:g}s.')
+                    trailer_length = new_len_
             plan_floors = card_floors
             if cue_time_:
                 # The script's own clips come first: the cards get what is left of the plug, down to a bare
@@ -11169,7 +11180,7 @@ def _run_trailer_job(jid, params):
                         card_durations[i] -= cut
                         note = f'{labels[i]} shortened by {cut:.1f}s so the scenes have room.'
                         if window_ and start_ > 0.05:
-                            note = (f'{labels[i]} cut to its {card_durations[i] - cut:.1f}s from {start_:.1f}s on '
+                            note = (f'{labels[i]} cut to its {card_durations[i]:.1f}s from {start_:.1f}s on '
                                     f'(the part with the title), not its first seconds.')
                         card_fit_info['notes'].append(note)
             total_card_dur = sum(card_durations)
