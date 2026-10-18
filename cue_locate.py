@@ -17,6 +17,11 @@ TAIL = 0.35             # room kept after the last word
 NEAR = 90.0             # seconds: between equal matches, the one this near the written time wins
 
 
+def is_complete(c):
+    """A cue that says everything: its material, where it starts and where it ends. It is cut exactly as written."""
+    return bool(c.get('material')) and c.get('out') is not None and c.get('time') is not None
+
+
 def locate_cues(cues, transcripts, n_materials=None):
     """`cues` as parse_script_cues made them; `transcripts` {material_number: [word dicts]}.
     Returns (cues, notes): every cue has a 'material'; a cue found by its words has its time (and out) moved
@@ -25,7 +30,7 @@ def locate_cues(cues, transcripts, n_materials=None):
     n_materials = n_materials or (max(transcripts) if transcripts else 1)
     for c in cues:
         c = dict(c)
-        if c.get('material') and c.get('kind') != 'sot':
+        if is_complete(c):
             out.append(c)
             continue
         said = (c['dialog'] or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else c.get('desc')     # the language model's reading, else the raw line

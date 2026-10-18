@@ -10943,7 +10943,7 @@ def _run_trailer_job(jid, params):
 
     # Cues that name no material are found by listening: Whisper on each material, the cue's words looked for.
     _cues0 = params.get('script_cues') or []
-    if any(not c.get('material') or c.get('kind') == 'sot' for c in _cues0):
+    if any(not cue_locate.is_complete(c) for c in _cues0):
         # 1. The language model reads the cue lines: which are spoken words, which are shots to find.
         if _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
             job_set(jid, percent=2, step='Reading the script\'s cues')
@@ -10953,7 +10953,7 @@ def _run_trailer_job(jid, params):
                 print(f'Cue analysis by the language model failed ({e}); using the cue lines as written.')
         _mats0 = [p_ for p_ in (params.get('materials_paths') or [path]) if p_ and os.path.isfile(p_)] or [path]
         _tr0 = {}
-        if any(len(cutcraft.norm_tokens((c['dialog'] if 'dialog' in c else c.get('desc')) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not c.get('material') or c.get('kind') == 'sot'):
+        if any(len(cutcraft.norm_tokens((c['dialog'] if 'dialog' in c else c.get('desc')) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not cue_locate.is_complete(c)):
             job_set(jid, percent=3, step='Listening to the footage for the script\'s dialogue')
             for _i0, _p0 in enumerate(_mats0, 1):
                 try:
@@ -10961,7 +10961,7 @@ def _run_trailer_job(jid, params):
                 except Exception as e:
                     print(f'Cue dialogue search: material {_i0} not transcribed ({e})')
         _cues0, _notes0 = cue_locate.locate_cues(_cues0, _tr0, len(_mats0))
-        _look = [c for c in _cues0 if not c.get('located') and (c.get('visual') or (c.get('desc') if 'visual' not in c and c.get('kind') != 'sot' else None))]
+        _look = [c for c in _cues0 if not cue_locate.is_complete(c) and not c.get('located') and (c.get('visual') or (c.get('desc') if 'visual' not in c and c.get('kind') != 'sot' else None))]
         if _look and _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
             job_set(jid, percent=4, step='Looking at the footage for the script\'s shots')
             _model0 = load_production_defaults().get('vision_model') or 'qwen3-vl:8b'
@@ -11148,12 +11148,10 @@ def _run_trailer_job(jid, params):
                 # too short for them would crush the cards (and cut the end line off), so the plug is the
                 # next length that holds them: spoken clips cannot be shrunk without cutting words.
                 need_len_ = cue_time_ + sum(card_floors) - max(0, len(card_files) - 1) * xfade_dur
-                new_len_ = next((L_ for L_ in (15, 30, 45, 60) if L_ >= need_len_ * 0.9), 60)
-                if new_len_ > trailer_length:
+                if need_len_ > trailer_length * 1.1:
                     card_fit_info['notes'].append(
-                        f'The script\'s clips ({cue_time_:.0f}s) and the cards need about {need_len_:.0f}s, '
-                        f'so the plug is {new_len_}s, not {trailer_length:g}s.')
-                    trailer_length = new_len_
+                        f'The script\'s clips ({cue_time_:.0f}s) and the cards need about {need_len_:.0f}s; '
+                        f'the {trailer_length:g}s plug is kept, so the clips are shortened to fit.')
             plan_floors = card_floors
             if cue_time_:
                 # The script's own clips come first: the cards get what is left of the plug, down to a bare

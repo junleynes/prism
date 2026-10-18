@@ -80,12 +80,20 @@ def test_two_material_script_keeps_the_lines_under_each_timecode():
     by = {(c['material'], c['time']): c for c in cues}
     assert 'TRAYDOR KA' in by[(1, 218.0)]['desc'] and by[(1, 218.0)]['kind'] == 'sot'
     assert by[(2, 35.0)]['desc'] == 'BUNOT GALO! TAWA MARK'
-    assert cl.locate_cues([dict(by[(1, 218.0)])], {1: W('traydor ka sino leader niyo', 221)}, 2)[0][0]['time'] < 221
+    assert cl.is_complete(by[(1, 218.0)]) and cl.is_complete(by[(2, 35.0)])   # labelled with in and out: followed as written
 
 
 def test_labelled_spoken_line_is_looked_for_only_on_its_own_material():
-    c = {'time': 5.0, 'out': 8.0, 'material': 2, 'kind': 'sot', 'desc': 'NASAN KAPATID KO'}
+    c = {'time': 5.0, 'material': 2, 'kind': 'sot', 'desc': 'NASAN KAPATID KO'}      # a start only: incomplete
     other = W('nasan kapatid ko', 30)
     mine = W('nasan kapatid ko', 44)
     out, _ = cl.locate_cues([c], {1: other, 2: mine}, 2)
     assert out[0]['material'] == 2 and abs(out[0]['time'] - 43.85) < 0.01
+
+
+def test_a_complete_cue_is_cut_exactly_as_written():
+    c = {'time': 218.0, 'out': 223.0, 'material': 1, 'kind': 'sot', 'desc': 'TRAYDOR KA'}
+    assert cl.is_complete(c)
+    out, notes = cl.locate_cues([c], {1: W('traydor ka', 230)}, 2)
+    assert out[0]['time'] == 218.0 and out[0]['out'] == 223.0 and not notes
+    assert not cl.is_complete({'time': 1.0, 'material': 1}) and not cl.is_complete({'time': 1.0, 'out': 4.0})
