@@ -42,3 +42,13 @@ def test_picture_match_moves_cue_only_when_clearly_better():
     assert cl.pick_by_look(c, {40.0: 7, 41.5: 8}) is c       # not clearly better
     assert cl.pick_by_look(c, {40.0: 1, 41.5: 4}) is c       # no real match
     assert cl.pick_by_look(c, {}) is c
+
+
+def test_model_reading_splits_spoken_from_shots():
+    cues = [{'time': 40.0, 'desc': 'NINA SAYS WHAT IS OUR PASSWORD'}, {'time': 50.0, 'desc': 'WIDE REACTS KUHA CP'}]
+    reply = '{"cues":[{"n":1,"dialog":"what is our password","visual":null,"material":null},{"n":2,"dialog":null,"visual":"wide shot, people react","material":null}]}'
+    a = cl.parse_analysis(reply, cues)
+    assert a[0]['dialog'] == 'what is our password' and a[1]['dialog'] is None and a[1]['visual'].startswith('wide')
+    out, _ = cl.locate_cues(a, {1: WORDS}, 1)
+    assert out[0]['located'] is True and not out[1].get('located')
+    assert cl.parse_analysis('not json', cues) == cues

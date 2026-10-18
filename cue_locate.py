@@ -6,6 +6,8 @@ time typed from a different cut of the episode is a little off anyway. So the cu
 for in what each uploaded material says (Whisper), and the cue is moved to where they are spoken.
 A cue with no words to look for, or none found, keeps its written time on the first material.
 """
+import json
+import re
 import cutcraft
 
 MIN_TOKENS = 2          # fewer words than this cannot be told apart from chatter
@@ -26,13 +28,14 @@ def locate_cues(cues, transcripts, n_materials=None):
         if c.get('material'):
             out.append(c)
             continue
-        want = cutcraft.norm_tokens(c.get('desc') or '')
+        said = c['dialog'] if 'dialog' in c else c.get('desc')     # the language model's reading, else the raw line
+        want = cutcraft.norm_tokens(said or '')
         best = None
         if len(want) >= MIN_TOKENS:
             for mat, words in transcripts.items():
                 if not words:
                     continue
-                r = cutcraft.align_script([{'text': c['desc']}], words, min_score=MIN_SCORE)[0]
+                r = cutcraft.align_script([{'text': said}], words, min_score=MIN_SCORE)[0]
                 if r['w0'] is None:
                     continue
                 w0, w1 = words[r['w0']], words[r['w1']]
@@ -90,3 +93,50 @@ def pick_by_look(cue, scores, duration=None):
         c['out'] = round(new + span, 3)
     c['located'] = 'look'
     return c
+
+
+# ---- the language model reads the script's cue lines first ----
+def analysis_prompt(cues):
+    lines = '\n'.join(f'{i + 1}. {c.get("desc") or ""}' for i, c in enumerate(cues))
+    return ('These are cue lines from a TV promo script, timecodes already removed. For each, say what the editor must find '
+            'in the footage. "dialog": the exact words a person SPEAKS on camera (a SOT / sound bite), or null when nobody '
+            'speaks or the line is only a shot instruction. "visual": a short description of the picture wanted (shot size, who, '
+            'what they do), or null. "material": the source number if the line names one (M1, M2, "material 2"), else null. '
+            'Voice-over lines read by the narrator are neither: use null for both.\n'
+            'Reply as JSON: {"cues":[{"n":1,"dialog":null,"visual":null,"material":null}, ...]} with one entry per line.\n\n' + lines)
+
+
+def parse_analysis(reply, cues):
+    """The cues with 'dialog' / 'visual' (and 'material') filled from the model's reply; unchanged when the reply is unusable."""
+    try:
+        obj = json.loads(reply)
+        rows = obj.get('cues') if isinstance(obj, dict) else obj
+    except (ValueError, TypeError):
+        m = re.search(r'\{.*\}', reply or '', re.S)
+        try:
+            rows = json.loads(m.group(0)).get('cues') if m else None
+        except (ValueError, AttributeError):
+            rows = None
+    if not isinstance(rows, list):
+        return cues
+    by_n = {}
+    for r in rows:
+        try:
+            by_n[int(r.get('n'))] = r
+        except (TypeError, ValueError, AttributeError):
+            continue
+    out = []
+    for i, c in enumerate(cues):
+        r = by_n.get(i + 1)
+        if not r:
+            out.append(c)
+            continue
+        c = dict(c)
+        for k in ('dialog', 'visual'):
+            v = r.get(k)
+            c[k] = v.strip() if isinstance(v, str) and v.strip() and v.strip().lower() != 'null' else None
+        mat = r.get('material')
+        if not c.get('material') and isinstance(mat, int) and mat >= 1:
+            c['material'] = mat
+        out.append(c)
+    return out

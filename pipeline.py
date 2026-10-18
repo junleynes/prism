@@ -10873,7 +10873,7 @@ def _look_for_cue(path, cue, model):
         if not r.stdout:
             continue
         resp = requests.post(f'{OLLAMA_URL}/api/generate', json={
-            'model': model, 'prompt': cue_locate.describe_prompt(cue.get('desc')), 'stream': False, 'think': False,
+            'model': model, 'prompt': cue_locate.describe_prompt(cue.get('visual') or cue.get('desc')), 'stream': False, 'think': False,
             'images': [base64.b64encode(r.stdout).decode()],
             'format': {'type': 'object', 'properties': {'match': {'type': 'integer', 'minimum': 0, 'maximum': 10}},
                        'required': ['match']},
@@ -10935,9 +10935,16 @@ def _run_trailer_job(jid, params):
     # Cues that name no material are found by listening: Whisper on each material, the cue's words looked for.
     _cues0 = params.get('script_cues') or []
     if any(not c.get('material') for c in _cues0):
+        # 1. The language model reads the cue lines: which are spoken words, which are shots to find.
+        if _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
+            job_set(jid, percent=2, step='Reading the script\'s cues')
+            try:
+                _cues0 = cue_locate.parse_analysis(_ask_script_model(cue_locate.analysis_prompt(_cues0)), _cues0)
+            except Exception as e:
+                print(f'Cue analysis by the language model failed ({e}); using the cue lines as written.')
         _mats0 = [p_ for p_ in (params.get('materials_paths') or [path]) if p_ and os.path.isfile(p_)] or [path]
         _tr0 = {}
-        if any(len(cutcraft.norm_tokens(c.get('desc') or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not c.get('material')):
+        if any(len(cutcraft.norm_tokens((c['dialog'] if 'dialog' in c else c.get('desc')) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not c.get('material')):
             job_set(jid, percent=3, step='Listening to the footage for the script\'s dialogue')
             for _i0, _p0 in enumerate(_mats0, 1):
                 try:
@@ -10945,7 +10952,7 @@ def _run_trailer_job(jid, params):
                 except Exception as e:
                     print(f'Cue dialogue search: material {_i0} not transcribed ({e})')
         _cues0, _notes0 = cue_locate.locate_cues(_cues0, _tr0, len(_mats0))
-        _look = [c for c in _cues0 if not c.get('located') and len(cutcraft.norm_tokens(c.get('desc') or '')) >= 1]
+        _look = [c for c in _cues0 if not c.get('located') and (c.get('visual') if 'visual' in c else c.get('desc'))]
         if _look and _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
             job_set(jid, percent=4, step='Looking at the footage for the script\'s shots')
             _model0 = load_production_defaults().get('vision_model') or 'qwen3-vl:8b'
