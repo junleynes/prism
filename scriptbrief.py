@@ -210,6 +210,7 @@ def read_layout(pages):
     brief = {'vo': [], 'tone': None, 'tcard': None, 'music': None, 'sot': [], 'notes': [], 'script_id': None,
              'read_by': 'layout'}
     found = False
+    pg_no = 0
     for pg in pages:
         words = mark_words(pg['words'], pg['rects'])
         rows = p._group_words_into_rows(words)
@@ -219,7 +220,11 @@ def read_layout(pages):
         left = [w for w in words if w['x0'] < split]
         right = [w for w in words if w['x0'] >= split]
         L, R = _lines_of(left), _lines_of(right)
+        n_clips, n_sot = len(brief.get('clips') or []), len(brief['sot'])
         found = _read_page(L, R, brief) or found
+        for e in (brief.get('clips') or [])[n_clips:] + brief['sot'][n_sot:]:
+            e['pg'] = pg_no
+        pg_no += 1
     if not found:
         return None
     _anchor(brief)
@@ -256,7 +261,7 @@ def _read_page(L, R, brief):
                               'y0': last[0]['y0'], 'y1': last[-1]['y1']}
             got = True
     brief.setdefault('_clips', []).extend(clip_blocks)
-    brief.setdefault('clips', []).extend({'cue': b['cue'], 'lines': list(b['lines'])} for b in clip_blocks)
+    brief.setdefault('clips', []).extend({'cue': b['cue'], 'lines': list(b['lines']), 'y0': b['y0']} for b in clip_blocks)
     if clip_blocks:
         got = True
     # ---- the right column: voice-over, delivery note, music, dialogue taken from the footage
@@ -317,13 +322,15 @@ def cues_from_brief(brief, available_materials=None):
             if mat and avail and mat not in avail:
                 continue
             words = (list(r.get('lines') or []) if kind == 'shot' else ([c['desc']] if c.get('desc') else []) + list(r.get('lines') or []))
-            cue = {'time': float(c['time']), 'desc': _clean(_CUE_TAG.sub('', ' '.join(w for w in words if w))), 'kind': kind}
+            cue = {'order': (r.get('pg', 0), float(r.get('y0') if r.get('y0') is not None else 0.0)), 'time': float(c['time']), 'desc': _clean(_CUE_TAG.sub('', ' '.join(w for w in words if w))), 'kind': kind}
             if mat:
                 cue['material'] = mat
             if c.get('out') is not None:
                 cue['out'] = float(c['out'])
             out.append(cue)
-    out.sort(key=lambda c: (c.get('material') or 1, c['time']))
+    out.sort(key=lambda c: c['order'])                      # the order the script reads in
+    for i, c in enumerate(out):
+        c['order'] = i
     return out
 
 
@@ -363,8 +370,6 @@ def _anchor(brief):
     if tc:
         tc.pop('y0', None)
         tc.pop('y1', None)
-    for s in brief['sot']:
-        s.pop('y0', None)
 
 
 # ---------------------------------------------------------------- reading a file

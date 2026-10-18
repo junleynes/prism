@@ -109,3 +109,21 @@ def test_spoken_lines_are_not_extra_clips_when_the_written_shots_fill_the_plug()
     one = [{'time': 40.0, 'out': 43.0, 'kind': 'shot', 'desc': 'WIDE'}]          # 3 s of a 15 s plug: the SOTs are needed
     out, note = cl.drop_sot_when_clips_fill(one + sots, 15)
     assert len(out) == 3 and note is None
+
+
+def test_analysis_prompt_lists_materials_and_script():
+    pr = cl.analysis_prompt([{'desc': 'WIDE REACTS'}], ['FIREWA_A.mov', 'FIREWA_B.mov'], 'whole script text')
+    assert '1. FIREWA_A.mov' in pr and '2. FIREWA_B.mov' in pr and 'whole script text' in pr
+
+
+def test_parse_analysis_maps_material_and_ignores_out_of_range():
+    cues = [{'desc': 'a'}, {'desc': 'b'}, {'desc': 'c', 'material': 1}]
+    reply = '{"cues":[{"n":1,"material":2},{"n":2,"material":"M9"},{"n":3,"material":2}]}'
+    out = cl.parse_analysis(reply, cues, 2)
+    assert out[0]['material'] == 2 and 'material' not in out[1] and out[2]['material'] == 1
+
+
+def test_locate_keeps_script_order():
+    cues = [{'desc': 'x', 'time': 50.0, 'order': 0, 'material': 2}, {'desc': 'y', 'time': 5.0, 'order': 1, 'material': 1}]
+    out, _ = cl.locate_cues(cues, {}, 2)
+    assert [c['order'] for c in out] == [0, 1]

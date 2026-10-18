@@ -5319,12 +5319,13 @@ def build_cue_clips(cues, materials_paths, min_seg_dur=0.8, default_cue_dur=4.0)
                 'total_score': 10.0,
                 'script_boost': 10.0,
                 'script_desc': c.get('desc') or f'M{mat}',
+                'cue_order': c.get('order'),
                 'cue_fixed': bool(mat and c.get('out') is not None),   # material + in + out written: cut exactly so
                 'script_found': c.get('located') or None,      # True = heard (Whisper), 'look' = seen (vision), None = written time
                 'script_written': c.get('written_time'),
                 'has_face': False,
             })
-    clips.sort(key=lambda s: (s.get('material') or 0, s['start']))
+    clips.sort(key=lambda s: (s.get('cue_order') if s.get('cue_order') is not None else 0, s.get('material') or 0, s['start']))
     return clips
 
 def librosa_load(path, sr=22050, mono=True, duration=None, offset=0.0):
@@ -6709,6 +6710,7 @@ def api_trailer():
     # priority over manual entries if a request somehow carries both (the
     # UI's own radio only ever sends one at a time).
     script_brief = None
+    script_text = ''
     if script_file:
         raw_script = script_file.read()
         text, err = extract_script_text(_MemScript(script_file.filename, raw_script))
@@ -6719,6 +6721,7 @@ def api_trailer():
             segment_offsets=(None if available_materials is not None else segment_offsets),
             available_materials=available_materials,
         )
+        script_text = text or ''
         script_brief = read_script_brief(raw_script, script_file.filename, text, script_cues)
         # A two-column script keeps its clips on the left and its spoken lines (SOT) on the right; the layout reader
         # sees both, with the words written for each, where the plain text of one column does not.
@@ -7180,7 +7183,7 @@ def api_trailer():
                   detector=detector, adaptive_threshold=adaptive_threshold,
                   priority_prompt=priority_prompt,
                   negative_prompt=negative_prompt, pinned_scenes=pinned_scenes,
-                  script_cues=script_cues, script_brief=script_brief,
+                  script_cues=script_cues, script_brief=script_brief, script_text=script_text[:6000],
                   transition=transition, xfade_dur=xfade_dur, transition_matte_path=transition_matte_path,
                   overlay_art_path=overlay_art_path, overlay_opts=overlay_opts,
                   target_loudness=target_loudness, true_peak=true_peak, music_duck_db=music_duck_db, duck_depth_db=duck_depth_db, duck_release_hold=duck_release_hold, beat_match=beat_match, broadcast_stereo=broadcast_stereo, model=model,
@@ -7411,7 +7414,7 @@ def _autofill_short_selection_from_alternates(selected, alternates, already_used
     # two different materials' own local timelines can share numerically
     # close or identical start times without being anywhere near each
     # other in the actual source video.
-    result.sort(key=lambda s: (s.get('material') or 0, s['start']))
+    result.sort(key=lambda s: (s.get('cue_order') if s.get('cue_order') is not None else 0, s.get('material') or 0, s['start']))
     return result
 
 @app.route('/api/trailer/render', methods=['POST'])
@@ -7458,7 +7461,7 @@ def api_trailer_render():
         # (material, start), not start alone -- see the identical fix and
         # its full explanation elsewhere in this file for cross-material
         # ordering.
-        selected.sort(key=lambda s: (s.get('material') or 0, s['start']))
+        selected.sort(key=lambda s: (s.get('cue_order') if s.get('cue_order') is not None else 0, s.get('material') or 0, s['start']))
 
     if not selected:
         return jsonify(error='You dropped every scene — keep at least one, or add an alternate.'), 400
@@ -7553,7 +7556,7 @@ def api_trailer_preview_send_to_destination(preview_id):
         if bad:
             return jsonify(ok=False, error=f'No alternate numbered {bad[0]} in this preview.'), 400
         selected = selected + [alts[n - 1] for n in sorted(added)]
-        selected.sort(key=lambda s: (s.get('material') or 0, s['start']))
+        selected.sort(key=lambda s: (s.get('cue_order') if s.get('cue_order') is not None else 0, s.get('material') or 0, s['start']))
     if not selected:
         return jsonify(ok=False, error='You dropped every scene -- keep at least one, or add an alternate.'), 400
 
@@ -10885,7 +10888,7 @@ def select_scenes_vo_led(scenes_data, vo_text, trailer_duration, max_scene_dur, 
         return None, 0.0
     # (material, start), not start alone -- see the identical fix and its
     # full explanation elsewhere in this file for cross-material ordering.
-    selected.sort(key=lambda x: (x.get('material') or 0, x['start']))
+    selected.sort(key=lambda x: (x.get('cue_order') if x.get('cue_order') is not None else 0, x.get('material') or 0, x['start']))
     return selected, total_sel
 
 
@@ -10974,10 +10977,11 @@ def _run_trailer_job(jid, params):
     params['script_cues'] = _cues0
     if any(not cue_locate.is_complete(c) for c in _cues0):
         # 1. The language model reads the cue lines: which are spoken words, which are shots to find.
+        _names0 = [re.sub(r'^net_\d+_', '', os.path.basename(p_)) for p_ in (params.get('materials_paths') or [path]) if p_]
         if _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
             job_set(jid, percent=2, step='Reading the script\'s cues')
             try:
-                _cues0 = cue_locate.parse_analysis(_ask_script_model(cue_locate.analysis_prompt(_cues0)), _cues0)
+                _cues0 = cue_locate.parse_analysis(_ask_script_model(cue_locate.analysis_prompt(_cues0, _names0, params.get('script_text'))), _cues0, len(_names0))
             except Exception as e:
                 print(f'Cue analysis by the language model failed ({e}); using the cue lines as written.')
         _mats0 = [p_ for p_ in (params.get('materials_paths') or [path]) if p_ and os.path.isfile(p_)] or [path]
@@ -11005,7 +11009,7 @@ def _run_trailer_job(jid, params):
                 if _new0 is not _c0:
                     _cues0[_k0] = _new0
                     _notes0.append(f'"{_c0["desc"][:40]}" matched by picture at {_new0["time"]:.1f}s (written {_c0["time"]:.1f}s).')
-            _cues0.sort(key=lambda c: (c.get('material') or 1, c['time']))
+            _cues0.sort(key=lambda c: (c.get('order', 0), c.get('material') or 1, c['time']))
         params['script_cues'] = _cues0
         for _n0 in _notes0:
             print('Script cue:', _n0)
@@ -11264,7 +11268,7 @@ def _run_trailer_job(jid, params):
         # (material, start), not start alone -- see the identical fix and
         # its full explanation elsewhere in this file for cross-material
         # ordering.
-        selected.sort(key=lambda x: (x.get('material') or 0, x['start']))
+        selected.sort(key=lambda x: (x.get('cue_order') if x.get('cue_order') is not None else 0, x.get('material') or 0, x['start']))
         total_sel = sum(s['selected_dur'] for s in selected)
         scene_list = [None] * int(params.get('preview_total_scenes') or len(selected))
         word_starts = word_ends = []
@@ -11947,7 +11951,7 @@ def _run_trailer_job(jid, params):
                 if _flex:
                     _flex = _rebalance_selected_durations(_flex, max(min_seg_dur * len(_flex), trailer_duration - _fixed_total),
                                                           min_seg_dur=min_seg_dur)
-                selected = sorted(_fixed + _flex, key=lambda s: (s.get('material') or 0, s['start']))
+                selected = sorted(_fixed + _flex, key=lambda s: (s.get('cue_order') if s.get('cue_order') is not None else 0, s.get('material') or 0, s['start']))
                 if _fixed_total > trailer_duration + 0.5:
                     card_fit_info['notes'].append(
                         f'The script\'s written cuts add up to {_fixed_total:.0f}s, more than the {trailer_duration:.0f}s the '
@@ -12099,7 +12103,7 @@ def _run_trailer_job(jid, params):
                 # (material, start), not start alone -- see the identical fix
                 # and its full explanation elsewhere in this file for
                 # cross-material ordering.
-                selected.sort(key=lambda x: (x.get('material') or 0, x['start']))
+                selected.sort(key=lambda x: (x.get('cue_order') if x.get('cue_order') is not None else 0, x.get('material') or 0, x['start']))
 
                 n_seg = len(selected) + len(card_files)
                 xfade_loss = max(0, (n_seg - 1)) * xfade_dur
@@ -12208,7 +12212,7 @@ def _run_trailer_job(jid, params):
                 selected.append(cand)
                 total_sel += seg_dur
                 shortfall -= net_gain
-            selected.sort(key=lambda x: (x.get('material') or 0, x['start']))
+            selected.sort(key=lambda x: (x.get('cue_order') if x.get('cue_order') is not None else 0, x.get('material') or 0, x['start']))
 
         # Final exact-length correction. Everything above works in tolerances
         # (the loop breaks at abs(shortfall) <= 0.5, and the grow-the-last-clip

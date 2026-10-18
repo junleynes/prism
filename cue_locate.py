@@ -64,7 +64,7 @@ def locate_cues(cues, transcripts, n_materials=None):
             if len(want) >= MIN_TOKENS and transcripts:
                 notes.append(f'"{c["desc"][:40]}" was not heard in the footage; kept the written time.')
         out.append(c)
-    out.sort(key=lambda c: (c.get('material') or 1, c['time']))
+    out.sort(key=lambda c: (c.get('order', 0), c.get('material') or 1, c['time']))
     return out, notes
 
 
@@ -103,17 +103,22 @@ def pick_by_look(cue, scores, duration=None):
 
 
 # ---- the language model reads the script's cue lines first ----
-def analysis_prompt(cues):
-    lines = '\n'.join(f'{i + 1}. {c.get("desc") or ""}' for i, c in enumerate(cues))
+def analysis_prompt(cues, materials=None, script_text=None):
+    lines = '\n'.join(f'{i + 1}. {c.get("desc") or ""}' + (f' [material {c["material"]}]' if c.get('material') else '') for i, c in enumerate(cues))
+    mats = ''
+    if materials:
+        mats = 'Source files the editor has loaded:\n' + '\n'.join(f'  {i}. {n}' for i, n in enumerate(materials, 1)) + '\n'
+    ctx = f'\nThe whole script, for context:\n{script_text.strip()[:3000]}\n' if script_text and script_text.strip() else ''
     return ('These are cue lines from a TV promo script, timecodes already removed. For each, say what the editor must find '
             'in the footage. "dialog": the exact words a person SPEAKS on camera (a SOT / sound bite), or null when nobody '
             'speaks or the line is only a shot instruction. "visual": a short description of the picture wanted (shot size, who, '
-            'what they do), or null. "material": the source number if the line names one (M1, M2, "material 2"), else null. '
-            'Voice-over lines read by the narrator are neither: use null for both.\n'
-            'Reply as JSON: {"cues":[{"n":1,"dialog":null,"visual":null,"material":null}, ...]} with one entry per line.\n\n' + lines)
+            'what they do), or null. "material": the number of the source file it comes from, when the line names one (M1, '
+            '"material 2") or its words clearly match a file name below; else null. '
+            'Voice-over lines read by the narrator are neither: use null for both.\n' + mats +
+            'Reply as JSON: {"cues":[{"n":1,"dialog":null,"visual":null,"material":null}, ...]} with one entry per line.\n' + ctx + '\nCue lines:\n' + lines)
 
 
-def parse_analysis(reply, cues):
+def parse_analysis(reply, cues, n_materials=None):
     """The cues with 'dialog' / 'visual' (and 'material') filled from the model's reply; unchanged when the reply is unusable."""
     try:
         obj = json.loads(reply)
@@ -143,7 +148,9 @@ def parse_analysis(reply, cues):
             v = r.get(k)
             c[k] = v.strip() if isinstance(v, str) and v.strip() and v.strip().lower() != 'null' else None
         mat = r.get('material')
-        if not c.get('material') and isinstance(mat, int) and mat >= 1:
+        if isinstance(mat, str) and mat.strip().lstrip('Mm').isdigit():
+            mat = int(mat.strip().lstrip('Mm'))
+        if not c.get('material') and isinstance(mat, int) and mat >= 1 and (n_materials is None or mat <= n_materials):
             c['material'] = mat
         out.append(c)
     return out
