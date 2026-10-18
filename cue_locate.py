@@ -103,32 +103,43 @@ def pick_by_look(cue, scores, duration=None):
 
 
 # ---- the language model reads the script's cue lines first ----
+def _stamp(c):
+    t = c.get('time')
+    if t is None:
+        return ''
+    s = f'{int(t // 60)}:{t % 60:04.1f}' + (f'-{c["out"] % 60:04.1f}' if c.get('out') is not None else '')
+    return f' [{"M%d " % c["material"] if c.get("material") else ""}{s}]'
+
+
 def analysis_prompt(cues, materials=None, script_text=None):
-    lines = '\n'.join(f'{i + 1}. {c.get("desc") or ""}' + (f' [material {c["material"]}]' if c.get('material') else '') for i, c in enumerate(cues))
+    lines = '\n'.join(f'{i + 1}. {c.get("desc") or ""}{_stamp(c)}' for i, c in enumerate(cues))
     mats = ''
     if materials:
         mats = 'Source files the editor has loaded:\n' + '\n'.join(f'  {i}. {n}' for i, n in enumerate(materials, 1)) + '\n'
-    ctx = f'\nThe whole script, for context:\n{script_text.strip()[:3000]}\n' if script_text and script_text.strip() else ''
-    return ('These are cue lines from a TV promo script, timecodes already removed. For each, say what the editor must find '
-            'in the footage. "dialog": the exact words a person SPEAKS on camera (a SOT / sound bite), or null when nobody '
-            'speaks or the line is only a shot instruction. "visual": a short description of the picture wanted (shot size, who, '
-            'what they do), or null. "material": the number of the source file it comes from, when the line names one (M1, '
-            '"material 2") or its words clearly match a file name below; else null. '
-            'Voice-over lines read by the narrator are neither: use null for both.\n' + mats +
-            'Reply as JSON: {"cues":[{"n":1,"dialog":null,"visual":null,"material":null}, ...]} with one entry per line.\n' + ctx + '\nCue lines:\n' + lines)
+    ctx = f'\nThe whole script, for context:\n{script_text.strip()[:3500]}\n' if script_text and script_text.strip() else ''
+    return ('You are a TV promo editor reading a script. Below are its cue lines (timecodes in brackets where written). For each, say:\n'
+            '"role": "shot" (a picture to cut to), "sot" (words a person SPEAKS on camera, a sound bite) or "vo" (read by the narrator, not footage);\n'
+            '"dialog": the exact spoken words for a sot, else null; "visual": a short description of the picture wanted (shot size, who, '
+            'what they do), else null;\n'
+            '"material": the number of the source file it comes from, when the line names one (M1, "material 2") or its words clearly '
+            'match a file name below, else null.\n'
+            'Also give "flow": the cue numbers in the order the story plays, normally the order they are written.\n' + mats +
+            'Reply as JSON: {"cues":[{"n":1,"role":"shot","dialog":null,"visual":null,"material":null}, ...],"flow":[1,2,...],'
+            '"summary":"one sentence on what the promo is about"}\n' + ctx + '\nCue lines:\n' + lines)
 
 
 def parse_analysis(reply, cues, n_materials=None):
-    """The cues with 'dialog' / 'visual' (and 'material') filled from the model's reply; unchanged when the reply is unusable."""
+    """The cues with role / dialog / visual / material filled from the model's reply (written cuts are never changed);
+    unchanged when the reply is unusable. Sets c['ai_summary'] on the first cue when the model gave one."""
     try:
         obj = json.loads(reply)
-        rows = obj.get('cues') if isinstance(obj, dict) else obj
     except (ValueError, TypeError):
         m = re.search(r'\{.*\}', reply or '', re.S)
         try:
-            rows = json.loads(m.group(0)).get('cues') if m else None
-        except (ValueError, AttributeError):
-            rows = None
+            obj = json.loads(m.group(0)) if m else None
+        except ValueError:
+            obj = None
+    rows = obj.get('cues') if isinstance(obj, dict) else obj
     if not isinstance(rows, list):
         return cues
     by_n = {}
@@ -147,13 +158,42 @@ def parse_analysis(reply, cues, n_materials=None):
         for k in ('dialog', 'visual'):
             v = r.get(k)
             c[k] = v.strip() if isinstance(v, str) and v.strip() and v.strip().lower() != 'null' else None
+        role = str(r.get('role') or '').strip().lower()
+        if role in ('shot', 'sot', 'vo'):
+            c['role'] = role
         mat = r.get('material')
         if isinstance(mat, str) and mat.strip().lstrip('Mm').isdigit():
             mat = int(mat.strip().lstrip('Mm'))
         if not c.get('material') and isinstance(mat, int) and mat >= 1 and (n_materials is None or mat <= n_materials):
             c['material'] = mat
         out.append(c)
+    # the story's order, when the script's own reading order is not known and the model's is a true permutation
+    flow = obj.get('flow') if isinstance(obj, dict) else None
+    if isinstance(flow, list) and sorted(flow) == list(range(1, len(cues) + 1)) and not any('order' in c for c in out):
+        for pos, n in enumerate(flow):
+            out[n - 1]['order'] = pos
+        out.sort(key=lambda c: c['order'])
+    summ = obj.get('summary') if isinstance(obj, dict) else None
+    if out and isinstance(summ, str) and summ.strip():
+        out[0]['ai_summary'] = summ.strip()[:200]
     return out
+
+
+def apply_roles(cues):
+    """(cues, notes). For cues the script left incomplete, the model's role decides: a narrator line is no footage (dropped),
+    a spoken line is searched by its words, a shot by its picture. Complete cues are never touched."""
+    keep, notes = [], []
+    for c in cues:
+        if is_complete(c) or not c.get('role'):
+            keep.append(c)
+            continue
+        if c['role'] == 'vo':
+            notes.append(f'"{(c.get("desc") or "")[:40]}" is a narrator line, not footage; left out of the cuts.')
+            continue
+        c = dict(c)
+        c['kind'] = c['role']
+        keep.append(c)
+    return keep, notes
 
 
 FILL = 0.6              # written clips that make up this much of the plug already fill it

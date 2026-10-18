@@ -10975,15 +10975,24 @@ def _run_trailer_job(jid, params):
         print('Script cue:', _sot_note)
         params.setdefault('cue_notes', []).append(_sot_note)
     params['script_cues'] = _cues0
+    # 1. The language model reads the whole script: each cue's role, its material (by file name), the story's flow.
+    #    It only fills what the script left open; written cuts (material + in + out) are never changed.
+    _names0 = [re.sub(r'^net_\d+_', '', os.path.basename(p_)) for p_ in (params.get('materials_paths') or [path]) if p_]
+    if any(not cue_locate.is_complete(c) for c in _cues0) and _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
+        # (a script whose every cue is fully written needs no reading: it is cut as written)
+        job_set(jid, percent=2, step='Understanding the script')
+        try:
+            _cues0 = cue_locate.parse_analysis(_ask_script_model(cue_locate.analysis_prompt(_cues0, _names0, params.get('script_text'))), _cues0, len(_names0))
+            _sum0 = next((c.get('ai_summary') for c in _cues0 if c.get('ai_summary')), None)
+            _cues0, _role_notes = cue_locate.apply_roles(_cues0)
+            _msg = [f'Script read by the language model: {_sum0}'] if _sum0 else []
+            for _n0 in _msg + _role_notes:
+                print('Script cue:', _n0)
+            params.setdefault('cue_notes', []).extend(_msg + _role_notes)
+        except Exception as e:
+            print(f'Cue analysis by the language model failed ({e}); using the cue lines as written.')
+        params['script_cues'] = _cues0
     if any(not cue_locate.is_complete(c) for c in _cues0):
-        # 1. The language model reads the cue lines: which are spoken words, which are shots to find.
-        _names0 = [re.sub(r'^net_\d+_', '', os.path.basename(p_)) for p_ in (params.get('materials_paths') or [path]) if p_]
-        if _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
-            job_set(jid, percent=2, step='Reading the script\'s cues')
-            try:
-                _cues0 = cue_locate.parse_analysis(_ask_script_model(cue_locate.analysis_prompt(_cues0, _names0, params.get('script_text'))), _cues0, len(_names0))
-            except Exception as e:
-                print(f'Cue analysis by the language model failed ({e}); using the cue lines as written.')
         _mats0 = [p_ for p_ in (params.get('materials_paths') or [path]) if p_ and os.path.isfile(p_)] or [path]
         _tr0 = {}
         if any(len(cutcraft.norm_tokens((c['dialog'] if 'dialog' in c else c.get('desc')) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not cue_locate.is_complete(c)):

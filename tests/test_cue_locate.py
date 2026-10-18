@@ -127,3 +127,20 @@ def test_locate_keeps_script_order():
     cues = [{'desc': 'x', 'time': 50.0, 'order': 0, 'material': 2}, {'desc': 'y', 'time': 5.0, 'order': 1, 'material': 1}]
     out, _ = cl.locate_cues(cues, {}, 2)
     assert [c['order'] for c in out] == [0, 1]
+
+
+def test_roles_drop_narrator_and_keep_complete():
+    cues = [{'desc': 'narrator line', 'time': 5.0, 'role': 'vo'},
+            {'desc': 'written', 'time': 10.0, 'out': 14.0, 'material': 1, 'role': 'vo'},
+            {'desc': 'speech', 'time': 20.0, 'role': 'sot', 'kind': 'shot'}]
+    out, notes = cl.apply_roles(cues)
+    assert [c['desc'] for c in out] == ['written', 'speech'] and out[1]['kind'] == 'sot' and len(notes) == 1
+
+
+def test_flow_applies_only_without_script_order_and_summary():
+    cues = [{'desc': 'a', 'time': 1.0}, {'desc': 'b', 'time': 2.0}]
+    reply = '{"cues":[{"n":1,"role":"shot"},{"n":2,"role":"shot"}],"flow":[2,1],"summary":"A fire."}'
+    out = cl.parse_analysis(reply, cues)
+    assert [c['desc'] for c in out] == ['b', 'a'] and out[0]['ai_summary'] == 'A fire.'
+    ordered = [dict(c, order=i) for i, c in enumerate(cues)]
+    assert [c['desc'] for c in cl.parse_analysis(reply, ordered)] == ['a', 'b']
