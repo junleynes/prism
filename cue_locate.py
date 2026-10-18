@@ -25,14 +25,16 @@ def locate_cues(cues, transcripts, n_materials=None):
     n_materials = n_materials or (max(transcripts) if transcripts else 1)
     for c in cues:
         c = dict(c)
-        if c.get('material'):
+        if c.get('material') and c.get('kind') != 'sot':
             out.append(c)
             continue
-        said = c['dialog'] if 'dialog' in c else c.get('desc')     # the language model's reading, else the raw line
+        said = (c['dialog'] or (c.get('desc') if c.get('kind') == 'sot' else None)) if 'dialog' in c else c.get('desc')     # the language model's reading, else the raw line
         want = cutcraft.norm_tokens(said or '')
         best = None
         if len(want) >= MIN_TOKENS:
             for mat, words in transcripts.items():
+                if c.get('material') and mat != c['material']:
+                    continue                                   # a labelled cue is only looked for on its own material
                 if not words:
                     continue
                 r = cutcraft.align_script([{'text': said}], words, min_score=MIN_SCORE)[0]
@@ -53,7 +55,7 @@ def locate_cues(cues, transcripts, n_materials=None):
             c['located'] = True
             notes.append(f'"{c["desc"][:40]}" found in material {mat} at {a:.1f}s (written {c["written_time"]:.1f}s).')
         else:
-            c['material'] = 1
+            c['material'] = c.get('material') or 1
             if len(want) >= MIN_TOKENS and transcripts:
                 notes.append(f'"{c["desc"][:40]}" was not heard in the footage; kept the written time.')
         out.append(c)

@@ -52,3 +52,40 @@ def test_model_reading_splits_spoken_from_shots():
     out, _ = cl.locate_cues(a, {1: WORDS}, 1)
     assert out[0]['located'] is True and not out[1].get('located')
     assert cl.parse_analysis('not json', cues) == cues
+
+
+# ---- the two real scripts ----
+import os
+import scriptbrief as sb
+
+FIX = os.path.join(os.path.dirname(__file__), 'fixtures')
+
+
+def _cues(name, avail):
+    b = sb.read_layout(sb.pdf_pages(open(os.path.join(FIX, name), 'rb').read()))
+    return b, sb.cues_from_brief(b, avail)
+
+
+def test_single_material_script_keeps_every_spoken_line_and_shot():
+    b, cues = _cues('script_single_material.pdf', {1})
+    said = [c['desc'] for c in cues if c['kind'] == 'sot']
+    assert said[0] == 'MOM I NEED MONEY' and len(said) == 4
+    assert any('WIDE REACTS KUHA CP' == c['desc'] for c in cues if c['kind'] == 'shot')   # "CP" stays on the clip's line
+    assert all(not c.get('material') for c in cues)                                      # nothing is labelled
+    assert [v['text'] for v in b['vo']][0] == "MATUTO PARA ‘DI MABUDOL!"
+
+
+def test_two_material_script_keeps_the_lines_under_each_timecode():
+    _b, cues = _cues('script_two_materials.pdf', {1, 2})
+    by = {(c['material'], c['time']): c for c in cues}
+    assert 'TRAYDOR KA' in by[(1, 218.0)]['desc'] and by[(1, 218.0)]['kind'] == 'sot'
+    assert by[(2, 35.0)]['desc'] == 'BUNOT GALO! TAWA MARK'
+    assert cl.locate_cues([dict(by[(1, 218.0)])], {1: W('traydor ka sino leader niyo', 221)}, 2)[0][0]['time'] < 221
+
+
+def test_labelled_spoken_line_is_looked_for_only_on_its_own_material():
+    c = {'time': 5.0, 'out': 8.0, 'material': 2, 'kind': 'sot', 'desc': 'NASAN KAPATID KO'}
+    other = W('nasan kapatid ko', 30)
+    mine = W('nasan kapatid ko', 44)
+    out, _ = cl.locate_cues([c], {1: other, 2: mine}, 2)
+    assert out[0]['material'] == 2 and abs(out[0]['time'] - 43.85) < 0.01

@@ -5303,6 +5303,8 @@ def build_cue_clips(cues, materials_paths, min_seg_dur=0.8, default_cue_dur=4.0)
                 'total_score': 10.0,
                 'script_boost': 10.0,
                 'script_desc': c.get('desc') or f'M{mat}',
+                'script_found': c.get('located') or None,      # True = heard (Whisper), 'look' = seen (vision), None = written time
+                'script_written': c.get('written_time'),
                 'has_face': False,
             })
     clips.sort(key=lambda s: (s.get('material') or 0, s['start']))
@@ -6701,6 +6703,11 @@ def api_trailer():
             available_materials=available_materials,
         )
         script_brief = read_script_brief(raw_script, script_file.filename, text, script_cues)
+        # A two-column script keeps its clips on the left and its spoken lines (SOT) on the right; the layout reader
+        # sees both, with the words written for each, where the plain text of one column does not.
+        _layout_cues = scriptbrief.cues_from_brief(script_brief, available_materials) if script_brief else []
+        if _layout_cues:
+            script_cues = _layout_cues
         if not script_cues:
             return jsonify(error='No timecodes were found in that script. Each cue line needs at '
                                  'least one timecode like 00:01:30:12, 00:01:30, or 1:30. A single '
@@ -7239,6 +7246,8 @@ def api_trailer_preview_get(preview_id):
         if s.get('script_boost'):
             desc_txt = (s.get('script_desc') or 'matched timecode')[:80]
             reasons.append(f'Script cue (+{float(s.get("script_boost") or 0):.1f}): "{desc_txt}"')
+            _f = s.get('script_found')
+            reasons.append('Found by its words in the footage (Whisper)' if _f is True else 'Found by picture (AI vision)' if _f == 'look' else 'At the written timecode (not found by words or picture)')
         if s.get('vision_score'):
             reasons.append(f"AI vision {s.get('vision_score')}")
         if s.get('has_face'):
@@ -10934,7 +10943,7 @@ def _run_trailer_job(jid, params):
 
     # Cues that name no material are found by listening: Whisper on each material, the cue's words looked for.
     _cues0 = params.get('script_cues') or []
-    if any(not c.get('material') for c in _cues0):
+    if any(not c.get('material') or c.get('kind') == 'sot' for c in _cues0):
         # 1. The language model reads the cue lines: which are spoken words, which are shots to find.
         if _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
             job_set(jid, percent=2, step='Reading the script\'s cues')
@@ -10944,7 +10953,7 @@ def _run_trailer_job(jid, params):
                 print(f'Cue analysis by the language model failed ({e}); using the cue lines as written.')
         _mats0 = [p_ for p_ in (params.get('materials_paths') or [path]) if p_ and os.path.isfile(p_)] or [path]
         _tr0 = {}
-        if any(len(cutcraft.norm_tokens((c['dialog'] if 'dialog' in c else c.get('desc')) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not c.get('material')):
+        if any(len(cutcraft.norm_tokens((c['dialog'] if 'dialog' in c else c.get('desc')) or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not c.get('material') or c.get('kind') == 'sot'):
             job_set(jid, percent=3, step='Listening to the footage for the script\'s dialogue')
             for _i0, _p0 in enumerate(_mats0, 1):
                 try:
@@ -10952,7 +10961,7 @@ def _run_trailer_job(jid, params):
                 except Exception as e:
                     print(f'Cue dialogue search: material {_i0} not transcribed ({e})')
         _cues0, _notes0 = cue_locate.locate_cues(_cues0, _tr0, len(_mats0))
-        _look = [c for c in _cues0 if not c.get('located') and (c.get('visual') if 'visual' in c else c.get('desc'))]
+        _look = [c for c in _cues0 if not c.get('located') and (c.get('visual') or (c.get('desc') if 'visual' not in c and c.get('kind') != 'sot' else None))]
         if _look and _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
             job_set(jid, percent=4, step='Looking at the footage for the script\'s shots')
             _model0 = load_production_defaults().get('vision_model') or 'qwen3-vl:8b'
@@ -12446,6 +12455,7 @@ def _run_trailer_job(jid, params):
                      'ai_desc': s.get('ai_desc', ''), 'has_face': s.get('has_face', False),
                      'vo_beat': s.get('vo_beat'), 'vo_match': s.get('vo_match'), 'cut': s.get('cut'),
                      'script_boost': s.get('script_boost'), 'script_desc': s.get('script_desc'),
+                     'script_found': s.get('script_found'),
                      'edge_ratio': s.get('edge_ratio', 0), 'mean_hue': s.get('mean_hue', 0),
                      'energy_score': s.get('energy_score', 0), 'tags': s.get('tags') or [],
                      'pinned': bool(s.get('pinned'))}

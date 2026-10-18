@@ -184,6 +184,25 @@ def _label(cue):
 
 # ---------------------------------------------------------------- the layout reader
 
+def _table_gutter(pg):
+    """x of the vertical rule that splits a two-column table, when the page draws one in its middle: the words'
+    own spacing can put the split through a clip's line ("KUHA | CP"), the table's line cannot be wrong."""
+    w = float(pg.get('width') or 0)
+    best = {}
+    for r in pg.get('rects') or []:
+        try:
+            rw, rh = float(r['x1']) - float(r['x0']), float(r['bottom']) - float(r['top'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if rw < 3 and rh > 8 and 0.25 * w < r['x0'] < 0.75 * w:
+            k = round(float(r['x0']))
+            best[k] = best.get(k, 0.0) + rh
+    if not best:
+        return None
+    x, tall = max(best.items(), key=lambda kv: kv[1])
+    return x + 2.0 if tall > 60 else None
+
+
 def read_layout(pages):
     """pages: [{'width', 'words': [...], 'rects': [...]}] (pdfplumber's words and rects). -> brief, or None
     when no page has a two-column layout with anything to find in it."""
@@ -194,7 +213,7 @@ def read_layout(pages):
     for pg in pages:
         words = mark_words(pg['words'], pg['rects'])
         rows = p._group_words_into_rows(words)
-        split = p._detect_two_column_split(rows, pg['width']) if rows else None
+        split = _table_gutter(pg) or (p._detect_two_column_split(rows, pg['width']) if rows else None)
         if split is None:
             continue
         left = [w for w in words if w['x0'] < split]
@@ -237,6 +256,7 @@ def _read_page(L, R, brief):
                               'y0': last[0]['y0'], 'y1': last[-1]['y1']}
             got = True
     brief.setdefault('_clips', []).extend(clip_blocks)
+    brief.setdefault('clips', []).extend({'cue': b['cue'], 'lines': list(b['lines'])} for b in clip_blocks)
     if clip_blocks:
         got = True
     # ---- the right column: voice-over, delivery note, music, dialogue taken from the footage
@@ -272,7 +292,7 @@ def _read_page(L, R, brief):
             got = True
         else:
             cue = _cue_of(t)
-            if cue and _CUE_TAG.match(t):
+            if cue:
                 lines = []
                 while i + 1 < len(body) and not body[i + 1]['hl'] and not _cue_of(body[i + 1]['text']) \
                         and body[i + 1]['y0'] - body[i]['y1'] <= 6:
@@ -282,6 +302,29 @@ def _read_page(L, R, brief):
                 got = True
         i += 1
     return got
+
+
+def cues_from_brief(brief, available_materials=None):
+    """Every clip the layout found, in cue form: the left column's shots and the right column's spoken lines (SOT),
+    each with the words written for it. A cue naming a material that was not loaded is left out; one naming none is
+    kept, to be found by listening and looking. [] when the brief has no layout."""
+    out = []
+    avail = set(available_materials or [])
+    for kind, rows in (('shot', brief.get('clips') or []), ('sot', brief.get('sot') or [])):
+        for r in rows:
+            c = r['cue'] if kind == 'shot' else r
+            mat = c.get('material')
+            if mat and avail and mat not in avail:
+                continue
+            words = (list(r.get('lines') or []) if kind == 'shot' else ([c['desc']] if c.get('desc') else []) + list(r.get('lines') or []))
+            cue = {'time': float(c['time']), 'desc': _clean(_CUE_TAG.sub('', ' '.join(w for w in words if w))), 'kind': kind}
+            if mat:
+                cue['material'] = mat
+            if c.get('out') is not None:
+                cue['out'] = float(c['out'])
+            out.append(cue)
+    out.sort(key=lambda c: (c.get('material') or 1, c['time']))
+    return out
 
 
 def _music_from(lines):
