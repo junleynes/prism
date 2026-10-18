@@ -87,3 +87,25 @@ def test_the_size_cap_deletes_oldest_first_and_spares_recent_files(tmp_path, mon
     pipeline._enforce_upload_cap(folder, time.time())
     assert not os.path.exists(os.path.join(folder, 'b_mid.bin')) and os.path.exists(os.path.join(folder, 'c_new.bin'))
     os.remove(os.path.join(folder, 'c_new.bin'))
+
+
+def test_old_style_folders_in_a_shared_temp_folder_need_prism_files_in_them(tmp_path):
+    """JUN: D:\\TEMP\\tmpq6i9xlcc, from September, holding net_*.mov and thumb_*.jpg, was still there."""
+    ours, theirs, empty = tmp_path / 'tmpq6i9xlcc', tmp_path / 'tmpabcd1234', tmp_path / 'tmpffff0000'
+    for d in (ours, theirs, empty):
+        d.mkdir()
+    (ours / 'net_1789025550_WEEK6_DAY4_PLUG1.mov').write_bytes(b'm' * 3000)
+    (ours / 'thumb_b1f3ad0613e8ed03.jpg').write_bytes(b'j' * 100)
+    (theirs / 'installer.cab').write_bytes(b'o' * 500)
+    for d in (ours, theirs, empty):
+        for f in d.iterdir():
+            _age(f, 40 * 24 * 3600)
+        _age(d, 40 * 24 * 3600)
+    found = core.stale_upload_dirs(str(tmp_path), legacy='signature')
+    assert [os.path.basename(p) for p, _b in found] == ['tmpq6i9xlcc'] and found[0][1] == 3100
+    assert core.reap_stale_upload_dirs(str(tmp_path), legacy='signature') == 3100
+    assert not ours.exists() and theirs.exists(), "another program's folder is left alone"
+
+
+def test_both_places_are_searched_for_old_folders():
+    assert all(flag for _p, flag in core.upload_parents())

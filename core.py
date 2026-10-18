@@ -46,6 +46,23 @@ def _newest_and_size(path):
     return newest, size
 
 
+# The names PRISM gives the files it keeps in an upload folder. An old-style folder (tmpXXXXXXXX) in a folder
+# other programs also use is only taken for PRISM's when it holds one of these.
+PRISM_FILE_PREFIXES = ('net_', 'thumb_', 'src_', 'shclip_', 'shpart_', 'sfx_', 'voedit_', 'tts_', 'stt_', 'matched_',
+                       'woosh_sfx_', 'with_sfx_', 'vorefsrc_', 'voready_', 'voprevref_', 'vopreview_', 'voiceclone_',
+                       'vo_stt_', 'ttsref_', 'trailer_', 'titlecard_', 'endcard_', 'sotnorm_', 'sildet_', 'she_',
+                       'seg_', 'score_', 'parts_', 'norm_', 'lb_', 'gen_', 'finalmix_', 'export_', 'bgmready_',
+                       'bgmfit_', 'beat_video_', 'cardvo_', 'votight_', 'schedmaster_')
+
+
+def _holds_prism_files(path):
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    return any(n.startswith(PRISM_FILE_PREFIXES) for n in names)
+
+
 def stale_upload_dirs(parent, keep=None, legacy=False, now=None):
     """[(path, bytes)] of the per-run upload folders under `parent` that no
     running instance owns.
@@ -58,8 +75,10 @@ def stale_upload_dirs(parent, keep=None, legacy=False, now=None):
     exists: process ids are reused, quickly on Windows, and signalling a pid
     there can kill it.) With `legacy`, folders named the way mkdtemp() named
     them before this existed (tmpXXXXXXXX) are included once nothing in them
-    has changed for six hours -- only for the folder set in UPLOAD_TEMP_DIR,
-    which the deployment gave to this app, never for the system temp folder."""
+    has changed for six hours: in the folder set in UPLOAD_TEMP_DIR, which
+    the deployment gave to this app, whatever they hold (`legacy=True`); in
+    a folder other programs use too, such as the system temp folder, only
+    those holding files named the way PRISM names its own (`legacy='signature'`)."""
     now = time.time() if now is None else now
     out = []
     try:
@@ -85,6 +104,10 @@ def stale_upload_dirs(parent, keep=None, legacy=False, now=None):
                     if now - newest < _IDLE_LEGACY:
                         continue
             elif legacy and _LEGACY_DIR.match(name):
+                # legacy True: the folder was given to this app (UPLOAD_TEMP_DIR). 'signature': a folder
+                # shared with other programs (the system temp folder), where it must also hold PRISM's files.
+                if legacy == 'signature' and not _holds_prism_files(p):
+                    continue
                 newest, size = _newest_and_size(p)
                 if now - newest < _IDLE_LEGACY:
                     continue
@@ -142,14 +165,15 @@ if _upload_temp_dir:
 
 def upload_parents():
     """[(folder, legacy)] where this app's upload folders live: the folder the
-    current one is in, and the system temp folder. Old-style names are only
-    looked for in the first, and only when UPLOAD_TEMP_DIR chose it."""
+    current one is in, and the system temp folder. Old-style names are looked
+    for in both: anywhere in the folder UPLOAD_TEMP_DIR chose, and elsewhere
+    only in folders holding PRISM's own files."""
     folder = app.config['UPLOAD_FOLDER']
     parent = os.path.dirname(folder)
     chosen = bool(_upload_temp_dir) and os.path.realpath(parent) == os.path.realpath(_upload_temp_dir)
-    out = [(parent, chosen)]
+    out = [(parent, True if chosen else 'signature')]
     if os.path.realpath(tempfile.gettempdir()) != os.path.realpath(parent):
-        out.append((tempfile.gettempdir(), False))
+        out.append((tempfile.gettempdir(), 'signature'))
     return out
 
 
