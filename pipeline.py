@@ -30,6 +30,7 @@ from smbprotocol.exceptions import SharingViolation
 from core import app, ALLOWED_EXTENSIONS, _job_submit_limiter, _client_ip, _RateLimiter
 import cutcraft
 import highlights_core as hc
+import cue_locate
 import vo_fit
 import scriptbrief
 from schedule_core import IMAGE_EXTENSIONS as SCHEDULE_IMAGE_EXTENSIONS
@@ -10857,6 +10858,33 @@ def select_scenes_vo_led(scenes_data, vo_text, trailer_duration, max_scene_dur, 
     return selected, total_sel
 
 
+def _look_for_cue(path, cue, model):
+    """{time: 0..10} -- how well frames around the cue's written time match its description, per the vision model."""
+    import base64
+    t0 = float(cue['time'])
+    dur = probe_duration(path) or 0
+    out = {}
+    for off in cue_locate.OFFSETS:
+        t = round(t0 + off, 3)
+        if t < 0 or (dur and t > dur - 0.2):
+            continue
+        r = subprocess.run([FFMPEG, '-v', 'error', '-ss', f'{t:.3f}', '-i', path, '-frames:v', '1', '-vf', 'scale=640:-2',
+                            '-f', 'image2pipe', '-c:v', 'mjpeg', '-'], capture_output=True, timeout=60)
+        if not r.stdout:
+            continue
+        resp = requests.post(f'{OLLAMA_URL}/api/generate', json={
+            'model': model, 'prompt': cue_locate.describe_prompt(cue.get('desc')), 'stream': False, 'think': False,
+            'images': [base64.b64encode(r.stdout).decode()],
+            'format': {'type': 'object', 'properties': {'match': {'type': 'integer', 'minimum': 0, 'maximum': 10}},
+                       'required': ['match']},
+            'options': {'temperature': 0.1, 'num_predict': 40}}, timeout=120).json()
+        try:
+            out[t] = int(json.loads(resp.get('response') or '{}').get('match'))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 def _run_trailer_job(jid, params):
     path = params['path']; orig_name = params['orig_name']; mode = params['mode']
     genre = params['genre']; scoring_mode = params['scoring_mode']; trailer_length = params['trailer_length']
@@ -10903,6 +10931,40 @@ def _run_trailer_job(jid, params):
     end_card_video_start = params.get('end_card_video_start', 0.0); end_card_video_end = params.get('end_card_video_end')
     schedule_video_start = params.get('schedule_video_start', 0.0); schedule_video_end = params.get('schedule_video_end')
     scoring_audio_path = params['scoring_audio_path']; prompt = params['prompt']
+
+    # Cues that name no material are found by listening: Whisper on each material, the cue's words looked for.
+    _cues0 = params.get('script_cues') or []
+    if any(not c.get('material') for c in _cues0):
+        _mats0 = [p_ for p_ in (params.get('materials_paths') or [path]) if p_ and os.path.isfile(p_)] or [path]
+        _tr0 = {}
+        if any(len(cutcraft.norm_tokens(c.get('desc') or '')) >= cue_locate.MIN_TOKENS for c in _cues0 if not c.get('material')):
+            job_set(jid, percent=3, step='Listening to the footage for the script\'s dialogue')
+            for _i0, _p0 in enumerate(_mats0, 1):
+                try:
+                    _tr0[_i0] = transcribe_video(_p0)[0]
+                except Exception as e:
+                    print(f'Cue dialogue search: material {_i0} not transcribed ({e})')
+        _cues0, _notes0 = cue_locate.locate_cues(_cues0, _tr0, len(_mats0))
+        _look = [c for c in _cues0 if not c.get('located') and len(cutcraft.norm_tokens(c.get('desc') or '')) >= 1]
+        if _look and _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':
+            job_set(jid, percent=4, step='Looking at the footage for the script\'s shots')
+            _model0 = load_production_defaults().get('vision_model') or 'qwen3-vl:8b'
+            for _k0, _c0 in enumerate(_cues0):
+                if _c0 not in _look:
+                    continue
+                try:
+                    _new0 = cue_locate.pick_by_look(_c0, _look_for_cue(_mats0[min(_c0['material'], len(_mats0)) - 1], _c0, _model0))
+                except Exception as e:
+                    print(f'Cue picture search failed ({e})')
+                    continue
+                if _new0 is not _c0:
+                    _cues0[_k0] = _new0
+                    _notes0.append(f'"{_c0["desc"][:40]}" matched by picture at {_new0["time"]:.1f}s (written {_c0["time"]:.1f}s).')
+            _cues0.sort(key=lambda c: (c.get('material') or 1, c['time']))
+        params['script_cues'] = _cues0
+        for _n0 in _notes0:
+            print('Script cue:', _n0)
+        params.setdefault('cue_notes', []).extend(_notes0)
 
     # AI Vision scoring and Whisper-based cut safety are both load-bearing
     # for the quality of an automatically-generated plug, not optional
