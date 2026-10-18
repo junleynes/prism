@@ -1010,6 +1010,7 @@ input.sh-num[type=number]{width:92px}
 .ws-bar{position:sticky;bottom:0;z-index:6;display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 14px;margin-top:14px;border:1px solid var(--line);border-radius:10px;background:var(--elevated);box-shadow:0 -6px 18px rgba(0,0,0,.08)}
 .ws-trt{font-size:12px}
 .ws-out-sum{font-size:11px;color:var(--ink-dim)}
+.ws-beyond{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--ink-dim);margin:0;cursor:pointer;text-transform:none;letter-spacing:0;white-space:nowrap}
 .ws-pop{position:absolute;right:8px;bottom:calc(100% + 8px);width:min(780px,calc(100vw - 80px));max-height:70vh;overflow:auto;background:var(--elevated);border:1px solid var(--line);border-radius:10px;padding:12px 14px;box-shadow:0 10px 30px rgba(0,0,0,.2)}
 @media (max-width:1180px){.ws-grid{grid-template-columns:280px minmax(0,1fr)}.ws-insp{grid-column:1 / -1}.ws-stage{position:static}}
 @media (max-width:760px){.ws-grid{grid-template-columns:minmax(0,1fr)}.ws-list{position:static}}
@@ -8269,6 +8270,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
         <button type=button class="btn-sm" id=ws-setout title="End the moment here (O)">Set Out here</button>
         <button type=button class="btn-sm" id=ws-cut title="Cut a part out of the middle of this moment: press at the start of the part to remove, then again at its end (C)">&#9986; Cut from here</button>
         <button type=button class="btn-sm" id=ws-exact title="Render a small exact copy: framing, corrections and captions burned in">Exact 9:16 preview</button>
+        <label class="ws-beyond" title="Play a few seconds before and after the moment too, so In and Out can be set further out than they are now (extend it) as well as closer in"><input type=checkbox id=ws-beyond> show 5 s beyond the ends</label>
       </div>
       <div class="ws-keys"><kbd>Space</kbd> play &middot; <kbd>&uarr;</kbd><kbd>&darr;</kbd> moment &middot; <kbd>I</kbd> / <kbd>O</kbd> set in / out &middot; <kbd>C</kbd> cut out a part &middot; <kbd>,</kbd> <kbd>.</kbd> (or <kbd>&lt;</kbd> <kbd>&gt;</kbd>) one frame back / forward &middot; <kbd>X</kbd> tick</div>
     </section>
@@ -8312,7 +8314,7 @@ var SH = {analysis: null, cands: [], jobId: null, options: null, destinations: n
           inner: null, formProject: null, formNote: null, settling: false, stash: {}}
 // The Moments workspace: which moment is selected, which inspector tab, and
 // what the stage (player) is showing.
-var WS = {selC: null, loadedC: null, tab: 'trim', token: 0, loadT: null, raf: null, cues: [], dur: 0,
+var WS = {selC: null, loadedC: null, tab: 'trim', token: 0, loadT: null, raf: null, cues: [], dur: 0, lead: 0, tail: 0, beyond: false,
           screen: 'setup', zwin: null, drag: null, exact: false}
 
 function shFmt(t){
@@ -9477,7 +9479,7 @@ function shWsCuts(){
 function shWsCutHere(){
   var c = WS.selC, v = shEl('ws-video')
   if(!c || WS.exact || !v.getAttribute('src')) return
-  var t = Math.round((c.start + (v.currentTime || 0)) * 100) / 100
+  var t = Math.round((c.start - WS.lead + (v.currentTime || 0)) * 100) / 100
   if(WS.cutFrom == null){
     if(t <= c.start + 0.2 || t >= c.end - 0.2){ shWsMsg('Cuts go inside the moment. To shorten its start or end, set In or Out.'); setTimeout(function(){ shWsMsg('') }, 2200); return }
     WS.cutFrom = t; shWsCuts(); return
@@ -9700,6 +9702,15 @@ function shWsPost(url, body){
   return fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).then(function(r){ return r.json() })
 }
 
+// The part of the source a moment lives in: the preview never reaches past it.
+function shPartBounds(c){
+  var P = shParts()
+  if(P){ var k = shPartIdx(c); return [P[k].offset, P[k].offset + P[k].duration] }
+  return [0, SH.analysis ? SH.analysis.duration : 0]
+}
+var WS_BEYOND = 5
+function shWsTotal(){ return WS.lead + WS.dur + WS.tail }
+
 function shWsLoad(delay){
   clearTimeout(WS.loadT)
   var tok = ++WS.token
@@ -9710,30 +9721,34 @@ function shWsLoad(delay){
   if(!c || !a){ v.removeAttribute('src'); shWsMsg('Select a moment'); return }
   WS.loadedC = c
   WS.dur = c.end - c.start
+  var bnd = shPartBounds(c)
+  WS.lead = WS.beyond ? Math.max(0, Math.min(WS_BEYOND, c.start - bnd[0])) : 0
+  WS.tail = WS.beyond ? Math.max(0, Math.min(WS_BEYOND, bnd[1] - c.end)) : 0
   WS.cues = []
   shEl('ws-cap').textContent = ''
   shWsMsg('Preparing the clip…')
   Promise.all([
-    shWsPost('/api/shorts/clip', {analysis_id: a.analysis_id, start: c.start, end: c.end}),
-    shWsPost('/api/shorts/captions', {analysis_id: a.analysis_id, start: c.start, end: c.end,
-                                      subtitle_size: shEl('sh-caption-size').value, edited: c.captions || null})
+    shWsPost('/api/shorts/clip', {analysis_id: a.analysis_id, start: c.start - WS.lead, end: c.end + WS.tail}),
+    // Cue times are relative to the start asked for, which is the start of the video shown: padded, they line up too.
+    shWsPost('/api/shorts/captions', {analysis_id: a.analysis_id, start: c.start - WS.lead, end: c.end + WS.tail,
+                                      subtitle_size: shEl('sh-caption-size').value, edited: WS.lead || WS.tail ? null : (c.captions || null)})
   ]).then(function(r){
     if(tok !== WS.token) return
     WS.cues = r[1] && r[1].ok ? r[1].cues : []
     if(!r[0].ok){ v.removeAttribute('src'); shWsMsg(r[0].error || 'Could not prepare the clip.'); return }
     v.src = r[0].url; v.load()
-    shEl('ws-scrub').max = WS.dur
+    shEl('ws-scrub').max = shWsTotal(); v.currentTime = WS.lead   // opens on the moment's own first frame
   }).catch(function(err){ if(tok === WS.token) shWsMsg('Could not prepare the clip: ' + err) })
 }
 
 function shWsPaint(){
   var v = shEl('ws-video'), c = WS.selC
   if(!c) return
-  var t = Math.max(0, Math.min(WS.dur, v.currentTime || 0))
-  if(document.activeElement !== shEl('ws-scrub')) shEl('ws-scrub').value = t
-  shEl('ws-clock').textContent = t.toFixed(2) + ' / ' + WS.dur.toFixed(1)
+  var tv = Math.max(0, Math.min(shWsTotal(), v.currentTime || 0)), t = tv - WS.lead   // t: seconds into the moment (negative before it)
+  if(document.activeElement !== shEl('ws-scrub')) shEl('ws-scrub').value = tv
+  shEl('ws-clock').textContent = t.toFixed(2) + ' / ' + WS.dur.toFixed(1) + ((t < -1e-6 || t > WS.dur + 1e-6) ? ' (outside)' : '')
   var line = ''
-  if(!WS.exact) WS.cues.forEach(function(q){ if(q.text && q.text.trim() && q.start <= t + 1e-6 && t < q.end - 1e-6) line = q.text.replace(/\s+/g, ' ').trim() })
+  if(!WS.exact) WS.cues.forEach(function(q){ if(q.text && q.text.trim() && q.start <= tv + 1e-6 && tv < q.end - 1e-6) line = q.text.replace(/\s+/g, ' ').trim() })
   var cap = shEl('ws-cap')
   if(cap.textContent !== line) cap.textContent = line
   if(WS.onPaint) WS.onPaint()
@@ -9745,8 +9760,8 @@ function shWsTick(){
   var v = shEl('ws-video'), c = WS.selC
   if(c && c.cuts && c.cuts.length && !v.paused){
     // Played as it will come out: a cut part is jumped over.
-    var at = c.start + v.currentTime
-    shCutsClean(c).forEach(function(x){ if(at >= x[0] && at < x[1] - 0.02) v.currentTime = Math.min(WS.dur, x[1] - c.start) })
+    var at = c.start - WS.lead + v.currentTime
+    shCutsClean(c).forEach(function(x){ if(at >= x[0] && at < x[1] - 0.02) v.currentTime = Math.min(shWsTotal(), x[1] - c.start + WS.lead) })
   }
   WS.raf = (!v.paused && !v.ended) ? requestAnimationFrame(shWsTick) : null
 }
@@ -9760,7 +9775,7 @@ function shWsTick(){
   v.addEventListener('pause', function(){ b.innerHTML = '&#9654;' })
   v.addEventListener('ended', function(){ b.innerHTML = '&#9654;'; shWsPaint() })
   v.addEventListener('seeked', shWsPaint)
-  function toggle(){ if(!v.getAttribute('src')) return; if(v.paused){ if(v.ended || v.currentTime >= WS.dur - 0.05) v.currentTime = 0; v.play().catch(function(){}) } else v.pause() }
+  function toggle(){ if(!v.getAttribute('src')) return; if(v.paused){ if(v.ended || v.currentTime >= shWsTotal() - 0.05) v.currentTime = WS.lead; v.play().catch(function(){}) } else v.pause() }
   b.addEventListener('click', toggle)
   shEl('ws-phone').addEventListener('click', toggle)
   shEl('ws-scrub').addEventListener('input', function(){ v.currentTime = parseFloat(this.value) || 0; shWsPaint() })
@@ -9769,6 +9784,7 @@ function shWsTick(){
   shEl('ws-setin').addEventListener('click', function(){ shWsSetHere('start') })
   shEl('ws-setout').addEventListener('click', function(){ shWsSetHere('end') })
   shEl('ws-cut').addEventListener('click', shWsCutHere)
+  shEl('ws-beyond').addEventListener('change', function(){ WS.beyond = this.checked; if(WS.selC) shWsLoad(0) })
   shEl('ws-exact').addEventListener('click', shWsExact)
   window.shWsToggle = toggle
 })()
@@ -9791,16 +9807,16 @@ function shWsStep(dir){
   if(!v || !v.getAttribute('src') || !WS.selC) return
   if(!v.paused) v.pause()
   var fps = shWsFps(), n = Math.round((v.currentTime || 0) * fps) + dir
-  var last = Math.max(0, Math.ceil(WS.dur * fps) - 1)
+  var last = Math.max(0, Math.ceil(shWsTotal() * fps) - 1)
   n = Math.max(0, Math.min(last, n))
-  v.currentTime = Math.min(WS.dur, (n + 0.25) / fps)
+  v.currentTime = Math.min(shWsTotal(), (n + 0.25) / fps)
   shWsPaint()
 }
 
 function shWsSetHere(which){
   var c = WS.selC, v = shEl('ws-video')
   if(!c || WS.exact || !v.getAttribute('src')) return
-  var t = c.start + (v.currentTime || 0)
+  var t = c.start - WS.lead + (v.currentTime || 0)
   if(!shPointSet(c, which, Math.round(t * 100) / 100)){
     var tok = WS.token
     shWsMsg(which === 'start' ? 'In must be before the out point.' : 'Out must be after the in point.')
@@ -13569,7 +13585,7 @@ job. Configured via env vars:
       </ul>
       <p>Each candidate's score (0&ndash;100) weighs story most, then visual drama, then dialogue pace, then sound. Both Ollama and faster-whisper must be reachable; the job refuses to start otherwise rather than choose on half the evidence. The same goes for a transcription that fails part-way (the service errors or times out): the job stops and says why. Only a source with genuinely nothing to hear &mdash; no audio track, or no speech in it &mdash; falls back to picture alone. A warning above the list tells you when a fallback was used (no story found, or no dialogue at all). The speech-to-text service has to return timings as well as text: it is asked for <code>verbose_json</code> with timestamps and, if it answers that with the text alone, for <code>srt</code> and then <code>vtt</code>, which every Whisper server can write. Subtitle timings are per line, not per word, so captions made that way change a line at a time. A server that gives no timings in any of the three stops the job with a message saying so. On a master that keeps its sound on separate tracks or channels (eight mono tracks, say, with the full mix on 3 and 4), the dialogue is looked for where there is sound rather than on the first track: silent channels are never sent, a stereo pair recorded out of phase is sent as one side, and if the first candidate has no speech in it the next is tried, up to four. A note above the list says which track the dialogue was read from, and the shorts and their previews take their sound from the same place. When nothing is found, the warning lists what was tried and at what level.</p>
       <h3>2. Review</h3>
-      <p>The page works in three steps, shown along the top: <strong>1 Source</strong> (the episode, lengths, language and Output settings), <strong>2 Moments</strong> and <strong>3 Export</strong> (the finished shorts). Moments is a workspace. On the left is the list of moments, best first or in episode order, each with a thumbnail, its in&ndash;out, length and score (green 75 and over, amber 50 and over); the tick decides whether it is rendered, and clicking a row selects it. In the middle is a 9:16 player: it plays the real clip with its sound and shows the captions the moment will get, as they will be burned in (a correction made in <strong>Captions</strong> shows at once). <strong>Set In here</strong> and <strong>Set Out here</strong> take the in or out point from the picture&rsquo;s position; <strong>Exact 9:16 preview</strong> renders a small copy with the framing, corrections and captions applied. On the right the editor has four tabs: <strong>Trim</strong> (title, in and out typed as <code>m:ss.s</code> or seconds, or nudged by &plusmn;0.1 and &plusmn;1 s), <strong>Captions</strong>, <strong>Framing</strong> and <strong>Dialogue</strong>. Under them, the whole episode is drawn as a timeline of its moments (ticked ones solid, unticked hatched, the selected one outlined, the joins between parts marked) and, below it, the selected moment with its surroundings, where the two ends can be dragged. A change that would take a moment outside the lengths set for the cut is refused. The bar at the bottom stays in view: total running time, a summary of the Output settings (open them there, with presets &mdash; <em>Standard</em>, <em>Two-person scenes</em> and <em>Whole frame</em>), and <strong>Render</strong>. A finished render lights up <strong>Export</strong> and is offered in the queue as <strong>Show the shorts</strong>; it never takes the editor away from you. Keys, when you are not typing in a box: <kbd>Space</kbd> play or pause, <kbd>&uarr;</kbd> <kbd>&darr;</kbd> previous or next moment, <kbd>I</kbd> and <kbd>O</kbd> set in and out at the playhead, <kbd>X</kbd> tick or untick. The player shows the source framing; reframing happens at render, and the exact preview shows it.</p>
+      <p>The page works in three steps, shown along the top: <strong>1 Source</strong> (the episode, lengths, language and Output settings), <strong>2 Moments</strong> and <strong>3 Export</strong> (the finished shorts). Moments is a workspace. On the left is the list of moments, best first or in episode order, each with a thumbnail, its in&ndash;out, length and score (green 75 and over, amber 50 and over); the tick decides whether it is rendered, and clicking a row selects it. In the middle is a 9:16 player: it plays the real clip with its sound and shows the captions the moment will get, as they will be burned in (a correction made in <strong>Captions</strong> shows at once). <strong>Set In here</strong> and <strong>Set Out here</strong> take the in or out point from the picture&rsquo;s position; <strong>Exact 9:16 preview</strong> renders a small copy with the framing, corrections and captions applied. On the right the editor has four tabs: <strong>Trim</strong> (title, in and out typed as <code>m:ss.s</code> or seconds, or nudged by &plusmn;0.1 and &plusmn;1 s), <strong>Captions</strong>, <strong>Framing</strong> and <strong>Dialogue</strong>. Under them, the whole episode is drawn as a timeline of its moments (ticked ones solid, unticked hatched, the selected one outlined, the joins between parts marked) and, below it, the selected moment with its surroundings, where the two ends can be dragged. A moment can be made longer as well as shorter: type a new in or out, nudge it, drag an end, or tick <strong>show 5 s beyond the ends</strong> under the player, which plays a little before and after the moment so <strong>Set In here</strong> / <strong>Set Out here</strong> can reach past where it ends now. The <em>Length of each short</em> you set on Source only steers which moments are found; what you may trim to is 3 seconds up to 5 minutes, and a change outside that is refused (a moment that already breaks it may not be made worse). The bar at the bottom stays in view: total running time, a summary of the Output settings (open them there, with presets &mdash; <em>Standard</em>, <em>Two-person scenes</em> and <em>Whole frame</em>), and <strong>Render</strong>. A finished render lights up <strong>Export</strong> and is offered in the queue as <strong>Show the shorts</strong>; it never takes the editor away from you. Keys, when you are not typing in a box: <kbd>Space</kbd> play or pause, <kbd>&uarr;</kbd> <kbd>&darr;</kbd> previous or next moment, <kbd>I</kbd> and <kbd>O</kbd> set in and out at the playhead, <kbd>X</kbd> tick or untick. The player shows the source framing; reframing happens at render, and the exact preview shows it.</p>
       <p>The <strong>Framing</strong> tab shows each of its shots as a still, with the 9:16 window drawn where it will be: dashed for what was worked out, solid for a correction. For any shot, choose <strong>Crop here</strong> and slide the window (or click the still where it should go), <strong>Whole frame</strong> to show the whole picture over a blurred copy, or <strong>Split screen</strong> to stack the two people of the shot, one above the other (offered only for a shot with exactly two people far enough apart to give each a pane; the panes are drawn on the still, numbered top to bottom, and every split in a clip shares one window size). <strong>Make vertical preview</strong> renders a small 9:16 copy of the moment as it will come out &mdash; framing, corrections and captions &mdash; in a few seconds, without spending a full render. <strong>Use this framing</strong> keeps the corrections with that moment (marked <em>framing set</em>); a corrected shot is framed that way for its whole length, even where the plan had followed someone, cut between speakers or split the screen. The corrections belong to the shots, not to the in and out points: move those afterwards and each correction stays on the shot it was made for. <strong>Back to automatic</strong> drops them.</p>
       <p>The <strong>Captions</strong> tab opens the lines it will be captioned with, exactly as they will appear: change the wording, change when a line is on screen (times are from the start of the short, to a hundredth of a second), empty a line to drop it, or add one. <strong>Use these captions</strong> keeps them with that moment &mdash; it is marked <em>captions edited</em> &mdash; and they are what is burned in and written to its .srt. Moving the in or out point afterwards does not lose them: the lines still inside the new range stay, moved to where they now fall, and whatever the range gained at either end gets the automatic captions. <strong>Back to automatic</strong> drops the corrections. A phone-shaped <strong>preview</strong> beside the lines shows the line as it is burned in (size, outline and position) and follows what you do: click or type in a line and it shows that line; drag the slider to any point of the short. <strong>Play</strong> plays the real clip with its sound, a few seconds after the editor opens (while it is prepared the preview is stills and a clock), and the line on screen follows the picture&rsquo;s own clock, so each caption is shown with its voice. Captions are timed from the words: when an analysis is made the first word after a silence is moved to where the speech really begins, so a caption does not come up early and wait for the voice. Beside a line, <strong>Split</strong> cuts it in two at the text cursor (the time is divided in proportion), <strong>Join</strong> runs it into the next; in a time box the up and down keys move it by 0.05 s (Shift: 0.5 s). A line longer than fits on one line at the chosen size is marked amber and the preview shows it wrapped. One caption is on screen at a time, so where two lines overlap the earlier one ends as the next begins.</p>
       <p><strong>Your review is saved as you make it</strong> &mdash; ticks, titles, in and out points, corrected captions and framing, and moments added by hand. The analysis and the review are kept on the server (in <code>shorts_analyses</code> next to the library; <code>SHORTS_ANALYSES_DIR</code> to put them elsewhere) for 14 days after they were last opened (<code>SHORTS_ANALYSIS_DAYS</code>), so a restart or a day away does not mean analysing the episode again. <strong>Earlier cuts of this project</strong>, at the top of <strong>Create shorts</strong>, lists them with <strong>Open</strong>, which brings the cut back as it was left, and <strong>Delete</strong>, which removes the analysis and its review but never shorts made from it. You see your own; admins see everyone&rsquo;s.</p>

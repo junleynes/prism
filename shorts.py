@@ -920,6 +920,15 @@ def _run_analysis(jid, params):
             if moved_w:
                 words_aligned += moved_w
                 sg = sc.sync_segment_starts(sg, w)
+            # ...and goes off with the last one: a word held out into the pause keeps the line up
+            # after the voice has stopped; one cut short takes it off mid-word.
+            w, moved_e = sc.align_word_ends(w, P['db'])
+            words_aligned += moved_e
+        if caps[k] and sg and w == [] and not sc.coarse_times(sg):
+            # Captions the editor supplied, timed to the hundredth: only a mild drift against
+            # the sound is put right (half a second at most), never a different reading of it.
+            sg, moved_c = sc.align_segments(sg, P['db'], max_move=0.5)
+            aligned += moved_c
         if sg and not w and sc.coarse_times(sg):
             # Timed only to the line, and rounded to the whole second: every line
             # is moved onto where its sound really starts and stops, which is what

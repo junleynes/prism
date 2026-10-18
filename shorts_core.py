@@ -3010,7 +3010,7 @@ def coarse_times(segments, min_lines=6, share=0.7):
     return max(buckets.values()) >= share * len(times)
 
 
-def align_segments(segments, db, hop=ENVELOPE_HOP):
+def align_segments(segments, db, hop=ENVELOPE_HOP, max_move=None):
     """Line timings moved onto the sound: (segments, how many were moved).
 
     For a transcript timed only to the line. Each line's start goes to
@@ -3020,7 +3020,11 @@ def align_segments(segments, db, hop=ENVELOPE_HOP):
     start in the middle of sound began earlier.
     Where the sound cannot tell speech from a gap -- a wall of music, a
     crowd -- the line keeps its times. A line never starts before the one
-    ahead of it has ended, so two lines are never moved over each other."""
+    ahead of it has ended, so two lines are never moved over each other.
+
+    `max_move` (seconds) limits how far either edge may be moved: for lines
+    that were timed to the hundredth, where only a mild drift against the
+    sound is to be put right, never a different reading of it."""
     if db is None or not len(db) or not segments:
         return segments, 0
     db = np.asarray(db, dtype=np.float64)
@@ -3075,6 +3079,11 @@ def align_segments(segments, db, hop=ENVELOPE_HOP):
             ne = earlier[-1] if earlier else None
         new_s = round(ns - 0.03, 3) if ns is not None else s
         new_e = round(ne + 0.03, 3) if ne is not None else e
+        if max_move is not None:
+            if abs(new_s - s) > max_move:
+                new_s = s
+            if abs(new_e - e) > max_move:
+                new_e = e
         if new_e - new_s < 0.2:
             new_s, new_e = s, e
         new_s = max(new_s, prev_end)
@@ -3142,6 +3151,74 @@ def align_word_starts(words, db, hop=ENVELOPE_HOP):
             out.append(dict(w))
             continue
         out.append(dict(w, start=round(t, 3)))
+        moved += 1
+    return out, moved
+
+
+WORD_TAIL = {'gap': 0.4,      # only a word followed by at least this much quiet (or the last one) is looked at
+             'run_on': 0.7,   # a word cut short is let run on to where the sound stops, at most this far
+             'linger': 1.0,   # a word held past where the sound stopped is brought back, at most this far
+             'min_move': 0.1}
+
+
+def align_word_ends(words, db, hop=ENVELOPE_HOP):
+    """Word timings with the last word before a pause ended where its sound
+    ends: (words, how many were moved).
+
+    The other half of align_word_starts. A caption is on screen from its
+    first word to its last word's end, so a last word that Whisper timed
+    long (the end taken out into the pause after it) leaves the line on
+    screen after the voice has stopped, and one timed short takes the line
+    off while the word is still being said -- and a short whose out point
+    follows that word is cut through it. The sound says where it really
+    ends. Words inside a phrase, a wall of music or a level that cannot tell
+    speech from a gap keep their times."""
+    if db is None or not len(db) or not words:
+        return words, 0
+    db = np.asarray(db, dtype=np.float64)
+    n = len(db)
+    quiet_run = max(2, int(round(ALIGN['quiet'] / hop)))
+    out, moved = [], 0
+    for k, w in enumerate(words):
+        s, e = float(w['start']), float(w['end'])
+        nxt = float(words[k + 1]['start']) if k + 1 < len(words) else float('inf')
+        if nxt - e < WORD_TAIL['gap']:
+            out.append(dict(w))
+            continue
+        lo = max(0, int((s - ALIGN['window']) / hop))
+        hi = min(n, int((e + ALIGN['window']) / hop) + 1)
+        here = db[lo:hi]
+        if len(here) < 30:
+            out.append(dict(w))
+            continue
+        floor, top = float(np.percentile(here, 10)), float(np.percentile(here, 95))
+        if top - floor < WORD_END['contrast']:
+            out.append(dict(w))
+            continue
+        quiet = here < floor + max(4.0, 0.3 * (top - floor))
+
+        def is_quiet(t):
+            j = int(round(t / hop)) - lo
+            return 0 <= j < len(here) and quiet[max(0, j - 3):j + 4].mean() >= 0.5
+        ne = None
+        if not is_quiet(e):
+            # Still sounding: the word runs on to where the sound first gives way to quiet.
+            for j in range(max(1, int(round(e / hop)) - lo), min(len(here) - quiet_run, int(round((e + WORD_TAIL['run_on']) / hop)) - lo)):
+                if not quiet[j - 1] and quiet[j:j + quiet_run].all():
+                    ne = (lo + j) * hop + 0.03
+                    break
+        else:
+            # Already quiet: back to the last sound before it.
+            j = int(round(e / hop)) - lo
+            floor_j = max(1, int(round((max(s + 0.08, e - WORD_TAIL['linger'])) / hop)) - lo)
+            while j > floor_j and quiet[j - 1]:
+                j -= 1
+            if j > floor_j and not quiet[j - 1]:
+                ne = (lo + j) * hop + 0.03
+        if ne is None or abs(ne - e) < WORD_TAIL['min_move'] or ne <= s + 0.08 or ne >= nxt - 0.02:
+            out.append(dict(w))
+            continue
+        out.append(dict(w, end=round(ne, 3)))
         moved += 1
     return out, moved
 

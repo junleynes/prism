@@ -2023,3 +2023,48 @@ def test_highlight_works_on_cues_with_no_word_times(tmp_path):
     plain = tmp_path / 'b.ass'
     sc.write_ass(cues, str(plain))
     assert len([l for l in plain.read_text().splitlines() if l.startswith('Dialogue')]) == 2
+
+
+def _voice_env(*spans, until=14.0):
+    """An envelope that is loud inside the given (start, end) spans and quiet elsewhere."""
+    hop = sc.ENVELOPE_HOP
+    db = np.full(int(until / hop), -55.0, dtype=np.float32)
+    for a, b in spans:
+        db[int(a / hop):int(b / hop)] = -20.0
+    return db
+
+
+def test_a_last_word_held_out_into_the_pause_ends_where_the_voice_does():
+    db = _voice_env((2.0, 6.0))
+    words = [{'start': 2.0, 'end': 2.6, 'word': 'Oh'}, {'start': 2.7, 'end': 3.2, 'word': 'my'},
+             {'start': 5.3, 'end': 6.8, 'word': 'God'}]
+    out, moved = sc.align_word_ends(words, db)
+    assert moved == 1 and 6.0 <= out[2]['end'] <= 6.1, out
+    assert out[2]['start'] == 5.3 and [w['end'] for w in out[:2]] == [2.6, 3.2]
+
+
+def test_a_word_cut_short_runs_on_to_the_end_of_its_sound():
+    db = _voice_env((2.0, 6.0))
+    out, moved = sc.align_word_ends([{'start': 5.0, 'end': 5.6, 'word': 'God'}], db)
+    assert moved == 1 and 6.0 <= out[0]['end'] <= 6.1, out
+    far = sc.align_word_ends([{'start': 5.0, 'end': 5.0 + 0.1, 'word': 'God'}], _voice_env((2.0, 9.0)))
+    assert far[1] == 0, 'sound that goes on far beyond it is not this word finishing'
+
+
+def test_words_inside_a_phrase_or_a_wall_of_sound_keep_their_ends():
+    db = _voice_env((2.0, 6.0))
+    words = [{'start': 5.0, 'end': 5.4, 'word': 'my'}, {'start': 5.5, 'end': 5.8, 'word': 'God'}]
+    assert sc.align_word_ends(words[:1] + [dict(words[1], start=5.6)], db)[0][0]['end'] == 5.4
+    flat = np.full(int(14 / sc.ENVELOPE_HOP), -20.0, dtype=np.float32)
+    assert sc.align_word_ends([{'start': 1.0, 'end': 7.0, 'word': 'Oh'}], flat)[1] == 0
+    assert sc.align_word_ends([{'start': 1.0, 'end': 7.0, 'word': 'Oh'}], None)[1] == 0
+
+
+def test_caption_lines_timed_to_the_hundredth_only_drift_a_little():
+    db = _voice_env((2.0, 4.0), (8.0, 10.0))
+    segs = [{'start': 2.3, 'end': 4.3, 'text': 'one'}, {'start': 5.5, 'end': 10.0, 'text': 'two'}]
+    out, moved = sc.align_segments(segs, db, max_move=0.5)
+    assert 1.9 <= out[0]['start'] <= 2.1 and 3.9 <= out[0]['end'] <= 4.1, 'a mild drift is put right'
+    assert out[1]['start'] == 5.5, 'a start 2.5 s before the sound is more than a drift: left as given'
+    free, _ = sc.align_segments(segs, db)
+    assert free[1]['start'] > 7.5, 'without the limit it would have moved'
