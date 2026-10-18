@@ -1694,7 +1694,9 @@ document.addEventListener("DOMContentLoaded", function(){
     </div>
     <div id="tr-network-combine-bar" style="display:none;padding:10px;border-top:1px solid var(--line);align-items:center;gap:10px;flex-wrap:wrap">
       <span id="tr-network-combine-status" style="font-size:12px;flex:1;min-width:140px"></span>
-      <button type="button" class="btn btn-primary-promo" id="tr-network-materials-btn" onclick="useSeparateMaterialsSelection()">Use selected materials</button>
+      <button type="button" class="btn btn-secondary-promo" id="tr-network-selectall-btn" onclick="trSelectAllInFolder()">Select all in folder</button>
+      <button type="button" class="btn btn-secondary-promo" id="tr-network-clearsel-btn" onclick="trClearSelection()">Clear</button>
+      <button type="button" class="btn btn-primary-promo" id="tr-network-materials-btn" onclick="useSeparateMaterialsSelection()">Use selected</button>
     </div>
   </div>
   <div id=tr-file-preview class="growing-preview">
@@ -4370,12 +4372,50 @@ document.addEventListener("DOMContentLoaded", function(){
     var status = document.getElementById('tr-network-combine-status')
     var matsBtn = document.getElementById('tr-network-materials-btn')
     if(!bar) return
-    if(trNetworkSelected.length < 2){ bar.style.display = 'none'; return }
+    trRefreshNumbers()
+    if(trNetworkSelected.length < 1){ bar.style.display = 'none'; return }
     bar.style.display = 'flex'
     if(matsBtn) matsBtn.disabled = false
-    status.textContent = trNetworkSelected.length + ' files selected \u00b7 first selected is source 1, then source 2, \u2026'
+    status.textContent = trNetworkSelected.length + ' selected (in this order: source 1 = M1, source 2 = M2, \u2026)'
     status.style.color = ''
   }
+
+  // The order the files were ticked in is the order of the materials: each ticked row shows its number.
+  function trSelKey(name, sp){ return (sp || '') + '\u0000' + name }
+  function trRefreshNumbers(){
+    networkList.querySelectorAll('.net-modal-row[data-mk]').forEach(function(r){
+      var i = trNetworkSelected.findIndex(function(s){ return trSelKey(s.name, s.subpath) === r.getAttribute('data-mk') })
+      var box = r.querySelector('.mk-box')
+      if(box) box.textContent = i >= 0 ? String(i + 1) : ''
+      r.style.background = i >= 0 ? 'rgba(240,90,90,.12)' : ''
+    })
+  }
+  function trToggleSelection(f, sp){
+    var k = trSelKey(f.name, sp)
+    var i = trNetworkSelected.findIndex(function(s){ return trSelKey(s.name, s.subpath) === k })
+    if(i >= 0) trNetworkSelected.splice(i, 1); else trNetworkSelected.push({name: f.name, size: f.size, subpath: sp || ''})
+    updateTrNetworkCombineBar()
+  }
+  function trAddTickBox(row, f, sp){
+    row.setAttribute('data-mk', trSelKey(f.name, sp))
+    row._f = {f: f, sp: sp || ''}
+    var box = document.createElement('span')
+    box.className = 'mk-box'
+    box.title = 'Tick to use as a source (the number is its order: M1, M2, \u2026)'
+    box.style.cssText = 'display:inline-block;min-width:20px;height:20px;line-height:18px;text-align:center;border:1px solid var(--line);border-radius:4px;margin-right:8px;font-size:11px;cursor:pointer;flex-shrink:0'
+    box.addEventListener('click', function(e){ e.stopPropagation(); trToggleSelection(f, sp) })
+    row.appendChild(box)
+  }
+  window.trSelectAllInFolder = function(){
+    networkList.querySelectorAll('.net-modal-row[data-mk]').forEach(function(r){
+      var m = r._f
+      if(m && !trNetworkSelected.some(function(s){ return trSelKey(s.name, s.subpath) === trSelKey(m.f.name, m.sp) })){
+        trNetworkSelected.push({name: m.f.name, size: m.f.size, subpath: m.sp})
+      }
+    })
+    updateTrNetworkCombineBar()
+  }
+  window.trClearSelection = function(){ trNetworkSelected = []; updateTrNetworkCombineBar() }
 
   // Multi-select only path: each file is its own material (M1, M2, …).
   // Selection order = material order. No combine, no TC offset.
@@ -4468,20 +4508,7 @@ document.addEventListener("DOMContentLoaded", function(){
     files.forEach(function(f){
       var row = document.createElement('div')
       row.className = 'net-modal-row'
-      var cb = document.createElement('input')
-      cb.type = 'checkbox'
-      cb.className = 'net-multi-check'
-      cb.title = 'Select as source (order = source 1, 2, \u2026)'
-      cb.addEventListener('click', function(e){ e.stopPropagation() })
-      cb.addEventListener('change', function(){
-        if(cb.checked){
-          trNetworkSelected.push({name: f.name, size: f.size, subpath: subpath || ''})
-        }else{
-          trNetworkSelected = trNetworkSelected.filter(function(sel){ return !(sel.name === f.name && sel.subpath === (subpath || '')) })
-        }
-        updateTrNetworkCombineBar()
-      })
-      row.appendChild(cb)
+      trAddTickBox(row, f, subpath || '')
       var nameSpan = document.createElement('span')
       nameSpan.className = 'row-name'
       nameSpan.textContent = f.name
@@ -4532,20 +4559,7 @@ document.addEventListener("DOMContentLoaded", function(){
         networkList.appendChild(row)
         return
       }
-      var cb = document.createElement('input')
-      cb.type = 'checkbox'
-      cb.className = 'net-multi-check'
-      cb.title = 'Select as source (order = source 1, 2, \u2026)'
-      cb.addEventListener('click', function(e){ e.stopPropagation() })
-      cb.addEventListener('change', function(){
-        if(cb.checked){
-          trNetworkSelected.push({name: f.name, size: f.size, subpath: f.subpath || ''})
-        }else{
-          trNetworkSelected = trNetworkSelected.filter(function(sel){ return !(sel.name === f.name && sel.subpath === (f.subpath || '')) })
-        }
-        updateTrNetworkCombineBar()
-      })
-      row.appendChild(cb)
+      trAddTickBox(row, f, f.subpath || '')
       // Deliberately shows only the filename, not a folder-path prefix --
       // f.subpath is still tracked and used correctly for fetching/
       // combining regardless of what's displayed here; this only changes
@@ -4561,6 +4575,7 @@ document.addEventListener("DOMContentLoaded", function(){
       row.addEventListener('click', function(){ selectTrNetworkRow(row, f.name, f.subpath) })
       networkList.appendChild(row)
     })
+    trRefreshNumbers()
   }
 
   var trNetworkSearchSeq = 0
