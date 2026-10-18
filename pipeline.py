@@ -3170,6 +3170,21 @@ CARD_VO_TAIL = 0.25            # silence kept after the last word
 CARD_VO_MIN_SAVING = 0.25      # not worth a re-cut for less than this
 
 
+def _breath_threshold_db(wav, default=-38.0):
+    """How quiet counts as "no speech" in this recording, in dB: a fixed distance under its own loudest
+    point, not a fixed level. A breath or room tone sits some 25-35 dB under the voice whatever the
+    recording level is, so a fixed -38 dB catches them in a quiet take and misses them in a hot one."""
+    try:
+        r = subprocess.run([FFMPEG, '-hide_banner', '-nostats', '-i', wav, '-af', 'volumedetect', '-f', 'null', '-'],
+                           capture_output=True, text=True, timeout=120)
+        m = re.search(r'max_volume:\s*(-?[\d.]+) dB', r.stderr or '')
+        if not m:
+            return default
+        return max(-48.0, min(-34.0, float(m.group(1)) - 27.0))
+    except Exception:
+        return default
+
+
 def tighten_card_vo(vo_path, trim_start, trim_end, upload_dir=None, tag='cardvo'):
     """The narration of a title or end card with the dead air taken out: the silence before the first word,
     after the last, and the long pauses between words, which are brought down to a natural short breath.
@@ -3195,7 +3210,7 @@ def tighten_card_vo(vo_path, trim_start, trim_end, upload_dir=None, tag='cardvo'
         if r.returncode != 0 or not os.path.exists(win):
             return unchanged
         try:
-            sil = sorted(_detect_silence_intervals(win, noise_db=-38, min_dur=min(pause_min, 0.25)))
+            sil = sorted(_detect_silence_intervals(win, noise_db=_breath_threshold_db(win), min_dur=min(pause_min, 0.25)))
         finally:
             try:
                 os.remove(win)
@@ -4354,6 +4369,21 @@ def _apply_extra_ranges(path, start, end, raw_extra, upload_dir=None, tag='vo'):
     out = os.path.join(upload_dir or app.config['UPLOAD_FOLDER'], f'parts_{tag}_{int(time.time() * 1000)}.wav')
     joined = _concat_audio_ranges(path, ranges, out)
     return (joined, 0.0, None) if joined else (path, start, end)
+
+
+VO_SILENCE_MODES = ('trim', 'fit')
+
+
+def _tighten_vo_intake(path, start, end, mode):
+    """The uploaded narration with its dead air taken out when `mode` is 'trim' (the default): the silence
+    before the first word and after the last, and every pause or breath long enough to be dead air, brought
+    down to a natural short one. Done once, here, on the recording as it comes in, so the reading against the
+    script, the review and the render all work on the same tightened narration.
+    -> (path, start, end, seconds_saved); the inputs and 0.0 when the mode is 'fit' (silence only trimmed
+    where a line does not fit its room, in cutcraft.plan_vo) or when there is nothing worth taking out."""
+    if mode != 'trim' or not path:
+        return path, start, end, 0.0
+    return tighten_card_vo(path, start, end, tag='votight')
 
 
 def _suggest_card_vo_ranges(params, brief):
@@ -6733,6 +6763,15 @@ def api_trailer():
     if vo_mode == 'upload' and vo_upload_path:
         vo_upload_path, vo_trim_start, vo_trim_end = _apply_extra_ranges(
             vo_upload_path, vo_trim_start, vo_trim_end, request.form.get('vo_extra_ranges', ''), tag='vo')
+    # Dead air in the narration: 'trim' (the default) takes out the silence at its ends and the long pauses and
+    # breaths inside it; 'fit' leaves it as recorded unless a line does not fit its room.
+    vo_silence = (request.form.get('vo_silence', 'trim') or 'trim').strip().lower()
+    if vo_silence not in VO_SILENCE_MODES:
+        vo_silence = 'trim'
+    vo_tighten_saved = 0.0
+    if vo_mode == 'upload' and vo_upload_path:
+        vo_upload_path, vo_trim_start, vo_trim_end, vo_tighten_saved = _tighten_vo_intake(
+            vo_upload_path, vo_trim_start, vo_trim_end, vo_silence)
     # Cleaner edits (all on by default, each can be switched off):
     #   cut_clean  settle every clip's in/out so it never lands inside a word
     #   card_fit   fit the title/end cards to the plug length
@@ -7027,7 +7066,7 @@ def api_trailer():
                   vo_rate=vo_rate, vo_start=vo_start, vo_volume=vo_volume, sync_beats=sync_beats, whisper_enhance=whisper_enhance,
                   selection_driver=selection_driver,
                   vo_trim_start=vo_trim_start, vo_trim_end=vo_trim_end,
-                  cut_clean=cut_clean, card_fit=card_fit, vo_smart=vo_smart, vo_jcut=vo_jcut, vo_jcut_auto=vo_jcut_auto,
+                  cut_clean=cut_clean, card_fit=card_fit, vo_smart=vo_smart, vo_jcut=vo_jcut, vo_jcut_auto=vo_jcut_auto, vo_silence=vo_silence, vo_tighten_saved=vo_tighten_saved,
                   scoring_audio_trim_start=scoring_audio_trim_start, scoring_audio_trim_end=scoring_audio_trim_end,
                   end_card_path=end_card_path, end_card_orig_name=end_card_orig_name,
                   end_card_video_start=end_card_video_start, end_card_video_end=end_card_video_end,
@@ -10826,6 +10865,8 @@ def _run_trailer_job(jid, params):
     card_durations = []
     _card_vo_ts = int(time.time() * 1000)
     _vo_notes = []
+    if params.get('vo_tighten_saved'):
+        _vo_notes.append(f"Narration: {params['vo_tighten_saved']:.1f}s of silence, pauses and breaths was taken out.")
     if end_card_path and os.path.exists(end_card_path):
         if end_card_video_start > 0 or end_card_video_end is not None:
             trimmed = os.path.join(app.config['UPLOAD_FOLDER'], f'titlecard_trim_{_card_vo_ts}.mp4')
@@ -10834,12 +10875,12 @@ def _run_trailer_job(jid, params):
                 end_card_path = result
         if title_card_vo_path and os.path.exists(title_card_vo_path):
             muxed = os.path.join(app.config['UPLOAD_FOLDER'], f'titlecard_vo_{_card_vo_ts}.mp4')
-            if params.get('card_vo_tighten', True) and card_vo_overruns(
-                    end_card_path, title_card_vo_path, title_card_vo_start, title_card_vo_end):
+            if params.get('card_vo_tighten', True) and (params.get('vo_silence', 'trim') == 'trim' or card_vo_overruns(
+                    end_card_path, title_card_vo_path, title_card_vo_start, title_card_vo_end)):
                 title_card_vo_path, title_card_vo_start, title_card_vo_end, _saved = tighten_card_vo(
                     title_card_vo_path, title_card_vo_start, title_card_vo_end, tag='tcvo')
                 if _saved:
-                    _vo_notes.append(f'Title card voice-over: longer than its card, so {_saved:.1f}s of silence between and around the words was taken out.')
+                    _vo_notes.append(f'Title card voice-over: {_saved:.1f}s of silence and breaths between and around the words was taken out.')
             result = mux_card_vo(end_card_path, title_card_vo_path, title_card_vo_start, title_card_vo_end, muxed)
             if result:
                 end_card_path = result
@@ -10853,12 +10894,12 @@ def _run_trailer_job(jid, params):
                 schedule_card_path = result
         if end_card_vo_path and os.path.exists(end_card_vo_path):
             muxed = os.path.join(app.config['UPLOAD_FOLDER'], f'endcard_vo_{_card_vo_ts}.mp4')
-            if params.get('card_vo_tighten', True) and card_vo_overruns(
-                    schedule_card_path, end_card_vo_path, end_card_vo_start, end_card_vo_end):
+            if params.get('card_vo_tighten', True) and (params.get('vo_silence', 'trim') == 'trim' or card_vo_overruns(
+                    schedule_card_path, end_card_vo_path, end_card_vo_start, end_card_vo_end)):
                 end_card_vo_path, end_card_vo_start, end_card_vo_end, _saved = tighten_card_vo(
                     end_card_vo_path, end_card_vo_start, end_card_vo_end, tag='ecvo')
                 if _saved:
-                    _vo_notes.append(f'End card voice-over: longer than its card, so {_saved:.1f}s of silence between and around the words was taken out.')
+                    _vo_notes.append(f'End card voice-over: {_saved:.1f}s of silence and breaths between and around the words was taken out.')
             result = mux_card_vo(schedule_card_path, end_card_vo_path, end_card_vo_start, end_card_vo_end, muxed)
             if result:
                 schedule_card_path = result

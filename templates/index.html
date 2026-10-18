@@ -1793,6 +1793,12 @@ document.addEventListener("DOMContentLoaded", function(){
           <option value=on selected>Cut and place at the script's points</option>
           <option value=off>Play the recording as it is</option>
         </select>
+        <label style="margin-top:8px">Silence &amp; breaths in the narration</label>
+        <select name=vo_silence id="vo-silence-select">
+          <option value=trim selected>Trim them (recommended)</option>
+          <option value=fit>Only where a line does not fit</option>
+        </select>
+        <p class="clean-help">Trim: the silence before and after the speech, and every long pause or breath, is brought down to a short natural one &mdash; in the narration and in the title and end card voices. The other choice leaves the recording as it is unless a line would not fit its room.</p>
         <label style="margin-top:8px">Voice lead (J-cut)</label>
         <select name=vo_jcut id="vo-jcut-select">
           <option value=auto selected>Only when the narration does not fit</option>
@@ -2673,14 +2679,14 @@ document.addEventListener("DOMContentLoaded", function(){
     duck_release_hold: 'Duck hold', beat_match: 'Beat matching',
     broadcast_stereo: 'Broadcast stereo', sync_beats: 'Sync cuts to beats',
     whisper_enhance: 'Dialogue-aware cuts',
-    cut_clean: 'Clean cuts', card_fit: 'Card fit', vo_smart: 'Script-aware narration',
+    cut_clean: 'Clean cuts', card_fit: 'Card fit', vo_smart: 'Script-aware narration', vo_silence: 'Narration silence',
   }
   var TPL_SETTING_VALUES = {
     scoring_mode: {generate: 'AI generated', upload: 'uploaded file', none: 'none'},
     sfx_mode: {genre: 'from genre', upload: 'uploaded file', none: 'none'},
     vo_mode: {tts: 'text-to-speech', upload: 'uploaded file', none: 'none'},
     vo_engine: {fish_audio: 'Fish Audio S2'},
-    cut_clean: {on: 'on', off: 'off'}, card_fit: {fit: 'fit to plug', off: 'leave as uploaded'}, vo_smart: {on: 'on', off: 'off'},
+    cut_clean: {on: 'on', off: 'off'}, card_fit: {fit: 'fit to plug', off: 'leave as uploaded'}, vo_smart: {on: 'on', off: 'off'}, vo_silence: {trim: 'trimmed', fit: 'only if it does not fit'},
   }
   var TPL_SETTING_UNITS = {
     trailer_length: 's', xfade_dur: 's', max_scene_dur: 's', min_scene_len_sec: 's',

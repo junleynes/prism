@@ -89,3 +89,50 @@ def test_silence_is_only_taken_out_of_card_narration_that_does_not_fit_its_card(
     assert pipeline.card_vo_overruns(str(work / 'nope.mp4'), long_, 0.0, None) is False
     path, _, _, saved = pipeline.tighten_card_vo(long_, 0.0, None)
     assert saved > 1.5 and _dur(path) < 4.0, 'taken out, it now fits the card'
+
+
+def _voice(path, pieces):
+    """pieces: [('word', s) | ('breath', s) | ('gap', s)] -> speech-like tone bursts, breath noise 30 dB under them, silence."""
+    ins, labels = [], []
+    for i, (kind, s) in enumerate(pieces):
+        src = {'word': 'sine=frequency=300:sample_rate=48000,volume=8',
+               'breath': 'anoisesrc=color=pink:amplitude=0.012:sample_rate=48000',
+               'gap': 'anullsrc=r=48000:cl=mono'}[kind]
+        ins += ['-t', str(s), '-f', 'lavfi', '-i', src]
+        labels.append(f'[{i}:a]')
+    subprocess.run(FF + ins + ['-filter_complex', ''.join(labels) + f'concat=n={len(pieces)}:v=0:a=1,volume=1.0',
+                               '-ar', '48000', '-ac', '1', str(path)], check=True)
+    return str(path)
+
+
+def test_breaths_between_phrases_are_taken_out_not_just_digital_silence(work):
+    src = _voice(work / 'br.wav', [('gap', 0.8), ('word', 0.7), ('breath', 0.6), ('word', 0.7), ('breath', 0.5),
+                                   ('word', 0.7), ('gap', 1.0)])
+    before = _dur(src)
+    path, a, b, saved = pipeline.tighten_card_vo(src, 0.0, None)
+    assert path != src and saved > 1.5, saved
+    assert _dur(path) < before - 1.5
+    thr = pipeline._breath_threshold_db(src)
+    assert -48.0 <= thr <= -34.0
+
+
+def test_the_narration_is_trimmed_at_intake_unless_the_mode_says_otherwise(work):
+    src = _voice(work / 'vo.wav', [('gap', 1.0), ('word', 0.8), ('breath', 0.7), ('word', 0.8), ('gap', 1.5)])
+    same = pipeline._tighten_vo_intake(src, 0.0, None, 'fit')
+    assert same == (src, 0.0, None, 0.0), "'fit' leaves the recording as it is (the plan trims only what must fit)"
+    path, a, b, saved = pipeline._tighten_vo_intake(src, 0.0, None, 'trim')
+    assert path != src and (a, b) == (0.0, None) and saved > 1.0
+    assert pipeline._tighten_vo_intake(None, 0.0, None, 'trim')[0] is None
+    assert 'trim' in pipeline.VO_SILENCE_MODES and 'fit' in pipeline.VO_SILENCE_MODES
+
+
+def test_the_form_offers_the_choice_and_defaults_to_trimming():
+    import unittest.mock as mock
+    with mock.patch('requests.post'), mock.patch('requests.get'):
+        import main
+    c = main.app.test_client()
+    with c.session_transaction() as s:
+        s.update(authed=True, user_id=1, username='admin', role='admin', csrf_token='t')
+    html = c.get('/').get_data(as_text=True)
+    i = html.index('name=vo_silence')
+    assert 'value=trim selected' in html[i:i + 300]
