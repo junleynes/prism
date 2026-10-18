@@ -151,3 +151,10 @@ def test_pin_and_swap_buttons_work_in_the_review_grid():
         pg.click('.scene-pin')
         assert pg.evaluate("window._pins.length") == 0 and pg.inner_text('.scene-pin') == 'Pin'
         b.close()
+
+
+def test_highlights_and_artwork_project_form_has_no_artist_field():
+    js = open('static/projects.js', encoding='utf-8').read()
+    assert 'artist' not in js.lower()
+    # Vertical Shorts keeps its own project form, with the field
+    assert 'id=sh-pf-artists' in open('templates/index.html', encoding='utf-8').read()

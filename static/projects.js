@@ -82,8 +82,6 @@
               '<input type="text" id="' + P + '-episode" class="input-box" maxlength="40" placeholder="e.g. TDH-101"></div>' +
             '<div><label for="' + P + '-eptitle">Title:</label>' +
               '<input type="text" id="' + P + '-eptitle" class="input-box" maxlength="120" placeholder="e.g. Ang Pagbabalik"></div>' +
-            '<div><label for="' + P + '-artists">Artist/s:</label>' +
-              '<input type="text" id="' + P + '-artists" class="input-box" maxlength="300" placeholder="e.g. Juan Dela Cruz, Maria Santos"></div>' +
             '<div><label for="' + P + '-air">Air date:</label>' +
               '<input type="date" id="' + P + '-air" class="input-box"></div>' +
             '<div><label for="' + P + '-status">Status:</label>' +
@@ -135,7 +133,6 @@
     function line(p){
       var bits = [statusPill(p)]
       if(p.episode || p.episode_title) bits.push(esc([p.episode, p.episode_title].filter(Boolean).join(' \u2013 ')))
-      if(p.artists) bits.push(esc(p.artists))
       if(p.air_date) bits.push('airs ' + esc(dateText(p.air_date)))
       if(p.assigned_to) bits.push('assigned to ' + esc(p.assigned_to))
       if(p.group_name || S.isAdmin) bits.push(p.group_name ? 'group ' + esc(p.group_name) : 'no group')
@@ -305,7 +302,6 @@
       el('title').value = p ? (p.title || '') : ''
       el('episode').value = p ? (p.episode || '') : ''
       el('eptitle').value = p ? (p.episode_title || '') : ''
-      el('artists').value = p ? (p.artists || '') : ''
       el('air').value = p ? (p.air_date || '') : ''
       el('status').value = p ? (p.status || 'new') : 'new'
       loadAssignees(p ? p.assigned_to : '', p ? p.project_id : '')
@@ -336,7 +332,6 @@
       fd.append('title', title)
       fd.append('episode', el('episode').value)
       fd.append('episode_title', el('eptitle').value)
-      fd.append('artists', el('artists').value)
       fd.append('air_date', el('air').value)
       fd.append('status', el('status').value)
       fd.append('assigned_to', el('assign').value)
