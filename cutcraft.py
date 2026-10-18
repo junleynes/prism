@@ -30,6 +30,8 @@ import difflib
 import re
 import unicodedata
 
+import vo_fit
+
 # ---------------------------------------------------------------- cuts
 
 LEAD_MAX = 0.25         # room kept before a word that opens a clip
@@ -726,8 +728,33 @@ INLINE_PAUSE_MAX = 0.35 # longest pause kept inside a line: a recorded dramatic 
 SPLIT_GAP = 0.6         # a pause this long inside a line can be tightened
 LINE_GAP = 0.25         # default pause between lines with no time of their own
 MAX_TEMPO = 1.08        # the most the narration is sped up (pitch is kept)
+HARD_TEMPO = 1.18       # the most, once nothing gentler fits and the only other way is to lose words
 VO_FADE = 0.03          # fade on every cut edge
 VO_TAIL = 0.15          # keep this much of the plug's end free of narration
+
+
+def snap_to_sound(words, aligned, sound):
+    """Moves the first and last word of every found line onto the recording's own sound: the first onto where the
+    line's speech starts, the last to where it stops. A transcript that gave whole-line times has its words spread
+    evenly, so those two edges are the ones that land in a breath or inside a word. Edits `words` in place."""
+    found = sorted(((a['w0'], a['w1']) for a in aligned if a['w0'] is not None))
+    if not found or not sound:
+        return
+    lines = [{'in': words[w0]['start'], 'out': words[w1]['end']} for w0, w1 in found]
+    placed = vo_fit.place_lines(sound, lines)
+    if placed is None:                                     # two lines on one sound: place each by itself
+        placed = [(vo_fit.place_lines(sound, [ln]) or [None])[0] for ln in lines]
+    for (w0, w1), r in zip(found, placed):
+        if r is None:
+            continue
+        first, last = r[0] + vo_fit.LEAD, r[1] - vo_fit.TAIL
+        if last - first < 0.05:
+            continue
+        words[w0]['start'] = first
+        words[w1]['end'] = max(last, words[w0]['start'] + 0.02) if w0 == w1 else last
+        if w1 > w0:
+            words[w1]['start'] = min(words[w1]['start'], last - 0.02)
+            words[w0]['end'] = max(words[w0]['end'], first + 0.02)
 
 
 def _tidy_words(words):
@@ -785,7 +812,8 @@ def _line_elements(words, w0, w1, lo, hi):
 LEAD_AUTO_MAX = 1.5     # the most a line is brought forward, under the picture before it, to fit (a J-cut)
 
 
-def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO, aligned=None, lead_max=0.0):
+def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO, aligned=None, lead_max=0.0,
+            sound=None, hard_tempo=HARD_TEMPO):
     """Cut the recorded narration at word edges and place it.
 
     lines    parse_vo_script() output (with no script, one line per spoken
@@ -814,6 +842,8 @@ def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO,
         return {'pieces': [], 'notes': ['No speech found in the recording.'],
                 'fits': True, 'end': start_at, 'lines': []}
     aligned = aligned or align_script(lines, words)
+    if sound:
+        snap_to_sound(words, aligned, sound)
 
     bounds = []
     for k, al in enumerate(aligned):
@@ -860,7 +890,8 @@ def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO,
             nxt = runs[ri + 1]['at'] - 0.1
             deadline = nxt if deadline is None else min(deadline, nxt)
         floor = 0.0 if prev_end is None else prev_end + 0.1
-        got = _fit_run(run, deadline, lines, info, max_tempo, notes, words, lead_max=lead_max, lead_floor=floor)
+        got = _fit_run(run, deadline, lines, info, max_tempo, notes, words, lead_max=lead_max, lead_floor=floor,
+                       sound=sound, hard_tempo=hard_tempo)
         pieces.extend(got)
         if got:
             prev_end = max(p['at'] + (p['b'] - p['a']) / p['tempo'] for p in got)
@@ -870,12 +901,14 @@ def plan_vo(lines, words, *, start_at=0.0, window_end=None, max_tempo=MAX_TEMPO,
     return {'pieces': pieces, 'notes': notes, 'fits': fits, 'end': round(end, 3), 'lines': info}
 
 
-def _fit_run(run, deadline, lines, info, max_tempo, notes, words, lead_max=0.0, lead_floor=0.0):
+def _fit_run(run, deadline, lines, info, max_tempo, notes, words, lead_max=0.0, lead_floor=0.0, sound=None,
+             hard_tempo=HARD_TEMPO):
     """Lay out one run from its anchor and fit it before `deadline`.
     Returns that run's pieces."""
     anchor = run['at']
     cur = anchor                       # where the run starts: the anchor, or earlier when it is led (J-cut)
     lead_by = 0.0
+    hard_used = False
     items = [(k, [dict(e) for e in els]) for k, els in run['items']]
 
     def flat(items_):
@@ -932,15 +965,26 @@ def _fit_run(run, deadline, lines, info, max_tempo, notes, words, lead_max=0.0, 
                 break
             laid, end = layout(seq, 1.0, max_tempo)
             how = 'sped up'
+        if seq and end > deadline + 0.02 and hard_tempo > max_tempo:
+            # Faster than usual, but every word kept, before any word is lost.
+            if layout(seq, 1.0, hard_tempo)[1] <= deadline:
+                lo_, hi_ = max_tempo, hard_tempo
+                for _ in range(14):
+                    mid_ = (lo_ + hi_) / 2.0
+                    lo_, hi_ = (lo_, mid_) if layout(seq, 1.0, mid_)[1] <= deadline else (mid_, hi_)
+                laid, end = layout(seq, 1.0, hi_)
+                how, hard_used = 'sped up', True
+                notes.append(f'Narration sped up by {int(round((hi_ - 1) * 100))} % (more than usual) so that every word is kept.')
         if seq and end > deadline + 0.02:
             laid, end = layout(seq, 1.0, max_tempo)
-            laid, end, cut_line = _trim_to(laid, deadline, words)
+            laid, end, cut_line = _trim_to(laid, deadline, words, sound)
             how = 'trimmed'
             if cut_line is not None:
-                notes.append(f'Narration was cut at a word edge to end by {deadline:.1f}s.')
+                notes.append(f'Narration was cut at a pause to end by {deadline:.1f}s.' if sound
+                             else f'Narration was cut at a word edge to end by {deadline:.1f}s.')
         if how == 'tightened':
             notes.append('Pauses were tightened to fit the narration.')
-        elif how == 'sped up':
+        elif how == 'sped up' and not hard_used:
             notes.append(f'Narration sped up slightly (at most {int(round((max_tempo - 1) * 100))} %) to fit.')
 
     have = {}
@@ -964,8 +1008,10 @@ def _fit_run(run, deadline, lines, info, max_tempo, notes, words, lead_max=0.0, 
              'tempo': round(p['tempo'], 4), 'fade_in': VO_FADE, 'fade_out': VO_FADE} for p in laid]
 
 
-def _trim_to(laid, deadline, words):
-    """Cut a laid-out run so it ends by `deadline`, on a word edge.
+def _trim_to(laid, deadline, words, sound=None):
+    """Cut a laid-out run so it ends by `deadline`, on a word edge -- or, with `sound` (the recording's stretches of
+    speech), only where the recording is quiet: at the end of a stretch, never inside one. A line with no such place
+    left is dropped whole rather than cut through a word.
     Returns (kept pieces, end time, line that was cut or None)."""
     kept, cut_line = [], None
     end = laid[0]['at'] if laid else 0.0
@@ -977,7 +1023,19 @@ def _trim_to(laid, deadline, words):
             continue
         cut_line = p['line']
         room = (deadline - p['at']) * p['tempo']         # source seconds that still fit
-        if room > 0.1:
+        if room > 0.1 and sound:
+            limit = p['a'] + room
+            ends = [e for (_s, e) in sound if p['a'] + 0.1 < e + vo_fit.TAIL <= limit]
+            if ends:
+                e = ends[-1]
+                nxt = next((s for (s, _e) in sound if s > e), None)
+                b = min(e + vo_fit.TAIL, limit, (nxt - 0.01) if nxt is not None else 1e9)
+                q = dict(p)
+                q['b'] = b
+                q['dur'] = (b - p['a']) / p['tempo']
+                kept.append(q)
+                end = q['at'] + q['dur']
+        elif room > 0.1:
             limit = p['a'] + room
             fit = [w for w in words if w['start'] >= p['a'] - 0.01 and w['end'] + 0.05 <= limit]
             if fit:

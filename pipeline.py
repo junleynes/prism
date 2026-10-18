@@ -4278,7 +4278,20 @@ def _build_vo_plan(vo_path, vo_text, trim_start, trim_end, vo_start, window_end,
     if not lines:
         lines = [{'at': None, 'text': (sg.get('text') or '').strip(), 'optional': False}
                  for sg in segments if (sg.get('text') or '').strip()]
-    plan = cutcraft.plan_vo(lines, words, start_at=float(vo_start or 0.0), window_end=window_end, lead_max=lead_max)
+    # The recording's own sound: where speech really starts and stops. Cuts are made in its pauses, never in a word.
+    sound = None
+    env = _voice_envelope(vo_path)
+    if env:
+        try:
+            ts_ = float(trim_start or 0.0)
+            te_ = float(trim_end) if trim_end is not None else None
+            sound = [(a - ts_, b - ts_) for a, b in vo_fit.speech_segments(env[0], hop=env[1])
+                     if b - ts_ > 0 and (te_ is None or a < te_)]
+            sound = [(max(0.0, a), b) for a, b in sound] or None
+        except Exception as e:
+            print(f'VO sound scan skipped: {e}')
+    plan = cutcraft.plan_vo(lines, words, start_at=float(vo_start or 0.0), window_end=window_end, lead_max=lead_max,
+                            sound=sound)
     total = probe_duration(vo_path) or 0.0
     span = (float(trim_end) if trim_end is not None else total) - float(trim_start or 0.0)
     legacy_end = float(vo_start or 0.0) + max(0.0, span)
