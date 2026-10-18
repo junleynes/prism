@@ -1687,7 +1687,8 @@ class Animator:
     entry has an 'out' (a row of a page that is not the last) fades away
     then and is not drawn again."""
 
-    def __init__(self, artwork, timeline, recipe, duration, canvas=CANVAS):
+    def __init__(self, artwork, timeline, recipe, duration, canvas=CANVAS, alpha=False):
+        self.alpha = bool(alpha)           # True: frames are premultiplied BGRA on nothing (to lay over a picture)
         self.layers, self.timeline, self.recipe = artwork['layers'], timeline, recipe
         self.duration, self.canvas = float(duration), canvas
         self.settled_at = settle_time(timeline)
@@ -1730,7 +1731,7 @@ class Animator:
                 self._travel[i] = (begin, max(0.3, min(secs, duration - begin)))
         tune = recipe.get('layer_tune') or {}
         self._inten = [float((tune.get(str(ly.get('name', '')).lower()) or {}).get('intensity', 1.0)) for ly in self.layers]
-        self._base = np.zeros((canvas[1], canvas[0], 3), np.uint8)
+        self._base = np.zeros((canvas[1], canvas[0], 4 if self.alpha else 3), np.uint8)
         self._baked = 0
         self._last_t = -1.0
 
@@ -1906,7 +1907,7 @@ class Animator:
         out = self._base.copy()
         for i in range(self._baked, len(self.layers)):
             self._draw_layer(out, i, ta, step, tm)
-        if self.recipe.get('push_in'):
+        if self.recipe.get('push_in') and not self.alpha:
             tp = (step / STOP_MOTION_FPS if stop else t) / self.duration
             s = 1.0 + PUSH_IN * min(1.0, max(0.0, tp))
             w, h = self.canvas

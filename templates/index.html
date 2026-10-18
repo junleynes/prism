@@ -2026,7 +2026,7 @@ document.addEventListener("DOMContentLoaded", function(){
     <p style="font-size:11px;opacity:.65;margin:4px 0 0">A black-and-white matte (video or still) that wipes from one scene to the next, from the <b>Transitions</b> folder.</p>
   </div>
   </div>
-  <div class="overlay-art-box" style="margin-top:12px">
+  <div class="overlay-art-box adv-only" style="margin-top:12px">
     <label>Artwork overlay <span style="opacity:.6;font-weight:400">(optional)</span>:</label>
     <div class="browse-row">
       {% if allow_local_upload %}<input type=file name=overlay_art accept="image/*,.psd,.psb" data-net-field="overlay_art">{% endif %}
@@ -2035,6 +2035,24 @@ document.addEventListener("DOMContentLoaded", function(){
     <input type=hidden id=overlay_art_network name=overlay_art_network value="">
     <span class="net-file-chip" id=overlay_art_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('overlay_art')">&#10005;</span></span>
     <div id=overlay-art-options style="margin-top:6px">
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:6px 0">
+        <div><label style="font-size:11px">Starts at (s)</label><input type=number name=overlay_start value=1 min=0 step=0.5 style="width:80px"></div>
+        <div><label style="font-size:11px">Holds for (s)</label><input type=number name=overlay_hold value=0 min=0 step=0.5 style="width:80px" title="0 = until the end of the promo"></div>
+      </div>
+      <div style="margin:6px 0">
+        <label style="font-size:11px">Animation</label>
+        <select name=overlay_mode onchange="document.getElementById('overlay-layer-opts').style.display=(this.value==='layers')?'':'none';document.getElementById('overlay-whole-opts').style.display=(this.value==='layers')?'none':''"><option value=whole>Whole artwork (appear, hold, leave)</option><option value=layers>Layer by layer, like Artwork animation</option></select>
+      </div>
+      <div id=overlay-layer-opts style="display:none;margin-bottom:6px">
+        <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:end">
+          <div><label style="font-size:11px">Style</label><select name=overlay_style><option value=fade_still>Fade in + hold still</option><option value=wipe_mix>Wipe reveal + grow, rotate left, rotate right (mixed)</option><option value=fade_shine>Fade in + light sweep</option><option value=wipe_shine>Wipe reveal + light sweep</option><option value=slide_float>Slide up + gentle float</option><option value=pop_pulse>Pop in + pulse one by one</option><option value=stop_motion>Stop motion wipe + wobble</option><option value=pop_dance>Pop in + dancing</option><option value=pop_grow>Pop in + grow and shrink</option><option value=fade_rotate_left>Fade in + rotate left</option><option value=fade_rotate_right>Fade in + rotate right</option></select></div>
+          <div><label style="font-size:11px">Speed</label><select name=overlay_speed><option value=slow>Slow</option><option value=normal selected>Normal</option><option value=fast>Fast</option></select></div>
+          <label style="font-size:12px"><input type=checkbox name=overlay_keep_bg value=on> Keep the PSD's bottom layer (its backdrop)</label>
+        </div>
+        <input type=text name=overlay_prompt placeholder="Optional, in the Artwork animation's words: logo slides in from the left, title fades, text pops" style="width:100%;margin-top:6px">
+        <p style="font-size:11px;opacity:.65;margin:4px 0 0">Each layer of a Photoshop file arrives in the style, over the promo, then holds. The bottom layer is treated as a backdrop and left out unless you keep it. Appears / Leaves below are not used; the style decides how each layer comes in, and it fades out at the end.</p>
+      </div>
+      <div id=overlay-whole-opts>
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:end">
         <div><label style="font-size:11px">Appears</label>
           <select name=overlay_anim><option value=fade>Fade in</option><option value=slide_left>Slide in from left</option><option value=slide_right>Slide in from right</option><option value=slide_up>Slide up</option><option value=slide_down>Slide down</option><option value=pop>Pop</option><option value=none>Cut in</option></select></div>
@@ -2043,11 +2061,10 @@ document.addEventListener("DOMContentLoaded", function(){
         <div><label style="font-size:11px">Position</label>
           <select name=overlay_pos><option value=full>Full frame</option><option value=center>Centre</option><option value=top_left>Top left</option><option value=top_right>Top right</option><option value=bottom_left>Bottom left</option><option value=bottom_right>Bottom right</option></select></div>
         <div><label style="font-size:11px">Size (% of width)</label><input type=number name=overlay_scale value=100 min=5 max=100 step=5 style="width:80px"></div>
-        <div><label style="font-size:11px">Starts at (s)</label><input type=number name=overlay_start value=1 min=0 step=0.5 style="width:80px"></div>
-        <div><label style="font-size:11px">Holds for (s)</label><input type=number name=overlay_hold value=0 min=0 step=0.5 style="width:80px" title="0 = until the end of the promo"></div>
         <div><label style="font-size:11px">Move takes (s)</label><input type=number name=overlay_anim_dur value=0.5 min=0.1 max=3 step=0.1 style="width:80px"></div>
       </div>
       <p style="font-size:11px;opacity:.65;margin:4px 0 0">A PNG with transparency, a JPEG, or a Photoshop file (its visible layers are flattened, transparency kept), from the <b>Animation artwork</b> folder. It appears, holds, then leaves, over the finished promo &mdash; cards included. Holds for 0 means until the end.</p>
+      </div>
     </div>
   </div>
   <div class="adv-only">

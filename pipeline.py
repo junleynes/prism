@@ -88,6 +88,7 @@ TEMPLATE_SLOT_KEYS = list(TEMPLATE_SLOTS.keys())
 TEMPLATE_SETTING_FIELDS = [
     'genre', 'transition', 'xfade_dur', 'transition_matte',
     'overlay_anim', 'overlay_out', 'overlay_pos', 'overlay_start', 'overlay_hold', 'overlay_anim_dur', 'overlay_scale',
+    'overlay_mode', 'overlay_style', 'overlay_speed', 'overlay_prompt', 'overlay_keep_bg',
     'trailer_length', 'max_scene_dur', 'scene_threshold', 'min_scene_len_sec',
     'detector', 'adaptive_threshold',
     'mode', 'model', 'prompt',
@@ -6755,7 +6756,7 @@ def api_trailer():
                 transition = 'fade'
     # Artwork laid over the finished promo (a still or an alpha video), picked with Browse library.
     overlay_art_path = _resolve_upload('overlay_art', SCHEDULE_IMAGE_EXTENSIONS)
-    overlay_opts = overlay_art.clean_options(request.form) if overlay_art_path else None
+    overlay_opts = dict(overlay_art.clean_options(request.form), **overlay_art.clean_layer_options(request.form)) if overlay_art_path else None
 
     def _prod_float(field):
         raw = request.form.get(field)
@@ -13303,8 +13304,20 @@ def _run_trailer_job(jid, params):
         _tmp = os.path.join(app.config['UPLOAD_FOLDER'], f'overlay_{base_ts}.mp4')
         _flat = None
         try:
-            _art_png, _flat = overlay_art.prepare(_art, app.config['UPLOAD_FOLDER'])
-            _ok, _err = overlay_art.apply(FFMPEG, out_path, _art_png, _tmp, params['overlay_opts'], _total, timeout=FFMPEG_LONG_TIMEOUT)
+            _oo = dict(params['overlay_opts'])
+            if _oo.get('mode') == 'layers':
+                # Layer by layer, like Artwork animation: drawn on nothing for as long as it is on screen, then laid over.
+                _w, _h, _fps = overlay_art.probe_video(FFMPEG, out_path)
+                _on = (min(_total, _oo['start'] + _oo['hold']) if _oo['hold'] > 0 else _total) - _oo['start']
+                _flat = os.path.join(app.config['UPLOAD_FOLDER'], f'overlay_layers_{base_ts}.mov')
+                _ok, _err = overlay_art.render_layers(FFMPEG, _art, _oo, max(1.0, min(_on, 120.0)), (_w, _h), _fps, _flat,
+                                                      app.config['UPLOAD_FOLDER'])
+                if _ok:
+                    _ok, _err = overlay_art.apply(FFMPEG, out_path, _flat, _tmp,
+                                                  dict(_oo, anim='none', pos='full', scale=100.0), _total, timeout=FFMPEG_LONG_TIMEOUT)
+            else:
+                _art_png, _flat = overlay_art.prepare(_art, app.config['UPLOAD_FOLDER'])
+                _ok, _err = overlay_art.apply(FFMPEG, out_path, _art_png, _tmp, _oo, _total, timeout=FFMPEG_LONG_TIMEOUT)
         except Exception as e:
             _ok, _err = False, str(e)
         finally:

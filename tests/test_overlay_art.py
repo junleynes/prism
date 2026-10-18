@@ -99,3 +99,50 @@ def test_plain_images_pass_through_and_a_bad_psd_says_so(tmp_path):
     bad.write_bytes(b'not a psd')
     with pytest.raises(ValueError):
         oa.prepare(str(bad), str(tmp_path))
+
+
+def _layered_psd(tmp_path, size=(640, 360)):
+    from PIL import Image
+    from psd_tools import PSDImage
+    from psd_tools.api.layers import PixelLayer
+    psd = PSDImage.new('RGBA', size)
+    psd.append(PixelLayer.frompil(Image.new('RGBA', size, (10, 10, 60, 255)), psd, 'bg', top=0, left=0))
+    psd.append(PixelLayer.frompil(Image.new('RGBA', (200, 60), (255, 0, 0, 255)), psd, 'logo', top=40, left=40))
+    psd.append(PixelLayer.frompil(Image.new('RGBA', (240, 50), (255, 0, 0, 255)), psd, 'title', top=270, left=200))
+    p = str(tmp_path / 'layers.psd')
+    psd.save(p)
+    return p
+
+
+@pytest.mark.parametrize('style', ['fade_still', 'slide_float', 'pop_pulse', 'wipe_mix'])
+def test_layers_arrive_on_nothing_and_the_promo_shows_through(tmp_path, style):
+    base, _ = _fixtures(tmp_path)
+    psd = _layered_psd(tmp_path)
+    lo = oa.clean_layer_options({'overlay_mode': 'layers', 'overlay_style': style})
+    mov = str(tmp_path / 'layers.mov')
+    ok, note = oa.render_layers(FF, psd, lo, 4.0, (640, 360), 25.0, mov, str(tmp_path))
+    assert ok, note
+    o = oa.clean_options({'overlay_anim': 'none', 'overlay_start': '1', 'overlay_hold': '0', 'overlay_out': 'none'})
+    dst = str(tmp_path / 'out.mp4')
+    assert oa.apply(FF, base, mov, dst, o, 6.0)[0]
+    assert _red_at(dst, 0.5) == 0                          # not yet
+    assert _red_at(dst, 5.0) > 3000                        # arrived and held (red logo + title, backdrop left out)
+    r = subprocess.run([FF, '-loglevel', 'error', '-ss', '5', '-i', dst, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+                       capture_output=True, check=True)
+    a = np.frombuffer(r.stdout, np.uint8).reshape(360, 640, 3).astype(int)
+    assert abs(a[180, 320, 0] - 0x30) < 12                 # the promo's own grey is still there in the middle: no backdrop
+
+
+def test_keep_background_covers_the_promo(tmp_path):
+    base, _ = _fixtures(tmp_path)
+    psd = _layered_psd(tmp_path)
+    lo = oa.clean_layer_options({'overlay_mode': 'layers', 'overlay_style': 'fade_still', 'overlay_keep_bg': 'on'})
+    mov = str(tmp_path / 'l.mov')
+    assert oa.render_layers(FF, psd, lo, 4.0, (640, 360), 25.0, mov, str(tmp_path))[0]
+    o = oa.clean_options({'overlay_anim': 'none', 'overlay_start': '0', 'overlay_out': 'none'})
+    dst = str(tmp_path / 'k.mp4')
+    assert oa.apply(FF, base, mov, dst, o, 6.0)[0]
+    r = subprocess.run([FF, '-loglevel', 'error', '-ss', '5', '-i', dst, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+                       capture_output=True, check=True)
+    a = np.frombuffer(r.stdout, np.uint8).reshape(360, 640, 3).astype(int)
+    assert a[180, 320, 2] > 40 and a[180, 320, 0] < 30      # the PSD's dark-blue backdrop

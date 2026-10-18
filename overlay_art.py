@@ -96,24 +96,24 @@ def filter_graph(o, total, frame_w):
 
 
 def probe_video(ffmpeg, src):
-    """(width, fps) of the promo."""
+    """(width, height, fps) of the promo."""
     import shutil
     probe = ffmpeg.replace('ffmpeg', 'ffprobe') if 'ffmpeg' in os.path.basename(ffmpeg) else None
     probe = probe if probe and (os.path.exists(probe) or shutil.which(probe)) else shutil.which('ffprobe') or 'ffprobe'
-    r = subprocess.run([probe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,r_frame_rate',
+    r = subprocess.run([probe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,r_frame_rate',
                         '-of', 'csv=p=0', src], capture_output=True, text=True, timeout=30)
     try:
-        w, rate = r.stdout.strip().split(',')[:2]
+        w, h, rate = r.stdout.strip().split(',')[:3]
         n, d = rate.split('/')
-        return int(w), (float(n) / float(d) if float(d) else 25.0)
+        return int(w), int(h), (float(n) / float(d) if float(d) else 25.0)
     except (ValueError, ZeroDivisionError):
-        return 1920, 25.0
+        return 1920, 1080, 25.0
 
 
 def apply(ffmpeg, src, art, dst, o, total, timeout=600):
     """Writes `dst`: `src` with the artwork over it. Audio is copied. True when it worked."""
     is_image = os.path.splitext(art)[1].lower() in IMAGE_EXTS
-    frame_w, fps = probe_video(ffmpeg, src)
+    frame_w, _h, fps = probe_video(ffmpeg, src)
     pre = ['-loop', '1', '-framerate', f'{fps:g}', '-t', f'{total:.3f}'] if is_image else []
     cmd = [ffmpeg, '-y', '-loglevel', 'error', '-i', src] + pre + ['-i', art,
            '-filter_complex', filter_graph(o, total, frame_w), '-map', '[v]', '-map', '0:a?',
@@ -121,3 +121,75 @@ def apply(ffmpeg, src, art, dst, o, total, timeout=600):
            '-c:a', 'copy', '-movflags', '+faststart', '-t', f'{total:.3f}', dst]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0, r.stderr[-400:]
+
+
+# ---- layer by layer: the Artwork animation engine, drawn on nothing, then laid over the promo ----
+STYLE_DEFAULT = 'fade_still'
+SPEEDS = ('slow', 'normal', 'fast')
+
+
+def clean_layer_options(form):
+    """The layer-animation settings of a form: the style (one of Artwork animation's), the speed, an optional
+    prompt in the same words Artwork animation takes, and whether the PSD's bottom layer (its backdrop) stays."""
+    import schedule_core as sk
+    style = form.get('overlay_style') or STYLE_DEFAULT
+    speed = form.get('overlay_speed') or 'normal'
+    return {'mode': 'layers' if (form.get('overlay_mode') == 'layers') else 'whole',
+            'style': style if style in {k for k, _, _ in sk.STYLES} else STYLE_DEFAULT,
+            'speed': speed if speed in SPEEDS else 'normal',
+            'prompt': (form.get('overlay_prompt') or '').strip()[:400],
+            'keep_bg': str(form.get('overlay_keep_bg') or '').lower() in ('1', 'true', 'on', 'yes')}
+
+
+def _encode_cmd(ffmpeg, size, fps, dst):
+    enc = subprocess.run([ffmpeg, '-hide_banner', '-encoders'], capture_output=True, text=True).stdout
+    codec = (['-c:v', 'prores_ks', '-profile:v', '4', '-pix_fmt', 'yuva444p10le'] if 'prores_ks' in enc
+             else ['-c:v', 'qtrle', '-pix_fmt', 'argb'])
+    return ([ffmpeg, '-y', '-loglevel', 'error', '-f', 'rawvideo', '-pix_fmt', 'bgra', '-s', f'{size[0]}x{size[1]}',
+             '-r', f'{fps:g}', '-i', 'pipe:0', '-an'] + codec + [dst])
+
+
+def render_layers(ffmpeg, art_path, lo, seconds, size, fps, dst, workdir):
+    """Draws the artwork animating for `seconds` on a transparent canvas of `size` into `dst` (a .mov with alpha).
+    A Photoshop file's layers each arrive in the chosen style; a flat picture arrives as one. Returns (ok, note)."""
+    import numpy as np
+    import schedule_core as sk
+    src, tmp = art_path, None                  # layered artwork is read by Artwork animation's own reader
+    try:
+        art = sk.load_artwork(src, canvas=tuple(size))
+        names = [ly['name'] for ly in art['layers']]
+        if len(art['layers']) > 1 and not lo['keep_bg']:
+            art['layers'][0]['px'][:] = 0                      # the backdrop is the promo itself
+        roles = [ly['role'] for ly in art['layers']]
+        recipe = sk.style_recipe(lo['style'])
+        recipe['speed'] = lo['speed']
+        if lo['prompt']:
+            recipe = sk.parse_prompt(lo['prompt'], names, base=recipe)
+        recipe = sk.apply_layer_animation(recipe, art['layers'])
+        recipe, _cannot = sk.fit_to_artwork(recipe, names)
+        timeline = sk.build_timeline(recipe, names, seconds, roles, [ly['page'] for ly in art['layers']])
+        animator = sk.Animator(art, timeline, recipe, seconds, canvas=tuple(size), alpha=True)
+        proc = subprocess.Popen(_encode_cmd(ffmpeg, size, fps, dst), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE)
+        try:
+            for n in range(max(1, int(round(seconds * fps)))):
+                f = animator.frame(n / float(fps)).astype(np.float32)          # premultiplied BGRA
+                a = f[:, :, 3:4]
+                f[:, :, :3] = np.where(a > 0, f[:, :, :3] * 255.0 / np.maximum(a, 1.0), 0.0)
+                proc.stdin.write(np.clip(f + 0.5, 0, 255).astype(np.uint8).tobytes())
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        proc.stdin = None
+        _, err = proc.communicate(timeout=1800)
+        ok = proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
+        return ok, ('' if ok else err.decode('utf-8', 'replace')[-300:])
+    except sk.ArtworkError as e:
+        return False, str(e)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+
