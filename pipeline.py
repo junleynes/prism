@@ -30,6 +30,7 @@ from smbprotocol.exceptions import SharingViolation
 from core import app, ALLOWED_EXTENSIONS, _job_submit_limiter, _client_ip, _RateLimiter
 import cutcraft
 import highlights_core as hc
+import vo_fit
 import scriptbrief
 from schedule_core import IMAGE_EXTENSIONS as SCHEDULE_IMAGE_EXTENSIONS
 from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, library_get_row, library_delete,
@@ -4413,10 +4414,15 @@ def _suggest_card_vo_ranges(params, brief):
             if hit:
                 env = _voice_envelope(path)
                 # The first line's start and the last line's end, found in the sound (not padded from the transcript).
-                first = min(hit, key=lambda h: h[0])
-                last = max(hit, key=lambda h: h[1])
-                lo = _snap_to_voice(env, first[0], first[1])[0]
-                hi = _snap_to_voice(env, last[0], last[1])[1]
+                ordered = sorted(hit, key=lambda h: h[0])
+                placed = _place_on_voice(env, [{'in': h[0], 'out': h[1]} for h in ordered])
+                if placed and placed[0] and placed[-1]:
+                    lo, hi = placed[0][0], placed[-1][1]
+                else:
+                    first = min(hit, key=lambda h: h[0])
+                    last = max(hit, key=lambda h: h[1])
+                    lo = _snap_to_voice(env, first[0], first[1])[0]
+                    hi = _snap_to_voice(env, last[0], last[1])[1]
                 out[key] = {'in': round(lo, 2), 'out': round(hi, 2), 'text': ' / '.join(h[2] for h in hit)}
         except Exception as e:
             print(f'Card narration not read for {key}: {e}')
@@ -6418,6 +6424,19 @@ def _voice_envelope(path):
         return None
 
 
+def _place_on_voice(env, lines):
+    """[(start, end) or None] for each of `lines` (in recording order, {'in','out'} as the transcript heard them),
+    laid over the stretches of speech in the recording (see vo_fit); None when the recording cannot be read or the
+    transcript cannot be matched to its sound."""
+    if not env:
+        return None
+    try:
+        return vo_fit.place_lines(vo_fit.speech_segments(env[0], hop=env[1]), lines)
+    except Exception as e:
+        print(f'Placing lines on the sound failed: {e}')
+        return None
+
+
 def _snap_to_voice(env, w_in, w_out):
     """The selection for one spoken line: from just before its first sound to just after its last, found in
     the audio rather than taken from the transcript. A speech-to-text word end often runs on through the
@@ -6478,13 +6497,17 @@ def _narration_range_from_brief(brief, path):
     # never reaching into the neighbouring line).
     srt = sorted(hit, key=lambda h: h['in'])
     voice = _voice_envelope(path)
+    placed = _place_on_voice(voice, srt)
     parts = []
     for k, h in enumerate(srt):
-        lo, hi = _snap_to_voice(voice, h['in'], h['out'])
-        if k:
-            lo = max(lo, (srt[k - 1]['out'] + h['in']) / 2)
-        if k + 1 < len(srt):
-            hi = min(hi, (h['out'] + srt[k + 1]['in']) / 2)
+        if placed and placed[k]:
+            lo, hi = placed[k]                       # laid on the sound: starts on a sound, ends on one
+        else:
+            lo, hi = _snap_to_voice(voice, h['in'], h['out'])
+            if k:
+                lo = max(lo, (srt[k - 1]['out'] + h['in']) / 2)
+            if k + 1 < len(srt):
+                hi = min(hi, (h['out'] + srt[k + 1]['in']) / 2)
         parts.append({'in': round(lo, 2), 'out': round(max(hi, lo + 0.1), 2), 'text': h['text']})
     return {'in': parts[0]['in'], 'out': parts[0]['out'], 'parts': parts,
             'lines': hit, 'missing': len(texts) - len(hit)}
