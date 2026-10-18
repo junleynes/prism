@@ -10944,6 +10944,13 @@ def _run_trailer_job(jid, params):
 
     # Cues that name no material are found by listening: Whisper on each material, the cue's words looked for.
     _cues0 = params.get('script_cues') or []
+    # The left column's clips are the cuts. The right column's timecoded lines (SOT) are the sound taken from the
+    # footage: they only become cuts of their own when the written clips leave most of the plug empty.
+    _cues0, _sot_note = cue_locate.drop_sot_when_clips_fill(_cues0, trailer_length)
+    if _sot_note:
+        print('Script cue:', _sot_note)
+        params.setdefault('cue_notes', []).append(_sot_note)
+    params['script_cues'] = _cues0
     if any(not cue_locate.is_complete(c) for c in _cues0):
         # 1. The language model reads the cue lines: which are spoken words, which are shots to find.
         if _check_service('ollama', OLLAMA_URL, '/api/tags')['status'] == 'up':

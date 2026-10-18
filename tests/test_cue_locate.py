@@ -97,3 +97,15 @@ def test_a_complete_cue_is_cut_exactly_as_written():
     out, notes = cl.locate_cues([c], {1: W('traydor ka', 230)}, 2)
     assert out[0]['time'] == 218.0 and out[0]['out'] == 223.0 and not notes
     assert not cl.is_complete({'time': 1.0, 'material': 1}) and not cl.is_complete({'time': 1.0, 'out': 4.0})
+
+
+def test_spoken_lines_are_not_extra_clips_when_the_written_shots_fill_the_plug():
+    shots = [{'time': 213.0, 'out': 217.0, 'material': 1, 'kind': 'shot', 'desc': 'HABOL'},
+             {'time': 35.0, 'out': 42.0, 'material': 2, 'kind': 'shot', 'desc': 'BUNOT'}]
+    sots = [{'time': 218.0, 'out': 223.0, 'material': 1, 'kind': 'sot', 'desc': 'TRAYDOR'},
+            {'time': 12.0, 'out': 20.0, 'material': 2, 'kind': 'sot', 'desc': 'AKO'}]
+    out, note = cl.drop_sot_when_clips_fill(shots + sots, 15)
+    assert out == shots and note
+    one = [{'time': 40.0, 'out': 43.0, 'kind': 'shot', 'desc': 'WIDE'}]          # 3 s of a 15 s plug: the SOTs are needed
+    out, note = cl.drop_sot_when_clips_fill(one + sots, 15)
+    assert len(out) == 3 and note is None

@@ -147,3 +147,20 @@ def parse_analysis(reply, cues):
             c['material'] = mat
         out.append(c)
     return out
+
+
+FILL = 0.6              # written clips that make up this much of the plug already fill it
+
+
+def drop_sot_when_clips_fill(cues, plug_length):
+    """(cues, note). The spoken lines (SOT) are the footage's own sound: they become clips of their own only when the
+    written shots (material, in and out) cover less than FILL of the plug. Otherwise they are left out of the cut."""
+    sots = [c for c in cues if c.get('kind') == 'sot']
+    if not sots:
+        return cues, None
+    shots = [c for c in cues if c.get('kind') != 'sot']
+    span = sum(max(0.0, c['out'] - c['time']) for c in shots if is_complete(c))
+    if span >= FILL * plug_length:
+        return shots, (f'The script\'s written clips ({span:.0f}s) fill the {plug_length:g}s plug; its spoken lines (SOT) '
+                       'are the sound of those shots, not extra clips.')
+    return cues, None
