@@ -54,6 +54,12 @@ def locate_cues(cues, transcripts, n_materials=None):
                     best = (key, mat, float(w0['start']), float(w1['end']), r['score'])
         if best:
             _k, mat, a, b, score = best
+            if c.get('user_set') and not c.get('material'):
+                # Typed by the person, material left on Auto: the material where these words are said; the times stay as typed.
+                c['material'], c['material_by'] = mat, 'heard'
+                notes.append(f'"{c["desc"][:40]}" (your timecode) is said in material {mat}: cut as you set it.')
+                out.append(c)
+                continue
             if not c.get('material') and c.get('out') is not None and n_materials > 1 and inside(a, b, c['time'], c['out']):
                 # Written in and out, no material: the speech of every loaded material was searched for these words,
                 # and they are said there, at the written time. That identifies the material; the cut stays as written.
@@ -126,8 +132,9 @@ def snap_to_silence(c, silences, slack=1.5):
 
 
 def is_spoken(c):
-    """A cue whose sound matters: a spoken line (SOT), alone or joined to a shot."""
-    return c.get('kind') == 'sot' or bool(c.get('speech'))
+    """A cue whose sound matters: a spoken line (SOT), alone or joined to a shot. Not one the person typed in by hand:
+    that is cut as typed."""
+    return not c.get('user_set') and (c.get('kind') == 'sot' or bool(c.get('speech')))
 
 
 def _spoken_words(c):
@@ -205,8 +212,8 @@ def merge_overlaps(cues):
     out = []
     for c in cues:
         hit = None
-        for o in out:
-            if o.get('out') is None or c.get('out') is None or o.get('time') is None or c.get('time') is None:
+        for o in ([] if c.get('user_set') else out):
+            if o.get('user_set') or o.get('out') is None or c.get('out') is None or o.get('time') is None or c.get('time') is None:
                 continue
             if o.get('material') and c.get('material') and o['material'] != c['material']:
                 continue
@@ -359,7 +366,7 @@ def apply_roles(cues):
     a spoken line is searched by its words, a shot by its picture. Complete cues are never touched."""
     keep, notes = [], []
     for c in cues:
-        if is_complete(c) or not c.get('role'):
+        if c.get('user_set') or is_complete(c) or not c.get('role'):
             keep.append(c)
             continue
         if c['role'] == 'vo':
@@ -377,10 +384,10 @@ FILL = 0.6              # written clips that make up this much of the plug alrea
 def drop_sot_when_clips_fill(cues, plug_length):
     """(cues, note). The spoken lines (SOT) are the footage's own sound: they become clips of their own only when the
     written shots (material, in and out) cover less than FILL of the plug. Otherwise they are left out of the cut."""
-    sots = [c for c in cues if c.get('kind') == 'sot']
+    sots = [c for c in cues if c.get('kind') == 'sot' and not c.get('user_set')]
     if not sots:
         return cues, None
-    shots = [c for c in cues if c.get('kind') != 'sot']
+    shots = [c for c in cues if c.get('kind') != 'sot' or c.get('user_set')]
     span = sum(max(0.0, c['out'] - c['time']) for c in shots if c.get('out') is not None and c.get('time') is not None)
     if span >= FILL * plug_length:
         return shots, (f'The script\'s written clips ({span:.0f}s) fill the {plug_length:g}s plug; its spoken lines (SOT) '

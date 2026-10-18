@@ -3059,6 +3059,63 @@ document.addEventListener("DOMContentLoaded", function(){
       (bits.length ? '<div style="margin-top:4px;opacity:.85">' + bits.join(' &middot; ') + '</div>' : '') +
       '<div style="margin-top:4px;opacity:.65;font-size:12px">With the narration uploaded, each line is cut from the recording and placed where its clip starts; the tune-in line goes over the cards.</div>'
   }
+  // The script's cuts as an editable list: fix a wrong timecode, choose the material, remove a cut or add one.
+  // Rows the person changed are cut exactly as typed; the others are still checked against the footage's speech.
+  function paintCueEditor(){
+    var cuesEl = document.getElementById('script-validate-cues')
+    var rows = window._cueEdits || []
+    var names = _manualCueMaterialNames()
+    var opts = function(sel){
+      var o = '<option value=""' + (sel ? '' : ' selected') + '>Auto (find it)</option>'
+      names.forEach(function(n, i){ o += '<option value="' + (i + 1) + '"' + (String(sel) === String(i + 1) ? ' selected' : '') + '>M' + (i + 1) + ' \u00b7 ' + escapeHtmlLite(n) + '</option>' })
+      return o
+    }
+    var html = '<div style="font-family:inherit;opacity:.7;margin-bottom:4px">Edit a timecode or material, remove a cut, or add one. Changed cuts are cut exactly as typed.</div>' +
+      '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+    rows.forEach(function(r, i){
+      html += '<tr data-i="' + i + '" style="border-top:1px solid var(--line,#333)' + (r.edited ? ';background:rgba(230,184,77,.10)' : '') + '">' +
+        '<td style="padding:3px 4px;opacity:.6">' + (i + 1) + '</td>' +
+        '<td><select class="ce-mat" style="max-width:150px;font-size:11px;padding:2px 3px">' + opts(r.material) + '</select></td>' +
+        '<td><input class="ce-start" value="' + escapeHtmlLite(r.start) + '" style="width:62px;font-size:11px;padding:2px 4px"></td>' +
+        '<td><input class="ce-end" value="' + escapeHtmlLite(r.end) + '" style="width:62px;font-size:11px;padding:2px 4px"></td>' +
+        '<td style="padding:3px 6px;font-family:var(--font-body,inherit);opacity:.85" title="' + escapeHtmlLite((r.speech ? r.speech + ' / ' : '') + r.desc) + '">' +
+          escapeHtmlLite((r.desc || r.speech || '').slice(0, 46)) + (r.edited ? ' <b style="color:#e6b84d">edited</b>' : '') + '</td>' +
+        '<td><span class="ce-del" style="cursor:pointer;opacity:.6;padding:2px 6px" title="Remove this cut">&#10005;</span></td></tr>'
+    })
+    html += '</table><div style="margin-top:6px"><button type=button class="btn" id="ce-add" style="padding:3px 9px;font-size:11px">+ Add a cut</button> ' +
+      '<button type=button class="btn" id="ce-reset" style="padding:3px 9px;font-size:11px">Reset to script</button></div>'
+    cuesEl.style.fontFamily = 'inherit'
+    cuesEl.style.maxHeight = '260px'
+    cuesEl.innerHTML = html
+    var mark = function(i){
+      var r = rows[i], o = r.orig
+      r.edited = !o || r.material !== o.material || r.start !== o.start || r.end !== o.end
+      window._cueEditsDirty = true
+    }
+    cuesEl.querySelectorAll('tr[data-i]').forEach(function(tr){
+      var i = parseInt(tr.dataset.i, 10)
+      tr.querySelector('.ce-mat').addEventListener('change', function(e){ rows[i].material = e.target.value; mark(i); paintCueEditor() })
+      tr.querySelector('.ce-start').addEventListener('change', function(e){ rows[i].start = e.target.value.trim(); mark(i); paintCueEditor() })
+      tr.querySelector('.ce-end').addEventListener('change', function(e){ rows[i].end = e.target.value.trim(); mark(i); paintCueEditor() })
+      tr.querySelector('.ce-del').addEventListener('click', function(){ rows.splice(i, 1); window._cueEditsDirty = true; paintCueEditor() })
+    })
+    cuesEl.querySelector('#ce-add').addEventListener('click', function(){
+      rows.push({material: '', start: '', end: '', desc: 'Added cut', kind: 'shot', speech: '', note: '', edited: true, orig: null})
+      window._cueEditsDirty = true
+      paintCueEditor()
+    })
+    cuesEl.querySelector('#ce-reset').addEventListener('click', function(){
+      var b = window._scriptBriefRaw
+      var f = document.getElementById('script-file-input')
+      if(f && f.files && f.files[0] && window.scriptFileChosen) window.scriptFileChosen(f)
+    })
+  }
+  window.cueOverridesForForm = function(){
+    if(!window._cueEdits || !window._cueEditsDirty) return null
+    return window._cueEdits.map(function(r){
+      return {material: r.material || null, start: r.start, end: r.end, desc: r.desc, kind: r.kind, speech: r.speech, edited: !!r.edited}
+    })
+  }
   function showScriptValidatePanel(data, errorMsg){
     var panel = document.getElementById('script-validate-panel')
     var sum = document.getElementById('script-validate-summary')
@@ -3079,7 +3136,18 @@ document.addEventListener("DOMContentLoaded", function(){
     sum.style.color = data.ok ? '#8c8' : '#e88'
     sum.textContent = data.summary || (data.ok ? 'Script OK' : 'No usable cues')
     warn.innerHTML = (data.warnings || []).map(function(w){ return '• ' + w }).join('<br>')
-    if(data.cues && data.cues.length){
+    var scriptModeNow = (document.querySelector('input[name=script_mode]:checked') || {}).value
+    window._cueEdits = null
+    window._cueEditsDirty = false
+    if(data.cues && data.cues.length && scriptModeNow === 'upload'){
+      window._cueEdits = data.cues.map(function(c){
+        var row = {material: c.material || '', start: _tcShow(c.time), end: c.out != null ? _tcShow(c.out) : '', desc: c.desc || '',
+                   kind: c.kind || 'shot', speech: c.speech || '', note: c.note || '', edited: false}
+        row.orig = {material: row.material, start: row.start, end: row.end}
+        return row
+      })
+      paintCueEditor()
+    } else if(data.cues && data.cues.length){
       cuesEl.innerHTML = data.cues.map(function(c){
         var note = c.note ? (' — ' + c.note) : ''
         var desc = c.desc ? ('  ' + c.desc) : ''
@@ -4854,6 +4922,11 @@ async function submitTrailer(previewOnly){
     var manualEntries = collectManualCues()
     if(manualEntries.length) fd.append('manual_cues', JSON.stringify(manualEntries))
   }
+  // Timecodes corrected, cuts removed or added in the script's review list (Timecode Priority)
+  if(window.cueOverridesForForm && document.querySelector('input[name=script_mode]:checked').value === 'upload'){
+    var _ov = window.cueOverridesForForm()
+    if(_ov) fd.append('cue_overrides', JSON.stringify(_ov))
+  }
 
   if(episodicProjectId()) fd.append('project_id', episodicProjectId())
   var _pinsHere = (window._pins || []).filter(function(p){ return p.src === _trSourceKey() })
@@ -5330,16 +5403,103 @@ function _pinIndex(s){
   }
   return -1
 }
+// ---- Timecode edits made on the proposed cut: a scene's own material / in / out, and cuts added by hand ----
+window._sceneEdits = {}
+window._newCuts = []
+function trMaterialNames(){
+  try{
+    var raw = (document.getElementById('tr-materials-display-names') || {}).value || ''
+    var n = raw ? JSON.parse(raw) : []
+    return (n && n.length) ? n : ['M1']
+  }catch(e){ return ['M1'] }
+}
+function _tcShow(sec){
+  sec = Number(sec) || 0
+  if(Math.abs(sec - Math.round(sec)) > 0.04) return String(Math.round(sec * 10) / 10)
+  sec = Math.round(sec)
+  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = sec % 60
+  return (h ? h + ':' + (m < 10 ? '0' : '') + m : String(m)) + ':' + (x < 10 ? '0' : '') + x
+}
+function _matSelectHtml(cls, selected, withAuto){
+  var o = withAuto ? '<option value=""' + (selected ? '' : ' selected') + '>Auto (find it)</option>' : ''
+  trMaterialNames().forEach(function(n, i){
+    o += '<option value="' + (i + 1) + '"' + (String(selected) === String(i + 1) ? ' selected' : '') + '>M' + (i + 1) + ' \u00b7 ' + escapeHtmlLite(n) + '</option>'
+  })
+  return '<select class="' + cls + '" style="max-width:150px;font-size:11px;padding:3px 4px">' + o + '</select>'
+}
+function addSceneEditor(card, s, cb, note){
+  var form = document.createElement('div')
+  form.style.cssText = 'display:none;padding:0 10px 8px;font-size:11px'
+  form.innerHTML = '<div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">' +
+    _matSelectHtml('se-mat', s.material || 1, false) +
+    '<input class="se-start" placeholder="Start 1:40" style="width:70px;font-size:11px;padding:3px 4px">' +
+    '<input class="se-end" placeholder="End 1:45" style="width:70px;font-size:11px;padding:3px 4px">' +
+    '<button type=button class="btn se-ok" style="padding:3px 8px;font-size:10px">Apply</button>' +
+    '<button type=button class="btn se-undo" style="padding:3px 8px;font-size:10px">Undo</button></div>' +
+    '<div style="opacity:.6;margin-top:3px">Cut exactly as typed when you lock the cut and render.</div>'
+  card.appendChild(form)
+  var key = function(){ return cb.dataset.scene }
+  var ms = form.querySelector('.se-mat'), st = form.querySelector('.se-start'), en = form.querySelector('.se-end')
+  var fill = function(){ st.value = _tcShow(s.start); en.value = _tcShow(s.start + s.duration); ms.value = String(s.material || 1) }
+  fill()
+  form.querySelector('.se-ok').addEventListener('click', function(){
+    if(!st.value.trim()){ note.textContent = 'Type a start time'; return }
+    window._sceneEdits[key()] = {material: parseInt(ms.value, 10) || 1, start: st.value.trim(), end: en.value.trim()}
+    note.textContent = 'Edited: M' + ms.value + ' ' + st.value.trim() + (en.value.trim() ? ' \u2192 ' + en.value.trim() : '') + ' (applies on render)'
+    card.style.outline = '1px solid var(--amber)'
+    form.style.display = 'none'
+  })
+  form.querySelector('.se-undo').addEventListener('click', function(){
+    delete window._sceneEdits[key()]
+    fill(); note.textContent = ''; card.style.outline = ''
+  })
+  return form
+}
+function renderNewCutBox(grid){
+  var box = document.getElementById('tr-newcut-box')
+  if(!box){
+    box = document.createElement('div')
+    box.id = 'tr-newcut-box'
+    box.style.cssText = 'margin-top:10px;font-size:12px'
+    grid.insertAdjacentElement('afterend', box)
+  }
+  var chips = window._newCuts.map(function(c, i){
+    return '<span class="net-file-chip" style="display:inline-flex;margin:0 6px 4px 0"><span class="chip-name">+ M' + c.material + ' ' + escapeHtmlLite(c.start) + (c.end ? ' \u2192 ' + escapeHtmlLite(c.end) : '') +
+      '</span><span class="chip-x" data-i="' + i + '">&#10005;</span></span>'
+  }).join('')
+  box.innerHTML = '<div>' + chips + '</div>' +
+    '<button type=button class="btn" id="tr-newcut-open" style="padding:4px 10px;font-size:11px">+ Add a cut</button>' +
+    '<span id="tr-newcut-form" style="display:none;margin-left:8px">' + _matSelectHtml('nc-mat', 1, false) +
+    ' <input class="nc-start" placeholder="Start 1:40" style="width:76px;font-size:11px;padding:3px 4px">' +
+    ' <input class="nc-end" placeholder="End 1:45" style="width:76px;font-size:11px;padding:3px 4px">' +
+    ' <button type=button class="btn" id="tr-newcut-add" style="padding:3px 8px;font-size:11px">Add</button></span>' +
+    '<span id="tr-newcut-note" style="margin-left:8px;opacity:.7"></span>'
+  box.querySelector('#tr-newcut-open').addEventListener('click', function(){
+    var f = box.querySelector('#tr-newcut-form'); f.style.display = f.style.display === 'none' ? 'inline' : 'none'
+  })
+  box.querySelector('#tr-newcut-add').addEventListener('click', function(){
+    var st = box.querySelector('.nc-start').value.trim(), en = box.querySelector('.nc-end').value.trim()
+    if(!st){ box.querySelector('#tr-newcut-note').textContent = 'Type a start time'; return }
+    window._newCuts.push({material: parseInt(box.querySelector('.nc-mat').value, 10) || 1, start: st, end: en})
+    renderNewCutBox(grid)
+  })
+  box.querySelectorAll('.chip-x').forEach(function(x){
+    x.addEventListener('click', function(){ window._newCuts.splice(parseInt(x.dataset.i, 10), 1); renderNewCutBox(grid) })
+  })
+}
 function addSceneActions(card, s){
   var bar = document.createElement('div')
   bar.className = 'scene-actions'
   bar.style.cssText = 'display:flex;gap:6px;align-items:center;padding:0 10px 8px;font-size:10px'
   bar.innerHTML = '<button type=button class="btn scene-swap" style="padding:3px 8px;font-size:10px">Swap</button>' +
+                  '<button type=button class="btn scene-edit" style="padding:3px 8px;font-size:10px" title="Correct this scene\u2019s material and timecode">Edit time</button>' +
                   '<button type=button class="btn scene-pin" style="padding:3px 8px;font-size:10px"></button>' +
                   '<span class="scene-note" style="opacity:.7"></span>'
   card.appendChild(bar)
   var cb = card.querySelector('input[type=checkbox]')
   var swap = bar.querySelector('.scene-swap'), pin = bar.querySelector('.scene-pin'), note = bar.querySelector('.scene-note')
+  var editForm = addSceneEditor(card, s, cb, note)
+  bar.querySelector('.scene-edit').addEventListener('click', function(){ editForm.style.display = editForm.style.display === 'none' ? 'block' : 'none' })
   if(s.pinned && _pinIndex(s) < 0) window._pins.push({material: s.material, start: s.start, src: _trSourceKey()})
   function paint(){
     var on = _pinIndex(s) >= 0
@@ -5388,6 +5548,9 @@ function renderPreviewCut(d){
     d.estimated_duration + 's (target ' + d.trailer_length + 's) \u00b7 source ' + d.video_duration + 's'
   var grid = document.getElementById('tr-preview-grid')
   grid.innerHTML = ''
+  window._sceneEdits = {}
+  window._newCuts = []
+  renderNewCutBox(grid)
   d.scenes.forEach(function(s){
     grid.appendChild(buildSceneCard(s, 'tr-preview-pick', s.scene, true, '#' + s.scene, true))
   })
@@ -5764,6 +5927,8 @@ async function renderApprovedCut(){
   fd.append('preview_id', _previewId)
   if(drop.length) fd.append('drop', JSON.stringify(drop))
   if(add.length) fd.append('add', JSON.stringify(add))
+  if(Object.keys(window._sceneEdits || {}).length) fd.append('edit', JSON.stringify(window._sceneEdits))
+  if((window._newCuts || []).length) fd.append('new_cuts', JSON.stringify(window._newCuts))
   var start
   try{
     var r = await fetch('/api/trailer/render', {method:'POST', body: fd})

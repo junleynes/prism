@@ -6377,7 +6377,7 @@ def api_validate_script():
     _sbrief = read_script_brief(raw_script, script_name, text, parse_script_cues(text, available_materials=available)) if raw_script else None
     _lay = cue_locate.merge_overlaps(scriptbrief.cues_from_brief(_sbrief, available)) if _sbrief else []
     if _lay:
-        kept = [{'time': c['time'], 'timecode': _seconds_to_tc(c['time']), 'raw_time': c['time'],
+        kept = [{'time': c['time'], 'out': c.get('out'), 'kind': c.get('kind'), 'speech': c.get('speech'), 'timecode': _seconds_to_tc(c['time']), 'raw_time': c['time'],
                  'raw_timecode': _seconds_to_tc(c['time']),
                  'out_timecode': _seconds_to_tc(c['out']) if c.get('out') is not None else None,
                  'desc': (c.get('desc') or '')[:160], 'material': c.get('material'), 'status': 'ok',
@@ -7175,6 +7175,17 @@ def api_trailer():
     job_set_orig_name(jid, orig_name)
     # If discrete materials were staged, use the first as primary path for
     # display / legacy single-source helpers; all materials go on the job.
+    # The person's edited cue list (review panel under Timecode Priority) replaces what was read from the script:
+    # corrected timecodes, a material chosen, cuts removed or added. The voice-over and card reading stay the script's.
+    _ov_raw = (request.form.get('cue_overrides') or '').strip()
+    if _ov_raw and script_file:
+        _ov, _ov_err = _parse_cue_overrides(_ov_raw, len(materials_paths) if materials_paths else None)
+        if _ov_err:
+            return jsonify(error=_ov_err), 400
+        script_cues = _ov
+        if script_brief:
+            script_brief['clips_edited'] = True
+
     if materials_paths:
         path = materials_paths[0]
         if not orig_name:
@@ -7427,6 +7438,80 @@ def _autofill_short_selection_from_alternates(selected, alternates, already_used
     result.sort(key=lambda s: (s.get('cue_order') if s.get('cue_order') is not None else 0, s.get('material') or 0, s['start']))
     return result
 
+def _tc_secs(txt):
+    """Seconds from what a person typed: 100, 100.5, 1:40, 1:40:05 or 00:01:40:00 -- None when empty or unreadable."""
+    t = str(txt if txt is not None else '').strip()
+    if not t:
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        pass
+    parsed = _parse_timecode_line(t)
+    return float(parsed[0]) if parsed else None
+
+
+def _parse_cue_overrides(raw, n_materials):
+    """(cues, error) from the review panel's edited cue list: [{material|null, start, end, desc, kind, speech, edited}].
+    A row the person changed or added is marked user_set: it is cut as typed, never moved by what is heard."""
+    try:
+        rows = json.loads(raw)
+    except (ValueError, TypeError):
+        return None, 'The edited timecodes were not in a readable format.'
+    if not isinstance(rows, list):
+        return None, 'The edited timecodes were not in a readable format.'
+    cues = []
+    for i, r in enumerate(rows, 1):
+        if not isinstance(r, dict):
+            continue
+        t0, t1 = _tc_secs(r.get('start')), _tc_secs(r.get('end'))
+        if t0 is None or t0 < 0:
+            return None, f'Cut #{i} needs a start time ("{r.get("start")}" was not readable; use 1:40 or 100).'
+        if t1 is not None and t1 <= t0:
+            return None, f'Cut #{i} ends ({t1:g}s) before it starts ({t0:g}s).'
+        c = {'order': len(cues), 'time': t0, 'desc': str(r.get('desc') or '')[:200], 'kind': r.get('kind') if r.get('kind') in ('shot', 'sot') else 'shot'}
+        if t1 is not None:
+            c['out'] = t1
+        try:
+            mat = int(r.get('material')) if r.get('material') not in (None, '', 'auto') else None
+        except (TypeError, ValueError):
+            mat = None
+        if mat is not None:
+            if mat < 1 or (n_materials and mat > n_materials):
+                return None, f'Cut #{i} names material {mat}, which is not loaded.'
+            c['material'] = mat
+        if r.get('speech'):
+            c['speech'] = str(r['speech'])[:300]
+        if r.get('edited'):
+            c['user_set'] = True
+        cues.append(c)
+    return cues, None
+
+
+def _edited_scene(old, edit, mats):
+    """A preview scene with the person's own material, in and out. -> (scene, error)"""
+    try:
+        mat = int(edit.get('material') or old.get('material') or 1)
+    except (TypeError, ValueError):
+        return None, 'The material of an edited cut was not a number.'
+    t0, t1 = _tc_secs(edit.get('start')), _tc_secs(edit.get('end'))
+    if mat < 1 or mat > len(mats):
+        return None, f'Material {mat} is not loaded.'
+    if t0 is None or t0 < 0:
+        return None, f'The start of an edited cut ("{edit.get("start")}") was not readable.'
+    if t1 is None:
+        t1 = t0 + max(0.8, float(old.get('selected_dur') or 4.0))
+    if t1 <= t0:
+        return None, f'An edited cut ends ({t1:g}s) before it starts ({t0:g}s).'
+    new = build_cue_clips([{'time': t0, 'out': t1, 'material': mat, 'desc': old.get('script_desc') or f'M{mat}'}], mats)
+    if not new:
+        return None, 'That cut could not be built from the material.'
+    new = new[0]
+    new.update(cue_order=old.get('cue_order'), user_set=True, cue_fixed=True,
+               script_desc=(old.get('script_desc') or f'M{mat}') + ' (timecode edited)')
+    return new, None
+
+
 @app.route('/api/trailer/render', methods=['POST'])
 @require_permission('promo_generation')
 def api_trailer_render():
@@ -7444,6 +7529,44 @@ def api_trailer_render():
         return jsonify(error='That preview belongs to a different account.'), 403
 
     selected = p['selected']
+    # The person's own timecodes for a scene ({"2": {"material", "start", "end"}}) replace that scene's cut, and new cuts they
+    # added ([{"material", "start", "end"}]) join the end of the cut. Both are cut exactly as typed.
+    _mats_r = p['params'].get('materials_paths') or [p['params'].get('path')]
+    edits_n = set()
+    raw_edit = (request.form.get('edit') or '').strip()
+    if raw_edit:
+        try:
+            edits = json.loads(raw_edit)
+            assert isinstance(edits, dict)
+        except (ValueError, TypeError, AssertionError):
+            return jsonify(error='`edit` must be a JSON object of scene number -> {material, start, end}.'), 400
+        selected = list(selected)
+        for k, e in edits.items():
+            try:
+                i = int(k) - 1
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= i < len(selected)) or not isinstance(e, dict):
+                continue
+            new, err = _edited_scene(selected[i], e, _mats_r)
+            if err:
+                return jsonify(error=f'Scene {i + 1}: {err}'), 400
+            selected[i] = new
+            edits_n.add(i + 1)
+    raw_new = (request.form.get('new_cuts') or '').strip()
+    new_cuts = []
+    if raw_new:
+        try:
+            rows = json.loads(raw_new)
+            assert isinstance(rows, list)
+        except (ValueError, TypeError, AssertionError):
+            return jsonify(error='`new_cuts` must be a JSON array of {material, start, end}.'), 400
+        for j, e in enumerate(rows[:12], 1):
+            new, err = _edited_scene({'script_desc': 'Added cut', 'cue_order': 1000 + j}, e, _mats_r)
+            if err:
+                return jsonify(error=f'Added cut {j}: {err}'), 400
+            new['script_desc'] = 'Added cut'
+            new_cuts.append(new)
     raw_drop = (request.form.get('drop') or '').strip()
     drop = set()
     if raw_drop:
@@ -7452,6 +7575,8 @@ def api_trailer_render():
         except (ValueError, TypeError):
             return jsonify(error='`drop` must be a JSON array of scene numbers, e.g. [2,5].'), 400
         selected = [s for i, s in enumerate(selected) if (i + 1) not in drop]
+    if new_cuts:
+        selected = list(selected) + new_cuts
 
     # `add` pulls in runner-up scenes the preview offered but didn't pick. Merged
     # back in timeline order so a swapped-in clip lands where it belongs rather
@@ -7484,7 +7609,7 @@ def api_trailer_render():
     # resulting total has drifted (see the function's own tolerance) --
     # an unedited "render exactly what I previewed" still renders exactly
     # that, unchanged.
-    if drop or added:
+    if drop or added or edits_n or new_cuts:
         target = p['params'].get('trailer_length', 15)
         selected = _rebalance_selected_durations(selected, target)
         # Rebalancing alone can't close every gap: a short scene that's
@@ -7499,7 +7624,7 @@ def api_trailer_render():
         selected = _rebalance_selected_durations(selected, target)
 
     params = dict(p['params'])
-    if drop or added:
+    if drop or added or edits_n or new_cuts:
         params.pop('vo_plan', None)          # lines were placed by the clips as previewed: place them again
     params['preview_only'] = False
     params['preselected'] = selected
