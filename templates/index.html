@@ -9305,7 +9305,7 @@ async function shShowAnalysis(res, auto){
   }
   try{
     var a = await (await fetch('/api/shorts/analysis/' + res.analysis_id)).json()
-    if(!a.ok){ if(!auto) shNote(escapeHtmlLite(a.error || 'Could not load the analysis.'), true); return }
+    if(!a.ok){ shReviewForget(SH.formProject || SH.openProject); if(!auto) shNote(escapeHtmlLite(a.error || 'Could not load the analysis.'), true); return }
     shUseAnalysis(a)
     shRenderReview(auto)
   }catch(e){ if(!auto) shNote('Could not load the analysis: ' + escapeHtmlLite(String(e)), true) }
@@ -9315,9 +9315,32 @@ async function shShowAnalysis(res, auto){
 
 // The moments of an analysis as the editor left them (its saved review), or
 // as they were found, all ticked.
+// Which cut is open for review in each project, and on which screen: kept in this browser so a refresh comes
+// back to it instead of to an empty form.
+function shReviewMark(){
+  try{
+    var m = JSON.parse(localStorage.getItem('prism_sh_review') || '{}')
+    var pid = SH.formProject || SH.openProject
+    if(!pid) return
+    if(!SH.analysis) return                 // clearing the form to change project is not closing the cut
+    m[pid] = {id: SH.analysis.analysis_id, screen: WS.screen || 'moments'}
+    localStorage.setItem('prism_sh_review', JSON.stringify(m))
+  }catch(e){}
+}
+function shReviewForget(pid){
+  try{
+    var m = JSON.parse(localStorage.getItem('prism_sh_review') || '{}')
+    delete m[pid]; localStorage.setItem('prism_sh_review', JSON.stringify(m))
+  }catch(e){}
+}
+function shReviewLoad(pid){
+  try{ return (JSON.parse(localStorage.getItem('prism_sh_review') || '{}'))[pid] || null }catch(e){ return null }
+}
+
 function shUseAnalysis(a){
   SH.analysis = a
   if(SH.openProject) delete SH.stash[SH.openProject]
+  shReviewMark()
   WS.selC = null; WS.loadedC = null; WS.tab = 'trim'; WS.zwin = null
   SH.cands = a.review
     ? a.review.map(function(c){ return Object.assign({}, c) })
@@ -9615,6 +9638,7 @@ function shortsSelectAll(on){
 // editors and the queue keep working in place.
 function shScreen(name){
   WS.screen = name
+  shReviewMark()
   var ids = {setup: 'sh-screen-setup', moments: 'sh-review', export: 'sh-results'}
   Object.keys(ids).forEach(function(k){
     var el = shEl(ids[k])
@@ -11002,7 +11026,7 @@ async function shCandFraming(i){
             '<span>left/right</span><input type=range data-sp-x="' + n + '" min=' + (-Math.round(sh.split.panes[n][0])) + ' max=' + Math.round(mx - sh.split.panes[n][0]) + ' step=1 value=0 style="width:110px">' +
             '<span>up/down</span><input type=range data-sp-y="' + n + '" min=' + (-Math.round(sh.split.panes[n][1])) + ' max=' + Math.round(my - sh.split.panes[n][1]) + ' step=1 value=0 style="width:110px"></div>'
         }).join('') +
-        '<div style="opacity:.65">Slide to move each window over the picture; the stack on the right of the shot is what is kept.</div></div>' : '') + '</div>'
+        '<div style="opacity:.65">Drag each numbered square on the picture onto its face, or use the sliders; the stack on the right of the shot is what is kept.</div></div>' : '') + '</div>'
     var canvas = row.querySelector('canvas'), sel = row.querySelector('[data-shot-layout]'), slide = row.querySelector('[data-shot-x]')
     var img = new Image()
     function draw(){ if(img.complete && img.naturalWidth) shDrawShot(canvas, img, d, sh, ch) }
@@ -11062,9 +11086,54 @@ async function shCandFraming(i){
       draw()
     })
     slide.addEventListener('input', function(){ ch.x = parseFloat(slide.value); sel.value = 'crop'; draw() })
+    function effLayout(){ return ch.layout === 'auto' ? sh.auto : ch.layout }
+    // Split screen: drag each window (the square round a face) over the still; the sliders follow.
+    if(sh.split && splitCtl){
+      canvas.style.touchAction = 'none'
+      var drag = null
+      function paneAt(ev){
+        var r = canvas.getBoundingClientRect()
+        var fx = (ev.clientX - r.left) / r.width * d.disp_w, fy = (ev.clientY - r.top) / r.height * d.disp_h
+        var cur = [0, 1].map(function(n){
+          var s = (ch.shift && ch.shift[n]) || [0, 0], p0 = sh.split.panes[n]
+          return [Math.max(0, Math.min(d.disp_w - sh.split.size[0], p0[0] + s[0])), Math.max(0, Math.min(d.disp_h - sh.split.size[1], p0[1] + s[1]))]
+        })
+        for(var n = 1; n >= 0; n--){
+          if(fx >= cur[n][0] && fx <= cur[n][0] + sh.split.size[0] && fy >= cur[n][1] && fy <= cur[n][1] + sh.split.size[1])
+            return {n: n, fx: fx, fy: fy, start: cur[n]}
+        }
+        return null
+      }
+      canvas.addEventListener('pointerdown', function(ev){
+        if(effLayout() !== 'split') return
+        var hit = paneAt(ev); if(!hit) return
+        drag = hit
+        try{ canvas.setPointerCapture(ev.pointerId) }catch(e){}
+        ev.preventDefault()
+      })
+      canvas.addEventListener('pointermove', function(ev){
+        if(effLayout() !== 'split'){ canvas.style.cursor = ''; return }
+        if(!drag){ canvas.style.cursor = paneAt(ev) ? 'grab' : ''; return }
+        canvas.style.cursor = 'grabbing'
+        var r = canvas.getBoundingClientRect()
+        var fx = (ev.clientX - r.left) / r.width * d.disp_w, fy = (ev.clientY - r.top) / r.height * d.disp_h
+        var p0 = sh.split.panes[drag.n]
+        var nx = Math.max(0, Math.min(d.disp_w - sh.split.size[0], drag.start[0] + fx - drag.fx))
+        var ny = Math.max(0, Math.min(d.disp_h - sh.split.size[1], drag.start[1] + fy - drag.fy))
+        var sft = (ch.shift || [[0, 0], [0, 0]]).map(function(a){ return a.slice() })
+        sft[drag.n] = [Math.round(nx - p0[0]), Math.round(ny - p0[1])]
+        ch.shift = sft; ch.layout = 'split'; sel.value = 'split'
+        splitCtl.querySelector('[data-sp-x="' + drag.n + '"]').value = sft[drag.n][0]
+        splitCtl.querySelector('[data-sp-y="' + drag.n + '"]').value = sft[drag.n][1]
+        draw()
+      })
+      function endDrag(){ drag = null; canvas.style.cursor = '' }
+      canvas.addEventListener('pointerup', endDrag)
+      canvas.addEventListener('pointercancel', endDrag)
+    }
     // Clicking the still puts the box there.
     canvas.addEventListener('click', function(ev){
-      if(!crops) return
+      if(!crops || effLayout() === 'split') return
       var r = canvas.getBoundingClientRect(), fx = (ev.clientX - r.left) / r.width * d.disp_w
       ch.layout = 'crop'; ch.x = Math.max(0, Math.min(d.max_x, fx - d.crop_w / 2))
       sel.value = 'crop'; slide.value = ch.x; slide.style.display = ''; draw()
@@ -11712,7 +11781,7 @@ function shCreateSync(){
     }
     shCreateReset(); SH.formProject = here
     shSelRestore(here)
-    var back = SH.stash[here]
+    var back = SH.stash[here] || shReviewLoad(here)
     if(back){
       delete SH.stash[here]
       shShowAnalysis({analysis_id: back.id}, false).then(function(){ if(SH.analysis && SH.analysis.analysis_id === back.id) shScreen(back.screen === 'setup' ? 'moments' : back.screen) })
@@ -11736,7 +11805,7 @@ function shCreateSync(){
     shProjectOpen(pid, true); shInnerTab('p-shorts-create')
   })
   var drop = note.querySelector('[data-drop]')
-  if(drop) drop.addEventListener('click', function(){ SH.formProject = null; shCreateSync() })
+  if(drop) drop.addEventListener('click', function(){ shReviewForget(SH.formProject); SH.formProject = null; shCreateSync() })
 }
 
 // Empties what belongs to one project -- the picked video, the cut under
