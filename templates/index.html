@@ -10270,6 +10270,11 @@ async function shWsExact(draft, force){
   btn.disabled = true
   shWsMsg('Rendering a small 9:16 copy…')
   var o = shRenderOptions(), r
+  // The frames of the moment's shots first (shared with the Framing tab), then the render that uses them.
+  shWsMsg('Finding the frames…')
+  try{ await shShotsFor(c) }catch(e){}
+  if(tok !== WS.token){ btn.disabled = false; return }
+  shWsMsg('Rendering a small 9:16 copy…')
   try{
     r = await shWsPost('/api/shorts/vpreview', {analysis_id: a.analysis_id, start: c.start, end: c.end, reframe: o.reframe,
       speaker: o.speaker, subtitles: o.subtitles, subtitle_size: o.subtitle_size,
@@ -11000,6 +11005,28 @@ function shDrawShot(canvas, img, d, sh, choice){
   g.setLineDash([])
 }
 
+// The shots of a moment and their frames, worked out once and shared: the preview waits for them, the Framing tab
+// uses them, and the pictures are fetched into the browser's cache as soon as the shot list is known.
+var SH_SHOTS = {}
+function shShotsFor(c){
+  var a = SH.analysis, o = shRenderOptions()
+  var base = {analysis_id: a.analysis_id, start: c.start, end: c.end, reframe: o.reframe, speaker: o.speaker}
+  var key = JSON.stringify(base)
+  if(!SH_SHOTS[key]){
+    var keys = Object.keys(SH_SHOTS)
+    if(keys.length > 20) delete SH_SHOTS[keys[0]]
+    SH_SHOTS[key] = fetch('/api/shorts/framing', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(base)})
+      .then(function(r){ return r.json() })
+      .then(function(d){
+        if(!d.ok){ delete SH_SHOTS[key]; return d }
+        ;(d.shots || []).forEach(function(sh){ if(sh.thumb){ var im = new Image(); im.src = sh.thumb } })
+        return d
+      })
+      .catch(function(e){ delete SH_SHOTS[key]; return {ok: false, error: String(e)} })
+  }
+  return SH_SHOTS[key]
+}
+
 // The editor's framing for one moment: c.framing = {shots: [{at, layout, x}]},
 // one entry per corrected shot, `at` a time inside that shot (so the
 // correction stays on its shot when the in or out point moves).
@@ -11008,11 +11035,20 @@ async function shCandFraming(i){
   if(!c || !host || !SH.analysis) return
   if(host.style.display === 'block'){ host.style.display = 'none'; host.innerHTML = ''; return }
   host.style.display = 'block'
+  // The frames of every shot come first; the 9:16 preview is rendered once they are in, so the two do not
+  // compete for the source file, and the pictures are not held up by a render.
+  var stillsLeft = 0, pvStarted = false, shotsBuilt = false
+  function startPv(){
+    if(pvStarted) return
+    pvStarted = true
+    if(host.style.display === 'block') makePv(c.framing || current())
+  }
+  function stillSettled(){ if(--stillsLeft <= 0 && shotsBuilt) startPv() }
   host.innerHTML = '<div class="sh-frame sh-note">Finding the faces in this moment&hellip; (a few seconds per minute of footage the first time; it is remembered after that)</div>'
   var opts = shRenderOptions()
   var base = {analysis_id: SH.analysis.analysis_id, start: c.start, end: c.end, reframe: opts.reframe, speaker: opts.speaker}
   var d
-  try{ d = await (await fetch('/api/shorts/framing', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(base)})).json() }
+  try{ d = await shShotsFor(c) }
   catch(e){ host.innerHTML = '<div class="sh-warn">Could not work out the framing: ' + escapeHtmlLite(String(e)) + '</div>'; return }
   if(!d.ok){ host.innerHTML = '<div class="sh-warn">' + escapeHtmlLite(d.error || 'Could not work out the framing.') + '</div>'; return }
   var saved = (c.framing && c.framing.shots) || []
@@ -11061,8 +11097,11 @@ async function shCandFraming(i){
         '<div style="opacity:.65">Drag each numbered square on the picture onto its face, or use the sliders; the stack on the right of the shot is what is kept.</div></div>' : '') + '</div>'
     var canvas = row.querySelector('canvas'), sel = row.querySelector('[data-shot-layout]'), slide = row.querySelector('[data-shot-x]')
     var img = new Image()
+    var settled = false
+    stillsLeft++
+    function settleOnce(){ if(!settled){ settled = true; stillSettled() } }
     function draw(){ if(img.complete && img.naturalWidth) shDrawShot(canvas, img, d, sh, ch) }
-    img.onload = draw
+    img.onload = function(){ draw(); settleOnce() }
     // Each shot's picture is fetched on its own: it may take a moment (the first time), and is tried again before
     // giving up; when it cannot be made the reason is said.
     var tried = 0
@@ -11072,6 +11111,7 @@ async function shCandFraming(i){
       g.fillStyle = '#aaa'; g.font = '13px sans-serif'; g.fillText('No picture for this shot', 96, 100)
       g.font = '10px sans-serif'; g.fillText(String(why || sh.thumb_error || 'Click to try again').slice(0, 62), 12, 122)
       canvas.dataset.nopic = '1'
+      settleOnce()
     }
     function load(){
       if(!sh.thumb){ nopic(); return }
@@ -11198,7 +11238,9 @@ async function shCandFraming(i){
     if(WS.selC === c) shWsExact(framingNow || null, force)
   }
   host.querySelector('[data-pv-make]').addEventListener('click', function(){ makePv(current()) })
-  makePv(c.framing || current())
+  shotsBuilt = true
+  if(stillsLeft <= 0) startPv()
+  setTimeout(startPv, 10000)          // a still that never comes does not hold the preview back for good
   host.querySelector('[data-fr-save]').addEventListener('click', function(){
     var f = current()
     if(f) c.framing = f; else delete c.framing
