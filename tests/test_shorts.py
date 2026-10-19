@@ -1417,7 +1417,7 @@ def test_a_shorts_job_is_filed_as_a_shorts_job_and_kept_out_of_the_episodic_list
 # How many moments, and how long
 # --------------------------------------------------------------------------
 
-def test_lengths_default_to_60_to_120_seconds_and_a_hundred_moments_can_be_asked_for(env, monkeypatch):
+def test_lengths_default_to_120_to_180_seconds_and_a_hundred_moments_can_be_asked_for(env, monkeypatch):
     Services(monkeypatch)
     client, headers = _client()
     started = []
@@ -1434,7 +1434,7 @@ def test_lengths_default_to_60_to_120_seconds_and_a_hundred_moments_can_be_asked
         [50, 100, 100, 'auto', 'auto', 8]
 
     html = client.get('/').get_data(as_text=True)
-    assert 'id=sh-min class=sh-num value=60 ' in html and 'id=sh-max class=sh-num value=120 ' in html
+    assert 'id=sh-min class=sh-num value=120 ' in html and 'id=sh-max class=sh-num value=180 ' in html
     menu = html[html.index('<select id=sh-count'):]
     menu = menu[:menu.index('</select>')]
     assert re.findall(r'<option value=(\w+)( selected)?>', menu) == [
