@@ -1923,7 +1923,7 @@ document.addEventListener("DOMContentLoaded", function(){
           <button type=button class="player-bracket-btn" onclick="cardVoSetPoint('vo_upload','end')" title="Set OUT point">]</button>
           <input type=number name=vo_trim_end id="vo_upload_end" min=0 step=0.1 class="player-io-input" placeholder="end">
         </span>
-        <span class="player-time" id="vo_upload_time">0:00 / 0:00</span>
+        <span class="player-time" id="vo_upload_time">00;00;00;00 / 00;00;00;00</span>
         <span class="player-volume"><button type=button class="player-volume-icon" id="vo_upload_volicon" onclick="cardVoToggleMute('vo_upload')" title="Mute">&#128266;</button><input type=range class="player-volume-slider" id="vo_upload_volume" min=0 max=100 value=100 oninput="cardVoSetVolume('vo_upload', this.value)"></span>
       </div>
     </div>
@@ -2114,7 +2114,7 @@ document.addEventListener("DOMContentLoaded", function(){
         <button type=button class="player-bracket-btn" onclick="cardVoSetPoint('end_card_video','end')" title="Set OUT point">]</button>
         <input type=number name=end_card_video_trim_end id="end_card_video_end" min=0 step=0.1 class="player-io-input" placeholder="end">
       </span>
-      <span class="player-time" id="end_card_video_time">0:00 / 0:00</span>
+      <span class="player-time" id="end_card_video_time">00;00;00;00 / 00;00;00;00</span>
       <span class="player-volume"><button type=button class="player-volume-icon" id="end_card_video_volicon" onclick="cardVoToggleMute('end_card_video')" title="Mute">&#128266;</button><input type=range class="player-volume-slider" id="end_card_video_volume" min=0 max=100 value=100 oninput="cardVoSetVolume('end_card_video', this.value)"></span>
     </div>
     <span id="end_card_video_preview_note" style="font-size:11px;opacity:.7;display:block;margin-top:4px"></span>
@@ -2142,7 +2142,7 @@ document.addEventListener("DOMContentLoaded", function(){
         <button type=button class="player-bracket-btn" onclick="cardVoSetPoint('title_card_vo','end')" title="Set OUT point">]</button>
         <input type=number id="title_card_vo_end" name=title_card_vo_end min=0 step=0.1 class="player-io-input" placeholder="end">
       </span>
-      <span class="player-time" id="title_card_vo_time">0:00 / 0:00</span>
+      <span class="player-time" id="title_card_vo_time">00;00;00;00 / 00;00;00;00</span>
       <span class="player-volume"><button type=button class="player-volume-icon" id="title_card_vo_volicon" onclick="cardVoToggleMute('title_card_vo')" title="Mute">&#128266;</button><input type=range class="player-volume-slider" id="title_card_vo_volume" min=0 max=100 value=100 oninput="cardVoSetVolume('title_card_vo', this.value)"></span>
     </div>
   </div>
@@ -2156,7 +2156,7 @@ document.addEventListener("DOMContentLoaded", function(){
     </div>
   </div>
 
-  <div class="asset-section adv-only" id=asset-end-card>
+  <div class="asset-section" id=asset-end-card>
     <div class="asset-section-header" onclick="toggleAssetSection(this)">
       <span class="asset-section-title">End card (optional)</span>
       <span class="asset-section-summary" id=summary-end-card>Not set</span>
@@ -2184,7 +2184,7 @@ document.addEventListener("DOMContentLoaded", function(){
         <button type=button class="player-bracket-btn" onclick="cardVoSetPoint('schedule_video','end')" title="Set OUT point">]</button>
         <input type=number name=schedule_video_trim_end id="schedule_video_end" min=0 step=0.1 class="player-io-input" placeholder="end">
       </span>
-      <span class="player-time" id="schedule_video_time">0:00 / 0:00</span>
+      <span class="player-time" id="schedule_video_time">00;00;00;00 / 00;00;00;00</span>
       <span class="player-volume"><button type=button class="player-volume-icon" id="schedule_video_volicon" onclick="cardVoToggleMute('schedule_video')" title="Mute">&#128266;</button><input type=range class="player-volume-slider" id="schedule_video_volume" min=0 max=100 value=100 oninput="cardVoSetVolume('schedule_video', this.value)"></span>
     </div>
     <span id="schedule_video_preview_note" style="font-size:11px;opacity:.7;display:block;margin-top:4px"></span>
@@ -2211,7 +2211,7 @@ document.addEventListener("DOMContentLoaded", function(){
         <button type=button class="player-bracket-btn" onclick="cardVoSetPoint('end_card_vo','end')" title="Set OUT point">]</button>
         <input type=number id="end_card_vo_end" name=end_card_vo_end min=0 step=0.1 class="player-io-input" placeholder="end">
       </span>
-      <span class="player-time" id="end_card_vo_time">0:00 / 0:00</span>
+      <span class="player-time" id="end_card_vo_time">00;00;00;00 / 00;00;00;00</span>
       <span class="player-volume"><button type=button class="player-volume-icon" id="end_card_vo_volicon" onclick="cardVoToggleMute('end_card_vo')" title="Mute">&#128266;</button><input type=range class="player-volume-slider" id="end_card_vo_volume" min=0 max=100 value=100 oninput="cardVoSetVolume('end_card_vo', this.value)"></span>
     </div>
   </div>
@@ -2266,7 +2266,7 @@ document.addEventListener("DOMContentLoaded", function(){
           <button type=button class="player-bracket-btn" onclick="cardVoSetPoint('scoring_audio','end')" title="Set OUT point">]</button>
           <input type=number name=scoring_audio_trim_end id="scoring_audio_end" min=0 step=0.1 class="player-io-input" placeholder="end" style="display:none">
         </span>
-        <span class="player-time" id="scoring_audio_time">0:00 / 0:00</span>
+        <span class="player-time" id="scoring_audio_time">00;00;00;00 / 00;00;00;00</span>
         <span class="player-volume"><button type=button class="player-volume-icon" id="scoring_audio_volicon" onclick="cardVoToggleMute('scoring_audio')" title="Mute">&#128266;</button><input type=range class="player-volume-slider" id="scoring_audio_volume" min=0 max=100 value=100 oninput="cardVoSetVolume('scoring_audio', this.value)"></span>
       </div>
     </div>
@@ -2317,7 +2317,7 @@ document.addEventListener("DOMContentLoaded", function(){
           <button type=button class="player-bracket-btn" onclick="cardVoSetPoint('sfx_upload','end')" title="Set OUT point">]</button>
           <input type=number name=sfx_upload_trim_end id="sfx_upload_end" min=0 step=0.1 class="player-io-input" placeholder="end">
         </span>
-        <span class="player-time" id="sfx_upload_time">0:00 / 0:00</span>
+        <span class="player-time" id="sfx_upload_time">00;00;00;00 / 00;00;00;00</span>
         <span class="player-volume"><button type=button class="player-volume-icon" id="sfx_upload_volicon" onclick="cardVoToggleMute('sfx_upload')" title="Mute">&#128266;</button><input type=range class="player-volume-slider" id="sfx_upload_volume" min=0 max=100 value=100 oninput="cardVoSetVolume('sfx_upload', this.value)"></span>
       </div>
     </div>
@@ -3076,8 +3076,8 @@ document.addEventListener("DOMContentLoaded", function(){
       html += '<tr data-i="' + i + '" style="border-top:1px solid var(--line,#333)' + (r.edited ? ';background:rgba(230,184,77,.10)' : '') + '">' +
         '<td style="padding:3px 4px;opacity:.6">' + (i + 1) + '</td>' +
         '<td><select class="ce-mat" style="max-width:150px;font-size:11px;padding:2px 3px">' + opts(r.material) + '</select></td>' +
-        '<td><input class="ce-start" value="' + escapeHtmlLite(r.start) + '" style="width:62px;font-size:11px;padding:2px 4px"></td>' +
-        '<td><input class="ce-end" value="' + escapeHtmlLite(r.end) + '" style="width:62px;font-size:11px;padding:2px 4px"></td>' +
+        '<td><input class="ce-start" value="' + escapeHtmlLite(r.start) + '" style="width:100px;font-size:11px;padding:2px 4px"></td>' +
+        '<td><input class="ce-end" value="' + escapeHtmlLite(r.end) + '" style="width:100px;font-size:11px;padding:2px 4px"></td>' +
         '<td style="padding:3px 6px;font-family:var(--font-body,inherit);opacity:.85" title="' + escapeHtmlLite((r.speech ? r.speech + ' / ' : '') + r.desc) + '">' +
           escapeHtmlLite((r.desc || r.speech || '').slice(0, 46)) + (r.edited ? ' <b style="color:#e6b84d">edited</b>' : '') + '</td>' +
         '<td><span class="ce-del" style="cursor:pointer;opacity:.6;padding:2px 6px" title="Remove this cut">&#10005;</span></td></tr>'
@@ -3095,8 +3095,8 @@ document.addEventListener("DOMContentLoaded", function(){
     cuesEl.querySelectorAll('tr[data-i]').forEach(function(tr){
       var i = parseInt(tr.dataset.i, 10)
       tr.querySelector('.ce-mat').addEventListener('change', function(e){ rows[i].material = e.target.value; mark(i); paintCueEditor() })
-      tr.querySelector('.ce-start').addEventListener('change', function(e){ rows[i].start = e.target.value.trim(); mark(i); paintCueEditor() })
-      tr.querySelector('.ce-end').addEventListener('change', function(e){ rows[i].end = e.target.value.trim(); mark(i); paintCueEditor() })
+      tr.querySelector('.ce-start').addEventListener('change', function(e){ rows[i].start = _tcNorm(e.target.value); mark(i); paintCueEditor() })
+      tr.querySelector('.ce-end').addEventListener('change', function(e){ rows[i].end = _tcNorm(e.target.value); mark(i); paintCueEditor() })
       tr.querySelector('.ce-del').addEventListener('click', function(){ rows.splice(i, 1); window._cueEditsDirty = true; paintCueEditor() })
     })
     cuesEl.querySelector('#ce-add').addEventListener('click', function(){
@@ -3599,7 +3599,7 @@ document.addEventListener("DOMContentLoaded", function(){
     if(!player.src){ note.textContent = 'Choose an audio file first.'; return }
     var t = Math.round(player.currentTime * 10) / 10
     document.getElementById(prefix + (which === 'start' ? '_start' : '_end')).value = t
-    note.textContent = (which === 'start' ? 'In' : 'Out') + ' point set to ' + t + 's from the player.'
+    note.textContent = (which === 'start' ? 'In' : 'Out') + ' point set to ' + tcFmt(t) + ' from the player.'
     // Setting .value directly doesn't fire the input listener that repaints
     // on manual typing -- the waveform's selection highlight needs its own
     // explicit refresh here so it doesn't look stale relative to the field
@@ -3649,7 +3649,7 @@ document.addEventListener("DOMContentLoaded", function(){
     sc.style.background = 'linear-gradient(to right,' + lo + ' ' + pa + '%,' + hi + ' ' + pa + '%,' + hi + ' ' + pb + '%,' + lo + ' ' + pb + '%)'
     sc.style.height = '10px'
     sc.style.borderRadius = '5px'
-    sc.title = 'In ' + a.toFixed(1) + 's - Out ' + b.toFixed(1) + 's'
+    sc.title = 'In ' + tcFmt(a) + ' - Out ' + tcFmt(b)
   }
   setInterval(function(){ _paintVideoRange('end_card_video'); _paintVideoRange('schedule_video') }, 400)
   function cardVoToggleMute(prefix){
@@ -3680,8 +3680,7 @@ document.addEventListener("DOMContentLoaded", function(){
   }
   function _formatPlayerTime(secs){
     if(!isFinite(secs) || secs < 0) secs = 0
-    var m = Math.floor(secs / 60), s = Math.floor(secs % 60)
-    return m + ':' + (s < 10 ? '0' : '') + s
+    return window.tcFmt ? window.tcFmt(secs) : String(secs)
   }
   function _updatePlayerTime(prefix){
     var player = document.getElementById(prefix + '_player')
@@ -5373,7 +5372,7 @@ function buildSceneCard(s, cls, num, checked, badge, overlayPlay){
     '<div style="display:flex;align-items:center;gap:6px">' +
     '<label style="display:flex;gap:6px;align-items:center;margin:0;text-transform:none;letter-spacing:0;font-size:11px;cursor:pointer">' +
     '<input type=checkbox class="'+cls+'" data-scene="'+num+'"'+(checked?' checked':'')+'> ' +
-    '<strong>'+escapeHtmlLite(badge)+'</strong> <span style="opacity:.7">'+s.start+'s \u2192 '+usedEnd.toFixed(1)+'s</span></label>' +
+    '<strong>'+escapeHtmlLite(badge)+'</strong> <span style="opacity:.7">'+tcFmt(s.start)+' \u2192 '+tcFmt(usedEnd)+'</span></label>' +
     inlineBtn +
     '</div>' +
     '<div style="opacity:.7;margin-top:4px">uses '+s.duration+'s</div>' +
@@ -5413,13 +5412,8 @@ function trMaterialNames(){
     return (n && n.length) ? n : ['M1']
   }catch(e){ return ['M1'] }
 }
-function _tcShow(sec){
-  sec = Number(sec) || 0
-  if(Math.abs(sec - Math.round(sec)) > 0.04) return String(Math.round(sec * 10) / 10)
-  sec = Math.round(sec)
-  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = sec % 60
-  return (h ? h + ':' + (m < 10 ? '0' : '') + m : String(m)) + ':' + (x < 10 ? '0' : '') + x
-}
+function _tcShow(sec){ return tcFmt(sec) }
+function _tcNorm(txt){ var s = tcParse(txt); return (s === null || isNaN(s)) ? String(txt || '').trim() : tcFmt(s) }
 function _matSelectHtml(cls, selected, withAuto){
   var o = withAuto ? '<option value=""' + (selected ? '' : ' selected') + '>Auto (find it)</option>' : ''
   trMaterialNames().forEach(function(n, i){
@@ -5432,8 +5426,8 @@ function addSceneEditor(card, s, cb, note){
   form.style.cssText = 'display:none;padding:0 10px 8px;font-size:11px'
   form.innerHTML = '<div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">' +
     _matSelectHtml('se-mat', s.material || 1, false) +
-    '<input class="se-start" placeholder="Start 1:40" style="width:70px;font-size:11px;padding:3px 4px">' +
-    '<input class="se-end" placeholder="End 1:45" style="width:70px;font-size:11px;padding:3px 4px">' +
+    '<input class="se-start" placeholder="Start 00;01;40;00" style="width:104px;font-size:11px;padding:3px 4px">' +
+    '<input class="se-end" placeholder="End 00;01;45;00" style="width:104px;font-size:11px;padding:3px 4px">' +
     '<button type=button class="btn se-ok" style="padding:3px 8px;font-size:10px">Apply</button>' +
     '<button type=button class="btn se-undo" style="padding:3px 8px;font-size:10px">Undo</button></div>' +
     '<div style="opacity:.6;margin-top:3px">Cut exactly as typed when you lock the cut and render.</div>'
@@ -5444,8 +5438,8 @@ function addSceneEditor(card, s, cb, note){
   fill()
   form.querySelector('.se-ok').addEventListener('click', function(){
     if(!st.value.trim()){ note.textContent = 'Type a start time'; return }
-    window._sceneEdits[key()] = {material: parseInt(ms.value, 10) || 1, start: st.value.trim(), end: en.value.trim()}
-    note.textContent = 'Edited: M' + ms.value + ' ' + st.value.trim() + (en.value.trim() ? ' \u2192 ' + en.value.trim() : '') + ' (applies on render)'
+    window._sceneEdits[key()] = {material: parseInt(ms.value, 10) || 1, start: _tcNorm(st.value), end: _tcNorm(en.value)}
+    note.textContent = 'Edited: M' + ms.value + ' ' + _tcNorm(st.value) + (en.value.trim() ? ' \u2192 ' + _tcNorm(en.value) : '') + ' (applies on render)'
     card.style.outline = '1px solid var(--amber)'
     form.style.display = 'none'
   })
@@ -5470,8 +5464,8 @@ function renderNewCutBox(grid){
   box.innerHTML = '<div>' + chips + '</div>' +
     '<button type=button class="btn" id="tr-newcut-open" style="padding:4px 10px;font-size:11px">+ Add a cut</button>' +
     '<span id="tr-newcut-form" style="display:none;margin-left:8px">' + _matSelectHtml('nc-mat', 1, false) +
-    ' <input class="nc-start" placeholder="Start 1:40" style="width:76px;font-size:11px;padding:3px 4px">' +
-    ' <input class="nc-end" placeholder="End 1:45" style="width:76px;font-size:11px;padding:3px 4px">' +
+    ' <input class="nc-start" placeholder="Start 00;01;40;00" style="width:104px;font-size:11px;padding:3px 4px">' +
+    ' <input class="nc-end" placeholder="End 00;01;45;00" style="width:104px;font-size:11px;padding:3px 4px">' +
     ' <button type=button class="btn" id="tr-newcut-add" style="padding:3px 8px;font-size:11px">Add</button></span>' +
     '<span id="tr-newcut-note" style="margin-left:8px;opacity:.7"></span>'
   box.querySelector('#tr-newcut-open').addEventListener('click', function(){
@@ -5480,7 +5474,7 @@ function renderNewCutBox(grid){
   box.querySelector('#tr-newcut-add').addEventListener('click', function(){
     var st = box.querySelector('.nc-start').value.trim(), en = box.querySelector('.nc-end').value.trim()
     if(!st){ box.querySelector('#tr-newcut-note').textContent = 'Type a start time'; return }
-    window._newCuts.push({material: parseInt(box.querySelector('.nc-mat').value, 10) || 1, start: st, end: en})
+    window._newCuts.push({material: parseInt(box.querySelector('.nc-mat').value, 10) || 1, start: _tcNorm(st), end: _tcNorm(en)})
     renderNewCutBox(grid)
   })
   box.querySelectorAll('.chip-x').forEach(function(x){
@@ -5611,7 +5605,7 @@ function autoFillVoFromScript(){
   var put = function(prefix, r, what){
     if(!r){ say(prefix, 'Nothing in this recording matched the script' + (what ? ' (' + what + ')' : '') + '.', true); return }
     var i = document.getElementById(prefix + '_start'), o = document.getElementById(prefix + '_end')
-    if((i && i.dataset.touched) || (o && o.dataset.touched)){ say(prefix, 'The script reads In ' + r.in + ' s / Out ' + r.out + ' s; your own values were kept.'); return }
+    if((i && i.dataset.touched) || (o && o.dataset.touched)){ say(prefix, 'The script reads In ' + tcFmt(r.in) + ' / Out ' + tcFmt(r.out) + '; your own values were kept.'); return }
     var parts = r.parts && r.parts.length > 1 ? r.parts : null
     if(i) i.value = parts ? parts[0].in : r.in
     if(o) o.value = parts ? parts[0].out : r.out
@@ -5619,7 +5613,7 @@ function autoFillVoFromScript(){
     if(xr && xr._setExtra) xr._setExtra(parts ? parts.slice(1) : [])
     if(typeof _repaintWaveform === 'function') _repaintWaveform(prefix)
     var found = r.lines ? ' (' + r.lines.length + ' line' + (r.lines.length === 1 ? '' : 's') + ' found' + (r.missing ? ', ' + r.missing + ' not found' : '') + ')' : ''
-    say(prefix, parts ? (parts.length + ' parts, one per line, read from the script' + found + '.') : ('In ' + r.in + ' s, Out ' + r.out + ' s read from the script' + found + '.'))
+    say(prefix, parts ? (parts.length + ' parts, one per line, read from the script' + found + '.') : ('In ' + tcFmt(r.in) + ', Out ' + tcFmt(r.out) + ' read from the script' + found + '.'))
   }
   fetch('/api/trailer/script_vo_ranges', {method: 'POST', body: fd}).then(function(r){ return r.json() }).then(function(d){
     if(tok !== _voFillToken) return
@@ -5797,7 +5791,7 @@ function renderEditReport(d){
     else head = 'plays as recorded' + (vp.scripted ? '; the script matched.' : '.')
     if(!vp.fits){ kind = 'warn'; head += ' It still ends after the plug.' }
     var statusCls = {ok: 'ok', tightened: 'ok', 'sped up': 'warn', trimmed: 'warn', dropped: 'warn', missing: 'bad', 'cut off': 'bad'}
-    var fmt = function(t){ return t == null ? '&ndash;' : (Math.floor(t / 60) + ':' + ('0' + (t % 60).toFixed(1)).slice(-4)) }
+    var fmt = function(t){ return t == null ? '&ndash;' : tcFmt(t) }
     var table = (vp.edited && vp.lines && vp.lines.length) ? '<table class="vo-lines">' + vp.lines.map(function(l, i){
       return '<tr><td class="t">' + (i + 1) + '</td><td>' + esc((l.text || '').slice(0, 70)) + '</td><td class="t">' + fmt(l.at) + ' &rarr; ' + fmt(l.end) + '</td><td><span class="st ' + (statusCls[l.status] || '') + '">' + esc(l.status) + '</span>' + (l.lead ? ' <span class="st warn" title="Starts under the picture before it, because it did not fit">J-cut ' + l.lead.toFixed(1) + ' s</span>' : '') + '</td></tr>'
     }).join('') + '</table>' : ''
@@ -6523,7 +6517,7 @@ async function runTranscribe(){
     var rows = d.segments.map(function(sg){
       return '<div style="display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--line)">' +
         '<span style="min-width:110px;opacity:.6;font-family:monospace;font-size:11px">' +
-        sg.start.toFixed(1) + 's \u2192 ' + sg.end.toFixed(1) + 's</span>' +
+        tcFmt(sg.start) + ' \u2192 ' + tcFmt(sg.end) + '</span>' +
         '<span>' + escapeHtmlLite(sg.text) + '</span></div>'
     }).join('')
     out.innerHTML = '<div class=card>' +
@@ -7719,7 +7713,7 @@ function renderTrailerResult(d){
 
   var rows=''
   ;(d.scenes||[]).forEach(function(s){
-    rows+='<tr><td>'+s.scene+'</td><td>'+s.start+'s</td><td>'+s.end+'s</td><td>'+s.quality+'</td><td>'+s.duration+'</td><td>'+esc(s.description||'')+'</td></tr>'
+    rows+='<tr><td>'+s.scene+'</td><td>'+tcFmt(s.start)+'</td><td>'+tcFmt(s.end)+'</td><td>'+s.quality+'</td><td>'+s.duration+'</td><td>'+esc(s.description||'')+'</td></tr>'
   })
   document.getElementById('tr-table').innerHTML='<tr><th>#</th><th>Start</th><th>End</th><th>Score</th><th>Used</th><th>Description</th></tr>'+rows
   document.getElementById('tr-area').style.display='block'
@@ -16746,5 +16740,91 @@ function _dashLoadRecent(){
 document.addEventListener('DOMContentLoaded', loadDashboard)
 </script>
 </div><!-- /.shell -->
+
+<script>
+/* ---- Timecode: hh;mm;ss;ff (29.97 drop-frame) everywhere a time is typed or shown ---- */
+(function(){
+  var R = 30000 / 1001
+  function pad(n){ return (n < 10 ? '0' : '') + n }
+  window.tcFmt = function(sec){
+    sec = Number(sec)
+    if(!isFinite(sec) || sec < 0) sec = 0
+    var n = Math.round(sec * R)
+    var D = Math.floor(n / 17982), M = n % 17982
+    n += 18 * D + (M > 1 ? 2 * Math.floor((M - 2) / 1798) : 0)
+    var f = n % 30, s = Math.floor(n / 30) % 60, m = Math.floor(n / 1800) % 60, h = Math.floor(n / 108000)
+    return pad(h) + ';' + pad(m) + ';' + pad(s) + ';' + pad(f)
+  }
+  // Seconds from hh;mm;ss;ff (: or ; between fields), mm;ss, or plain seconds. NaN when unreadable, null when empty.
+  window.tcParse = function(txt){
+    txt = String(txt == null ? '' : txt).trim()
+    if(!txt) return null
+    if(/^\d+(\.\d+)?$/.test(txt)) return parseFloat(txt)
+    var p = txt.split(/[:;]/)
+    if(p.length < 2 || p.length > 4 || p.some(function(x){ return !/^\d{1,3}$/.test(x.trim()) })) return NaN
+    var v = p.map(function(x){ return parseInt(x, 10) })
+    var h = 0, m = 0, s = 0, f = 0
+    if(v.length === 4){ h = v[0]; m = v[1]; s = v[2]; f = v[3] }
+    else if(v.length === 3){ h = v[0]; m = v[1]; s = v[2] }
+    else { m = v[0]; s = v[1] }
+    var tm = h * 60 + m
+    var frames = (h * 3600 + m * 60 + s) * 30 + f - 2 * (tm - Math.floor(tm / 10))
+    return Math.max(0, frames) / R
+  }
+  var STYLE = document.createElement('style')
+  STYLE.textContent = '.tc-input{width:104px!important;font-family:"JetBrains Mono",monospace!important;font-size:11px!important;padding:3px 5px!important;margin:0!important;text-align:center}' +
+    '.tc-input.tc-bad{border-color:var(--tally)!important}.player-time{min-width:150px!important;font-size:10.5px!important}'
+  document.head.appendChild(STYLE)
+  var NAMES = {vo_start:1, overlay_start:1, overlay_hold:1}
+  function wants(el){
+    return el && el.tagName === 'INPUT' && el.type === 'number' && !el._tc &&
+      (el.classList.contains('player-io-input') || NAMES[el.name])
+  }
+  function enhance(orig){
+    if(!wants(orig)) return
+    var hiddenForever = orig.id && /^scoring_audio_(start|end)$/.test(orig.id)
+    var tc = document.createElement('input')
+    tc.type = 'text'; tc.className = 'tc-input'; tc.spellcheck = false
+    tc.placeholder = orig.getAttribute('placeholder') === 'end' ? 'end' : '00;00;00;00'
+    tc.title = 'hh;mm;ss;ff — hour, minute, second, frame (29.97 drop-frame)'
+    orig._tc = tc; tc._orig = orig
+    orig.style.display = 'none'
+    orig.parentNode.insertBefore(tc, orig)
+    if(hiddenForever) tc.style.display = 'none'
+    function pull(){
+      var v = orig.value
+      tc._last = v
+      tc.value = (v === '' || v == null) ? '' : tcFmt(parseFloat(v))
+    }
+    function push(){
+      var sec = tcParse(tc.value)
+      if(sec === null){ orig.value = ''; tc.classList.remove('tc-bad') }
+      else if(isNaN(sec)){ tc.classList.add('tc-bad'); return }
+      else { tc.classList.remove('tc-bad'); orig.value = String(Math.round(sec * 1000) / 1000) }
+      orig.dataset.touched = '1'
+      tc._last = orig.value
+      orig.dispatchEvent(new Event('input', {bubbles: true}))
+      orig.dispatchEvent(new Event('change', {bubbles: true}))
+      tc.value = orig.value === '' ? '' : tcFmt(parseFloat(orig.value))
+    }
+    tc.addEventListener('change', push)
+    tc.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); push() } })
+    pull()
+  }
+  function sweep(){
+    document.querySelectorAll('input[type=number]').forEach(enhance)
+    document.querySelectorAll('input.tc-input').forEach(function(tc){
+      var o = tc._orig
+      if(!o || document.activeElement === tc) return
+      if(o.value !== tc._last){
+        tc._last = o.value
+        tc.value = (o.value === '' || o.value == null) ? '' : tcFmt(parseFloat(o.value))
+      }
+    })
+  }
+  sweep()
+  setInterval(sweep, 300)
+})()
+</script>
 </body>
 </html>

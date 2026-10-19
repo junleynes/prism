@@ -4627,15 +4627,15 @@ def speech_free_slack(clip_start, clip_end, speech_spans, guard=0.18):
 # informal ones. Deliberately NOT matching a bare number of seconds -- far too
 # easy to false-positive on a scene number, page number or duration column.
 _TC_PATTERNS = [
-    re.compile(r'\b(\d{1,2}):(\d{2}):(\d{2})[:.](\d{1,3})\b'),  # HH:MM:SS:FF / HH:MM:SS.mmm
-    re.compile(r'\b(\d{1,2}):(\d{2}):(\d{2})\b'),               # HH:MM:SS
+    re.compile(r'\b(\d{1,2})[:;](\d{2})[:;](\d{2})[:;.](\d{1,3})\b'),  # HH:MM:SS:FF / HH;MM;SS;FF / HH:MM:SS.mmm
+    re.compile(r'\b(\d{1,2})[:;](\d{2})[:;](\d{2})\b'),               # HH:MM:SS
     # Some scripts write every timecode field with periods instead of colons
     # (e.g. "00.00.02.01" for HH.MM.SS.FF, or "2.11" / "0.06" for M.SS) --
     # otherwise identical to the colon formats above, just a different house
     # style some editors/writers use. Checked before the bare MM:SS/M.SS
     # patterns for the same longest-first reason those are ordered that way.
     re.compile(r'\b(\d{1,2})\.(\d{2})\.(\d{2})\.(\d{1,3})\b'),  # HH.MM.SS.FF (period-separated)
-    re.compile(r'\b(\d{1,2}):(\d{2})\b'),                       # MM:SS
+    re.compile(r'\b(\d{1,2})[:;](\d{2})\b'),                       # MM:SS
     re.compile(r'\b(\d{1,2})\.(\d{2})\b'),                      # M.SS / MM.SS (period-separated)
 ]
 
@@ -4663,17 +4663,29 @@ _SEGMENT_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-def _seconds_to_tc(secs, fps=25.0):
-    """Format seconds as HH:MM:SS:FF for display in selection transparency."""
+TC_FPS = 30000.0 / 1001.0
+
+def _seconds_to_tc(secs, fps=None):
+    """Seconds as hh;mm;ss;ff -- 29.97 drop-frame timecode, the form editors and scripts use."""
     try:
         secs = max(0.0, float(secs))
     except (TypeError, ValueError):
-        return '00:00:00:00'
-    h = int(secs // 3600)
-    m = int((secs % 3600) // 60)
-    s = int(secs % 60)
-    f = int(round((secs - int(secs)) * max(fps, 1))) % max(int(fps), 1)
-    return f'{h:02d}:{m:02d}:{s:02d}:{f:02d}'
+        return '00;00;00;00'
+    n = int(round(secs * TC_FPS))
+    d, m = divmod(n, 17982)
+    n += 18 * d + (2 * ((m - 2) // 1798) if m > 1 else 0)
+    f = n % 30
+    s = (n // 30) % 60
+    mi = (n // 1800) % 60
+    h = n // 108000
+    return f'{h:02d};{mi:02d};{s:02d};{f:02d}'
+
+def _tc_fields_to_seconds(h, m, s, f, drop=True):
+    tm = h * 60 + m
+    frames = (h * 3600 + m * 60 + s) * 30 + f
+    if drop:
+        frames -= 2 * (tm - tm // 10)
+    return max(0, frames) / TC_FPS
 
 def _match_to_seconds(m, pat_idx, fps=25.0):
     """Convert a regex match from _TC_PATTERNS[pat_idx] into seconds."""
@@ -4683,8 +4695,12 @@ def _match_to_seconds(m, pat_idx, fps=25.0):
         # HH:MM:SS.mmm → milliseconds; HH:MM:SS:FF → frames at fps
         raw = m.group(0)
         sep = raw[8] if len(raw) > 8 else ':'
-        sub = int(frac) / 1000.0 if sep == '.' else int(frac) / max(fps, 1)
-        return h * 3600 + mnt * 60 + s + sub
+        if sep == '.':
+            return h * 3600 + mnt * 60 + s + int(frac) / 1000.0
+        # ";" is the drop-frame form (29.97 fps); ":" keeps counting frames at the given fps.
+        if ';' in raw:
+            return _tc_fields_to_seconds(h, mnt, s, min(int(frac), 29), drop=True)
+        return h * 3600 + mnt * 60 + s + int(frac) / max(fps, 1)
     if pat_idx == 1:
         return int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2])
     if pat_idx == 2:
