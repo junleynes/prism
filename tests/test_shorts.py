@@ -3101,7 +3101,7 @@ def test_a_recaptioned_short_keeps_its_hold_and_sound_effect(env, monkeypatch, t
     bdir = os.path.join(shorts.SHORTS_DIR, b['batch_id'])
     m = shorts._read_manifest(bdir)
     got = shorts._kept_sfx(bdir, m['options'])
-    assert got == {'path': os.path.join(bdir, 'ending_sfx.wav'), 'gain': 0.0}
+    assert got == {'path': os.path.join(bdir, 'ending_sfx.wav'), 'gain': 0.0, 'in': None, 'out': None}
     assert shorts._kept_sfx(bdir, {'ending_sfx': None}) is None
     os.remove(os.path.join(bdir, 'ending_sfx.wav'))
     assert shorts._kept_sfx(bdir, m['options']) is None, 'gone: the short is rendered without it rather than failing'
