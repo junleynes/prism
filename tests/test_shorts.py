@@ -3070,7 +3070,7 @@ def test_a_render_takes_the_cliffhanger_hold_and_sound_effect_and_keeps_the_effe
     b = _render(client, headers, a['analysis_id'], item, reframe='fit', subtitles=False, ending='cliffhanger',
                 ending_hold=3.5, ending_sfx=staged, ending_sfx_gain=-6)['result']['batch']
     assert b['options']['ending_hold'] == 3.5
-    assert b['options']['ending_sfx'] == {'file': 'ending_sfx.wav', 'name': 'boom.wav', 'gain': -6.0}
+    assert b['options']['ending_sfx'] == {'file': 'ending_sfx.wav', 'name': 'boom.wav', 'gain': -6.0, 'in': None, 'out': None}
     s = b['shorts'][0]
     assert abs(s['duration'] - (4.0 + 3.5 + 0.4 - 0.16)) < 0.1, s['duration']      # 4.0 s moment, a 3.5 s hold, 0.4 s black
     bdir = os.path.join(shorts.SHORTS_DIR, b['batch_id'])
