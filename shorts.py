@@ -1822,7 +1822,7 @@ def _run_render(jid, params):
             contiguous = bool(nxt and chapters.get(n) == chapters[n - 1] + 1
                               and abs(float(nxt['start']) - float(it_global['end'])) < 0.5)
             badges = sc.chapter_badges(chapters[n - 1], chapters[n - 1] + 1 if contiguous else None,
-                                       n_frames / fps) or None
+                                       n_frames / fps, ep_text=params.get('episode_text'), next_text=params.get('next_text')) or None
         sopts = dict(opts, badges=badges, ending=ending_k, ending_hold=opts['ending_hold'] if ending_k else None,
                      ending_sfx=opts['ending_sfx'] if ending_k else None,
                      ending_overlay=opts['ending_overlay'] if ending_k else None,
@@ -2367,6 +2367,9 @@ def _render_options(data):
             'highlight_color': sc.highlight_hex(data.get('highlight_color')),
             # The "EP n and "NEXT: EP n+1" labels of a mini-drama's chapters, burned in like captions.
             'episode_labels': data.get('episode_labels', True) not in (False, 0, '0', 'false', 'off', None),
+            # What those labels say; {n} is the number ("Episode {n}", "Next: Episode {n}").
+            'episode_text': str(data.get('episode_text') or '')[:40].strip() or sc.EP_TEXT,
+            'next_text': str(data.get('next_text') or '')[:40].strip() or sc.NEXT_TEXT,
             # How each short finishes: on its last frame ('none'), or stopped
             # dead on its last beat, held, and cut to black ('cliffhanger').
             'ending': data.get('ending') if data.get('ending') in ('none', 'cliffhanger') else 'none',
@@ -3927,7 +3930,7 @@ def _restage(kept):
 
 
 # --- Templates: the Output settings under a name, shared by everyone with Vertical Shorts -----------------
-TEMPLATE_KEYS = ('reframe', 'speaker', 'subtitles', 'subtitle_size', 'episode_labels', 'word_highlight',
+TEMPLATE_KEYS = ('reframe', 'speaker', 'subtitles', 'subtitle_size', 'episode_labels', 'episode_text', 'next_text', 'word_highlight',
                  'highlight_color', 'cut_join', 'ending', 'ending_hold', 'ending_zoom', 'ending_look', 'ending_motion',
                  'fade_last', 'ending_fade', 'ending_sfx_gain', 'ending_sfx_in', 'ending_sfx_out', 'format', 'loudness')
 TEMPLATE_NAME_MAX, TEMPLATES_MAX = 60, 100

@@ -2078,3 +2078,8 @@ def test_preview_render_skips_loudnorm():
     quick = sc.build_render_cmd('ffmpeg', 'in.mp4', 'o.mp4', 0, 50, info, segs, loudness=None)
     assert any('loudnorm' in x for x in full)
     assert not any('loudnorm' in x for x in quick)
+
+
+def test_chapter_badges_custom_text():
+    b = sc.chapter_badges(3, 4, 90.0, ep_text='Episode {n}', next_text='Next: Episode')
+    assert [x['text'] for x in b] == ['Episode 3', 'Next: Episode 4']

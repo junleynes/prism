@@ -8442,6 +8442,10 @@ document.getElementById('vf').addEventListener('submit', async function(e){
     <div class="sh-chk"><label title="Mini-drama only: burn EP 1, EP 2&hellip; into each chapter, and NEXT: EP n+1 at its end" style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
       <input type=checkbox id=sh-ep-labels checked> Burn in EP labels
     </label></div>
+    <div class="sh-chk" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+      <label style="font-size:12px;text-transform:none;letter-spacing:0">Opening label <input type=text id=sh-ep-text class=input-box maxlength=40 placeholder="EP {n}" value="EP {n}" style="width:130px" title="{n} is the chapter number, e.g. Episode {n}"></label>
+      <label style="font-size:12px;text-transform:none;letter-spacing:0">Closing label <input type=text id=sh-next-text class=input-box maxlength=40 placeholder="NEXT: EP {n} >>" value="NEXT: EP {n} >>" style="width:160px" title="{n} is the next chapter number, e.g. Next: Episode {n}"></label>
+    </div>
   </section>
   <section class="sh-out-card" aria-label="Delivery">
     <h4>Delivery</h4>
@@ -9187,6 +9191,7 @@ function shRenderOptions(){
           subtitles: shEl('sh-captions').checked,
           subtitle_size: shEl('sh-caption-size').value,
           episode_labels: shEl('sh-ep-labels').checked,
+          episode_text: shEl('sh-ep-text').value, next_text: shEl('sh-next-text').value,
           word_highlight: shEl('sh-word-hl').checked && shEl('sh-captions').checked,
           highlight_color: shEl('sh-hl-color').value,
           ending: shEl('sh-ending').value,
@@ -9714,7 +9719,7 @@ async function shTplSave(){
   name = name.trim()
   if(!name) return
   var cap = shSelCapture(), vals = {}
-  var keys = ['reframe','speaker','subtitles','subtitle_size','episode_labels','word_highlight','highlight_color','cut_join','ending','ending_hold','ending_zoom','ending_look','ending_motion','fade_last','ending_fade','ending_sfx_gain','format','loudness']
+  var keys = ['reframe','speaker','subtitles','subtitle_size','episode_labels','episode_text','next_text','word_highlight','highlight_color','cut_join','ending','ending_hold','ending_zoom','ending_look','ending_motion','fade_last','ending_fade','ending_sfx_gain','format','loudness']
   keys.forEach(function(k){ if(cap.values[k] !== undefined) vals[k] = cap.values[k] })
   var files = {}
   ;['shorts_sfx', 'shorts_overlay'].forEach(function(k){ if(cap.files[k]) files[k] = cap.files[k] })
@@ -11379,7 +11384,7 @@ function shBatchDetails(b){
     row('Burned in', o.subtitles ? 'yes' : 'no'),
     o.subtitles ? row('Size', {s: 'Small', m: 'Medium', l: 'Large'}[o.subtitle_size] || E(o.subtitle_size || '')) : '',
     o.subtitles ? row('Light the word being said', o.word_highlight ? 'on <span style="display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px;background:#' + E(/^[0-9a-fA-F]{6}$/.test(o.highlight_color || '') ? o.highlight_color : 'FFD400') + '"></span>' : 'off') : '',
-    row('EP labels', o.episode_labels === false ? 'off' : 'on')]))
+    row('EP labels', o.episode_labels === false ? 'off' : E((o.episode_text || 'EP {n}') + ' / ' + (o.next_text || 'NEXT: EP {n} >>')))]))
   var end = o.ending === 'cliffhanger'
   cards.push(card('Ending', [
     row('Ending', end ? 'Cliffhanger' : 'Cut on the last frame'),
@@ -11860,7 +11865,7 @@ function shCreateSync(){
 var SH_SEL = {
   text: {mode: 'sh-mode', count: 'sh-count', language: 'sh-language', focus: 'sh-focus', avoid: 'sh-avoid', leave_out: 'sh-leave-out',
          stt_prompt: 'sh-stt-prompt', vision_model: 'sh-vision-model', story_model: 'sh-story-model', reframe: 'sh-reframe',
-         subtitle_size: 'sh-caption-size', highlight_color: 'sh-hl-color', cut_join: 'sh-cut-join', ending_look: 'sh-ending-look', ending_motion: 'sh-ending-motion', ending: 'sh-ending', format: 'sh-format', loudness: 'sh-level'},
+         episode_text: 'sh-ep-text', next_text: 'sh-next-text', subtitle_size: 'sh-caption-size', highlight_color: 'sh-hl-color', cut_join: 'sh-cut-join', ending_look: 'sh-ending-look', ending_motion: 'sh-ending-motion', ending: 'sh-ending', format: 'sh-format', loudness: 'sh-level'},
   num: {min_dur: 'sh-min', max_dur: 'sh-max', vision_frames: 'sh-frames', ending_hold: 'sh-ending-hold', ending_zoom: 'sh-ending-zoom',
         ending_fade: 'sh-ending-fade', ending_sfx_gain: 'sh-ending-sfx-gain', ending_sfx_in: 'sh-sfx-in', ending_sfx_out: 'sh-sfx-out'},
   bool: {word_highlight: 'sh-word-hl', speaker: 'sh-speaker', subtitles: 'sh-captions', episode_labels: 'sh-ep-labels', fade_last: 'sh-fade-last',

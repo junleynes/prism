@@ -1548,14 +1548,23 @@ def _hook_strength(t, visual, window=6.0):
     return min(1.0, best)
 
 
-def chapter_badges(chapter, next_chapter, seconds, intro=3.0, outro=3.0):
+EP_TEXT, NEXT_TEXT = 'EP {n}', 'NEXT: EP {n} >>'
+
+
+def badge_text(template, default, n):
+    """A label template with {n} for the number ("Episode {n}"); without {n} the number is added at the end."""
+    t = str(template or '').replace('\r', ' ').replace('\n', ' ').replace('\\', ' ').strip()[:40] or default
+    return t.replace('{n}', str(int(n))) if '{n}' in t else f'{t} {int(n)}'
+
+
+def chapter_badges(chapter, next_chapter, seconds, intro=3.0, outro=3.0, ep_text=None, next_text=None):
     """The on-screen series marks of one mini-drama chapter: "EP n" as it
     opens and "NEXT: EP n+1 >>" as it closes (not on the last one)."""
     out = []
     if chapter:
-        out.append({'start': 0.0, 'end': min(intro, seconds), 'text': f'EP {int(chapter)}'})
+        out.append({'start': 0.0, 'end': min(intro, seconds), 'text': badge_text(ep_text, EP_TEXT, chapter)})
     if next_chapter:
-        out.append({'start': max(0.0, seconds - outro), 'end': seconds, 'text': f'NEXT: EP {int(next_chapter)} >>'})
+        out.append({'start': max(0.0, seconds - outro), 'end': seconds, 'text': badge_text(next_text, NEXT_TEXT, next_chapter)})
     return out
 
 
