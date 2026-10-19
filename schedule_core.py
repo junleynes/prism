@@ -347,7 +347,9 @@ OVERRIDE_ROLES = ('content', 'decor', 'off', 'page')
 MOTIONS = tuple(a for a in AMBIENTS if a != 'mix')      # what a layer can be told to do once it is in
 EASES = ('out', 'in_out', 'back', 'linear')
 # What a person can tune on one layer, with the range each is held to.
-TUNING = {'delay': (0.0, 15.0), 'dur': (0.15, 4.0), 'intensity': (0.2, 2.5), 'stagger': (0.0, 2.0), 'at': (0.0, 60.0)}
+TUNING = {'delay': (0.0, 15.0), 'dur': (0.15, 4.0), 'intensity': (0.2, 2.5), 'stagger': (0.0, 2.0), 'at': (0.0, 60.0),
+          'leave_at': (0.0, 60.0), 'leave_dur': (0.1, 3.0), 'leave_delay': (0.0, 15.0)}
+LEAVE_MODES = ('start', 'end', 'out')   # a layer that goes when another starts arriving, has arrived, or has gone
 AFTER_MODES = ('end', 'start')      # a layer that waits for another: until it has arrived, or until it has started
 _PATH = re.compile(r'^\d{1,3}(\.\d{1,3}){0,4}$')
 
@@ -391,6 +393,10 @@ def _clean_item(val):
     if after:
         item['after'] = after
         item['after_mode'] = val.get('after_mode') if val.get('after_mode') in AFTER_MODES else 'end'
+    leave = _path_key(val['leave_after']) if val.get('leave_after') not in (None, '') else None
+    if leave:
+        item['leave_after'] = leave
+        item['leave_mode'] = val.get('leave_mode') if val.get('leave_mode') in LEAVE_MODES else 'end'
     return item
 
 
@@ -420,7 +426,7 @@ def clean_overrides(raw):
 
 
 def _tuning(item):
-    return {k: item[k] for k in (*TUNING, 'ease', 'after', 'after_mode') if k in item}
+    return {k: item[k] for k in (*TUNING, 'ease', 'after', 'after_mode', 'leave_after', 'leave_mode') if k in item}
 
 
 def apply_layer_animation(recipe, layers):
@@ -861,12 +867,13 @@ def load_artwork(path, canvas=CANVAS, overrides=None, with_report=False):
             names_at.setdefault(ly['_path'], []).append(str(ly.get('name', '')).lower())
     for ly in layers:
         tune = ly.get('tune')
-        if tune and tune.get('after'):
-            refs = [n for n in names_at.get(tune['after'], []) if n != str(ly.get('name', '')).lower()]
-            if refs:
-                tune['after'] = refs
-            else:
-                tune.pop('after', None); tune.pop('after_mode', None)
+        for key, mode in (('after', 'after_mode'), ('leave_after', 'leave_mode')):
+            if tune and tune.get(key):
+                refs = [n for n in names_at.get(tune[key], []) if n != str(ly.get('name', '')).lower()]
+                if refs:
+                    tune[key] = refs
+                else:
+                    tune.pop(key, None); tune.pop(mode, None)
     for i, ly in enumerate(layers):
         ly['role'] = 'picture' if len(layers) == 1 else ('background' if i == 0 else ly.get('role') or 'decor')
         ly.setdefault('page', None)
@@ -1446,8 +1453,59 @@ def _place_by_hand(out, recipe, layer_names, duration):
         t = tune.get(nm) or {}
         if i and (t.get('at') is not None or t.get('after')):
             want[i] = t
-    if not want:
+    if want:
+        out = _arrivals_by_hand(out, want, names, duration)
+    return _departures_by_hand(out, tune, names, duration)
+
+
+def _departures_by_hand(out, tune, names, duration):
+    """'leave_at': the layer fades away at that time. 'leave_after' (names of the layers it goes after) with
+    'leave_mode' 'start' / 'end' (they have started / finished arriving) or 'out' (they have gone): it goes then.
+    'leave_delay' is added; 'leave_dur' is how long the fade takes. It never goes before it has arrived, and one
+    that would go after the end simply stays."""
+    gone = {}
+    for i, nm in enumerate(names):
+        t = tune.get(nm) or {}
+        if i and (t.get('leave_at') is not None or t.get('leave_after')):
+            gone[i] = t
+    if not gone:
         return out
+    placed = {i: False for i in gone}
+    for _ in range(len(gone) + 1):
+        moved = False
+        for i, t in gone.items():
+            if placed[i]:
+                continue
+            if t.get('leave_after'):
+                refs = [names.index(r) for r in t['leave_after'] if r in names and names.index(r) != i]
+                if any(r in gone and not placed[r] for r in refs):
+                    continue
+                if not refs:
+                    placed[i] = True
+                    continue
+                mode = t.get('leave_mode') or 'end'
+                def when(e):
+                    if mode == 'start':
+                        return e['start']
+                    if mode == 'out':
+                        return (e['out'][0] + e['out'][1]) if 'out' in e else float(duration)
+                    return e['start'] + e['dur']
+                base = max(when(out[r]) for r in refs)
+            else:
+                base = float(t.get('leave_at') or 0.0)
+            e = dict(out[i])
+            begin = max(base + float(t.get('leave_delay') or 0.0), e['start'] + e['dur'])
+            if begin < float(duration) - 0.05:
+                e['out'] = (round(begin, 3), float(t.get('leave_dur') or PAGE_OUT))
+                out[i] = e
+            placed[i] = True
+            moved = True
+        if not moved:
+            break
+    return out
+
+
+def _arrivals_by_hand(out, want, names, duration):
     done = {i: False for i in want}
     latest = max(0.0, float(duration) - 0.3)
     for _ in range(len(want) + 1):

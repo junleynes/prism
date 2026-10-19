@@ -1279,3 +1279,23 @@ def test_rise_and_fall_cross_the_frame_once_edge_to_edge_and_do_not_loop(dressed
     r['layer_tune'] = {'ribbon': {'delay': 2.0, 'dur': 3.0}}
     an = sk.Animator(art, sk.build_timeline(r, DRESSED_NAMES, 10, DRESSED_ROLES), r, 10)
     assert an._travel[DRESSED_NAMES.index('Ribbon')] == (2.0, 3.0)
+
+
+def test_a_layer_told_to_go_away_is_drawn_until_then_and_not_after(tmp_path):
+    art = sk.load_artwork(_inspect_psd(tmp_path / 'p.psd'))
+    names = [ly['name'] for ly in art['layers']]
+    roles = [ly['role'] for ly in art['layers']]
+    pages = [ly['page'] for ly in art['layers']]
+    base = sk.style_recipe('fade_still')
+    shared = lambda r: sk.Animator(art, sk.build_timeline(r, names, 10, roles, pages), r, 10)       # noqa: E731
+    gone = sk.apply_layer_animation(base, [dict(ly, tune={'leave_at': 6.0, 'leave_dur': 0.5}) if ly['name'] == 'GMA Logo' else dict(ly)
+                                           for ly in art['layers']])
+    a, b = shared(base), shared(gone)
+    logo = np.s_[40:160, 60:360]          # where the logo block is, in the 1080p frame
+    scale = a.frame(5.0).shape[1] / float(W)
+    sl = np.s_[int(40 * scale):int(160 * scale), int(60 * scale):int(360 * scale)]
+    before_a, before_b = a.frame(5.0), b.frame(5.0)
+    assert np.array_equal(before_a[sl], before_b[sl])          # still there
+    after_a, after_b = a.frame(8.0), b.frame(8.0)
+    assert not np.array_equal(after_a[sl], after_b[sl])        # gone
+    assert float(np.abs(after_b[sl].astype(int) - 0).mean()) < float(np.abs(after_a[sl].astype(int) - 0).mean())

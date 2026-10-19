@@ -12769,9 +12769,18 @@ function spToggleSplit(path){
           if(first){ itw.after = first.path; itw.after_mode = 'end' }
         }
         spTidy(SP.sel); spStale(); spRenderWork()
+      }else if(id === 'sp-t-goes' && SP.sel != null){
+        var g = e.target.value, itg = SP.ov.layers[SP.sel] || (SP.ov.layers[SP.sel] = {})
+        ;['leave_at', 'leave_after', 'leave_mode', 'leave_delay', 'leave_dur'].forEach(function(k){ delete itg[k] })
+        if(g === 'at') itg.leave_at = 0
+        if(g === 'after'){
+          var other = ((SP.info && SP.info.layers) || []).filter(function(x){ return x.path !== SP.sel && ['content', 'decor', 'page'].indexOf(x.role) >= 0 })[0]
+          if(other){ itg.leave_after = other.path; itg.leave_mode = 'end' }
+        }
+        spTidy(SP.sel); spStale(); spRenderWork()
       }else if(id.indexOf('sp-t-') === 0 && SP.sel != null){
         var k = id.slice(5), v = e.target.value
-        spSetTune(SP.sel, k, (k === 'ease' || k === 'after' || k === 'after_mode') ? v : (v === '' ? null : parseFloat(v)))
+        spSetTune(SP.sel, k, (k === 'ease' || k === 'after' || k === 'after_mode' || k === 'leave_after' || k === 'leave_mode') ? v : (v === '' ? null : parseFloat(v)))
       }
     })
   }
@@ -13091,7 +13100,7 @@ function spTuneHtml(l, it){
     return '<div><label>' + label + '</label><input type=number id=sp-t-' + id + ' min=' + min + ' max=' + max + ' step=' + step +
       ' placeholder="' + ph + '" style="width:100%" value="' + (val == null ? '' : val) + '"></div>'
   }
-  var open = (it.delay || it.dur || it.ease || it.intensity != null || it.stagger != null || it.at != null || it.after) ? ' open' : ''
+  var open = (it.delay || it.dur || it.ease || it.intensity != null || it.stagger != null || it.at != null || it.after || it.leave_at != null || it.leave_after) ? ' open' : ''
   // When it comes in: in its turn, at a time of its own, or once another layer has arrived (or started).
   var when = it.at != null ? 'at' : (it.after ? 'after' : 'turn')
   var others = ((SP.info && SP.info.layers) || []).filter(function(x){
@@ -13107,14 +13116,30 @@ function spTuneHtml(l, it){
       '<div><label>Until it</label><select id=sp-t-after_mode style="width:100%">' +
         '<option value=end' + (it.after_mode !== 'start' ? ' selected' : '') + '>has arrived</option>' +
         '<option value=start' + (it.after_mode === 'start' ? ' selected' : '') + '>starts to arrive</option></select></div>' : '')
+  // When it goes away again: it stays, or fades at a time of its own, or once another layer has started, arrived or gone.
+  var goes = it.leave_at != null ? 'at' : (it.leave_after ? 'after' : 'stays')
+  var leaveSel = '<select id=sp-t-leave_after style="width:100%">' + others.map(function(x){
+    return '<option value="' + escapeHtmlLite(x.path) + '"' + (x.path === it.leave_after ? ' selected' : '') + '>' + escapeHtmlLite(x.name) + '</option>' }).join('') + '</select>'
+  var goesHtml = '<div style="grid-column:1/-1"><label>Goes away</label><select id=sp-t-goes style="width:100%">' +
+    '<option value=stays' + (goes === 'stays' ? ' selected' : '') + '>Stays on screen</option>' +
+    '<option value=at' + (goes === 'at' ? ' selected' : '') + '>At a time I choose</option>' +
+    '<option value=after' + (goes === 'after' ? ' selected' : '') + (others.length ? '' : ' disabled') + '>After another layer</option></select></div>' +
+    (goes === 'at' ? num('leave_at', 'Goes at (s)', it.leave_at, 0, 60, 0.1, '0') : '') +
+    (goes === 'after' ? '<div><label>Goes after</label>' + leaveSel + '</div>' +
+      '<div><label>Once it</label><select id=sp-t-leave_mode style="width:100%">' +
+        '<option value=start' + (it.leave_mode === 'start' ? ' selected' : '') + '>starts to arrive</option>' +
+        '<option value=end' + (it.leave_mode !== 'start' && it.leave_mode !== 'out' ? ' selected' : '') + '>has arrived</option>' +
+        '<option value=out' + (it.leave_mode === 'out' ? ' selected' : '') + '>has gone</option></select></div>' : '') +
+    (goes !== 'stays' ? num('leave_delay', 'Then waits a further (s)', it.leave_delay, 0, 15, 0.1, '0') +
+                        num('leave_dur', 'Fades over (s)', it.leave_dur, 0.1, 3, 0.05, '0.35') : '')
   return '<details class="sp-help sp-adv-only"' + open + ' style="margin-top:10px"><summary>Timing &amp; feel</summary><div class="sp-tune" style="margin-top:8px">' +
-    whenHtml +
+    whenHtml + goesHtml +
     num('delay', when === 'turn' ? 'Starts later by (s)' : 'Then waits a further (s)', it.delay, 0, 15, 0.1, '0') +
     num('dur', 'Takes (s)', it.dur, 0.15, 4, 0.05, 'automatic') +
     '<div><label>Eases</label><select id=sp-t-ease style="width:100%">' + spOpt(SP_EASES, it.ease || '') + '</select></div>' +
     num('intensity', 'Strength of the motion (1 = style)', it.intensity, 0.2, 2.5, 0.1, '1') +
     (l.role === 'page' ? num('stagger', 'Gap between its rows (s)', it.stagger, 0, 2, 0.05, 'automatic') : '') +
-    '</div><div class="sh-note"><b>Comes in</b> chooses when the layer appears: in its turn, at a time you set, or once another layer has arrived or started (a wait that goes round in a circle is ignored). Starts later holds the layer back after that; a moving layer with a delay then arrives instead of being there from the start. Strength makes shake, rotate, float and the rest gentler (below 1) or bigger (above 1).</div></details>'
+    '</div><div class="sh-note"><b>Goes away</b> fades the layer out at a time you set, or once another layer has started, arrived or gone. <b>Comes in</b> chooses when the layer appears: in its turn, at a time you set, or once another layer has arrived or started (a wait that goes round in a circle is ignored). Starts later holds the layer back after that; a moving layer with a delay then arrives instead of being there from the start. Strength makes shake, rotate, float and the rest gentler (below 1) or bigger (above 1).</div></details>'
 }
 function spSetTune(path, key, value){
   var it = SP.ov.layers[path] || (SP.ov.layers[path] = {})
