@@ -347,7 +347,8 @@ OVERRIDE_ROLES = ('content', 'decor', 'off', 'page')
 MOTIONS = tuple(a for a in AMBIENTS if a != 'mix')      # what a layer can be told to do once it is in
 EASES = ('out', 'in_out', 'back', 'linear')
 # What a person can tune on one layer, with the range each is held to.
-TUNING = {'delay': (0.0, 15.0), 'dur': (0.15, 4.0), 'intensity': (0.2, 2.5), 'stagger': (0.0, 2.0)}
+TUNING = {'delay': (0.0, 15.0), 'dur': (0.15, 4.0), 'intensity': (0.2, 2.5), 'stagger': (0.0, 2.0), 'at': (0.0, 60.0)}
+AFTER_MODES = ('end', 'start')      # a layer that waits for another: until it has arrived, or until it has started
 _PATH = re.compile(r'^\d{1,3}(\.\d{1,3}){0,4}$')
 
 
@@ -386,6 +387,10 @@ def _clean_item(val):
             item[k] = round(min(max(v, lo), hi), 2)
     if val.get('ease') in EASES:
         item['ease'] = val['ease']
+    after = _path_key(val['after']) if val.get('after') not in (None, '') else None
+    if after:
+        item['after'] = after
+        item['after_mode'] = val.get('after_mode') if val.get('after_mode') in AFTER_MODES else 'end'
     return item
 
 
@@ -415,7 +420,7 @@ def clean_overrides(raw):
 
 
 def _tuning(item):
-    return {k: item[k] for k in (*TUNING, 'ease') if k in item}
+    return {k: item[k] for k in (*TUNING, 'ease', 'after', 'after_mode') if k in item}
 
 
 def apply_layer_animation(recipe, layers):
@@ -635,6 +640,7 @@ def _load_psd(path, canvas, overrides=None, report=None):
             name = str(layer.name or f'Page {number}').strip()
             rows = _page_rows(parts, name, canvas)
             for r in rows:
+                r['_path'] = idx
                 if ov.get('arrive'):
                     r['arrive'] = dict(ov['arrive'])
                 if ov.get('motion'):
@@ -664,6 +670,7 @@ def _load_psd(path, canvas, overrides=None, report=None):
             got['px'] = (got['px'].astype(np.float32) * it['opacity'] + 0.5).astype(np.uint8)
         if got:
             got['_seq'] = seq
+            got['_path'] = idx
             seq += 1
             if orole in ('content', 'decor'):
                 got['role'] = orole
@@ -847,6 +854,19 @@ def load_artwork(path, canvas=CANVAS, overrides=None, with_report=False):
         seen[base.lower()] = n
         if n > 1:
             ly['name'] = f'{base} ({n})'
+    # A layer that waits for another says which by its place in the file; from here on it is by name.
+    names_at = {}
+    for ly in layers:
+        if ly.get('_path') is not None:
+            names_at.setdefault(ly['_path'], []).append(str(ly.get('name', '')).lower())
+    for ly in layers:
+        tune = ly.get('tune')
+        if tune and tune.get('after'):
+            refs = [n for n in names_at.get(tune['after'], []) if n != str(ly.get('name', '')).lower()]
+            if refs:
+                tune['after'] = refs
+            else:
+                tune.pop('after', None); tune.pop('after_mode', None)
     for i, ly in enumerate(layers):
         ly['role'] = 'picture' if len(layers) == 1 else ('background' if i == 0 else ly.get('role') or 'decor')
         ly.setdefault('page', None)
@@ -1409,6 +1429,56 @@ PAGE_OUT, PAGE_GAP = 0.35, 0.1     # a page fades away over this long; the next 
 
 
 def build_timeline(recipe, layer_names, duration, roles=None, pages=None):
+    """The timeline (see _build_timeline), then each layer that was told to come in at a time of its own, or after
+    another layer, put there."""
+    out = _build_timeline(recipe, layer_names, duration, roles=roles, pages=pages)
+    return _place_by_hand(out, recipe, layer_names, duration)
+
+
+def _place_by_hand(out, recipe, layer_names, duration):
+    """'at': the layer starts at that time. 'after' (names of the layers it waits for) with 'after_mode' 'end' (until
+    they have arrived) or 'start' (until they have started): it starts then. Either way 'delay' is added on top.
+    A wait that goes round in a circle is left as it was."""
+    tune = recipe.get('layer_tune') or {}
+    names = [str(n).lower() for n in layer_names]
+    want = {}
+    for i, nm in enumerate(names):
+        t = tune.get(nm) or {}
+        if i and (t.get('at') is not None or t.get('after')):
+            want[i] = t
+    if not want:
+        return out
+    done = {i: False for i in want}
+    latest = max(0.0, float(duration) - 0.3)
+    for _ in range(len(want) + 1):
+        moved = False
+        for i, t in want.items():
+            if done[i]:
+                continue
+            if t.get('after'):
+                refs = [names.index(r) for r in t['after'] if r in names]
+                if any(r in want and not done[r] for r in refs):
+                    continue                     # what it waits for is not placed yet
+                if not refs:
+                    done[i] = True
+                    continue
+                key = (lambda e: e['start']) if t.get('after_mode') == 'start' else (lambda e: e['start'] + e['dur'])
+                base = max(key(out[r]) for r in refs)
+            else:
+                base = float(t.get('at') or 0.0)
+            e = dict(out[i])
+            e['start'] = round(min(base + float(t.get('delay') or 0.0), latest), 3)
+            if 'out' in e and e['out'][0] < e['start'] + e['dur']:
+                e['out'] = (e['start'] + e['dur'], e['out'][1])
+            out[i] = e
+            done[i] = True
+            moved = True
+        if not moved:
+            break
+    return out
+
+
+def _build_timeline(recipe, layer_names, duration, roles=None, pages=None):
     """[{'effect', 'direction', 'start', 'dur'}] per layer, bottom first.
 
     With `pages` (per layer: None, or which page it is a row of), the rows
@@ -1457,7 +1527,7 @@ def build_timeline(recipe, layer_names, duration, roles=None, pages=None):
         return entry
 
     arrives = [page_of[i] is None and (roles is None or roles[i] != 'decor' or layer_names[i].lower() in recipe['layers']
-                                       or bool((tune.get(layer_names[i].lower()) or {}).get('delay')))
+                                       or any((tune.get(layer_names[i].lower()) or {}).get(k) for k in ('delay', 'at', 'after')))
                for i in range(1, n)]
     rest = sum(arrives)
     # A beat on the bare background before anything lands on it.

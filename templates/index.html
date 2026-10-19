@@ -12760,9 +12760,18 @@ function spToggleSplit(path){
         spSetAnim(SP.sel, 'arrive', eff ? {effect: eff, direction: spEl('sp-arrive-dir').value || 'right'} : null)
       }else if(id === 'sp-motion' && SP.sel != null){
         spSetAnim(SP.sel, 'motion', e.target.value)
+      }else if(id === 'sp-t-when' && SP.sel != null){
+        var w = e.target.value, itw = SP.ov.layers[SP.sel] || (SP.ov.layers[SP.sel] = {})
+        delete itw.at; delete itw.after; delete itw.after_mode
+        if(w === 'at') itw.at = 0
+        if(w === 'after'){
+          var first = ((SP.info && SP.info.layers) || []).filter(function(x){ return x.path !== SP.sel && ['content', 'decor', 'page'].indexOf(x.role) >= 0 })[0]
+          if(first){ itw.after = first.path; itw.after_mode = 'end' }
+        }
+        spTidy(SP.sel); spStale(); spRenderWork()
       }else if(id.indexOf('sp-t-') === 0 && SP.sel != null){
         var k = id.slice(5), v = e.target.value
-        spSetTune(SP.sel, k, k === 'ease' ? v : (v === '' ? null : parseFloat(v)))
+        spSetTune(SP.sel, k, (k === 'ease' || k === 'after' || k === 'after_mode') ? v : (v === '' ? null : parseFloat(v)))
       }
     })
   }
@@ -13082,14 +13091,30 @@ function spTuneHtml(l, it){
     return '<div><label>' + label + '</label><input type=number id=sp-t-' + id + ' min=' + min + ' max=' + max + ' step=' + step +
       ' placeholder="' + ph + '" style="width:100%" value="' + (val == null ? '' : val) + '"></div>'
   }
-  var open = (it.delay || it.dur || it.ease || it.intensity != null || it.stagger != null) ? ' open' : ''
+  var open = (it.delay || it.dur || it.ease || it.intensity != null || it.stagger != null || it.at != null || it.after) ? ' open' : ''
+  // When it comes in: in its turn, at a time of its own, or once another layer has arrived (or started).
+  var when = it.at != null ? 'at' : (it.after ? 'after' : 'turn')
+  var others = ((SP.info && SP.info.layers) || []).filter(function(x){
+    return x.path !== l.path && ['content', 'decor', 'page'].indexOf(x.role) >= 0 })
+  var afterSel = '<select id=sp-t-after style="width:100%">' + others.map(function(x){
+    return '<option value="' + escapeHtmlLite(x.path) + '"' + (x.path === it.after ? ' selected' : '') + '>' + escapeHtmlLite(x.name) + '</option>' }).join('') + '</select>'
+  var whenHtml = '<div style="grid-column:1/-1"><label>Comes in</label><select id=sp-t-when style="width:100%">' +
+    '<option value=turn' + (when === 'turn' ? ' selected' : '') + '>In its turn (automatic)</option>' +
+    '<option value=at' + (when === 'at' ? ' selected' : '') + '>At a time I choose</option>' +
+    '<option value=after' + (when === 'after' ? ' selected' : '') + (others.length ? '' : ' disabled') + '>After another layer</option></select></div>' +
+    (when === 'at' ? num('at', 'Appears at (s)', it.at, 0, 60, 0.1, '0') : '') +
+    (when === 'after' ? '<div><label>Waits for</label>' + afterSel + '</div>' +
+      '<div><label>Until it</label><select id=sp-t-after_mode style="width:100%">' +
+        '<option value=end' + (it.after_mode !== 'start' ? ' selected' : '') + '>has arrived</option>' +
+        '<option value=start' + (it.after_mode === 'start' ? ' selected' : '') + '>starts to arrive</option></select></div>' : '')
   return '<details class="sp-help sp-adv-only"' + open + ' style="margin-top:10px"><summary>Timing &amp; feel</summary><div class="sp-tune" style="margin-top:8px">' +
-    num('delay', 'Starts later by (s)', it.delay, 0, 15, 0.1, '0') +
+    whenHtml +
+    num('delay', when === 'turn' ? 'Starts later by (s)' : 'Then waits a further (s)', it.delay, 0, 15, 0.1, '0') +
     num('dur', 'Takes (s)', it.dur, 0.15, 4, 0.05, 'automatic') +
     '<div><label>Eases</label><select id=sp-t-ease style="width:100%">' + spOpt(SP_EASES, it.ease || '') + '</select></div>' +
     num('intensity', 'Strength of the motion (1 = style)', it.intensity, 0.2, 2.5, 0.1, '1') +
     (l.role === 'page' ? num('stagger', 'Gap between its rows (s)', it.stagger, 0, 2, 0.05, 'automatic') : '') +
-    '</div><div class="sh-note">Starts later holds the layer back after its turn; a moving layer with a delay then arrives instead of being there from the start. Strength makes shake, rotate, float and the rest gentler (below 1) or bigger (above 1).</div></details>'
+    '</div><div class="sh-note"><b>Comes in</b> chooses when the layer appears: in its turn, at a time you set, or once another layer has arrived or started (a wait that goes round in a circle is ignored). Starts later holds the layer back after that; a moving layer with a delay then arrives instead of being there from the start. Strength makes shake, rotate, float and the rest gentler (below 1) or bigger (above 1).</div></details>'
 }
 function spSetTune(path, key, value){
   var it = SP.ov.layers[path] || (SP.ov.layers[path] = {})
