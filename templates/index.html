@@ -13549,13 +13549,16 @@ function spBusyView(pid){
 }
 function spSwitchProject(from, to){
   if(from) SP_STASH[from] = {info: SP.info, token: SP.token, name: SP.name, ov: SP.ov, sel: SP.sel, page: SP.page, screen: SP.screen,
-    settings: spSettings(), look: SP.look, durTouched: SP.durTouched, board: SP.board, boardUndo: SP.boardUndo, batch: SP.batch}
+    settings: spSettings(), look: SP.look, durTouched: SP.durTouched, board: SP.board, boardUndo: SP.boardUndo, batch: SP.batch,
+    boardNote: (spEl('sp-board-note') || {}).value || ''}
   SP.readTok++; clearTimeout(SP.readTimer)
   SP.token = null; SP.info = null; SP.name = ''; SP.sel = null; SP.page = 0; SP.durTouched = false; SP.look = ''
   SP.board = null; SP.boardUndo = null; SP.batch = []
   SP.ov = {background_upto: null, expand: [], layers: {}}
-  ;['sp-image', 'sp-music'].forEach(function(id){ var f = spEl(id); if(f) f.value = '' })
-  ;['schedule_image', 'schedule_music', 'schedule_batch'].forEach(function(k){
+  ;['sp-image', 'sp-music', 'sp-board'].forEach(function(id){ var f = spEl(id); if(f) f.value = '' })
+  var bn = spEl('sp-board-note'); if(bn) bn.value = ''
+  SP.boardBusy = false
+  ;['schedule_image', 'schedule_music', 'schedule_batch', 'schedule_storyboard'].forEach(function(k){
     var n = spEl(k + '_network'); if(n && n.value && typeof clearNetworkField === 'function') clearNetworkField(k) })
   spEl('sp-prompt').value = ''
   spPreviewOff(); spBoardPanel('')
@@ -13568,6 +13571,8 @@ function spSwitchProject(from, to){
     spApplySettings(back.settings || {})
     SP.durTouched = back.durTouched
     if(SP.info) spRenderWork()
+    var bn2 = spEl('sp-board-note'); if(bn2) bn2.value = back.boardNote || ''
+    if(SP.board) spBoardShow()
   }
   if(typeof spBatchDraw === 'function') spBatchDraw()
   spScreen(back && back.info ? (back.screen === 'result' ? 'work' : back.screen) : 'art')
