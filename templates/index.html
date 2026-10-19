@@ -9787,6 +9787,23 @@ function shWsRefreshMarks(){
   })
 }
 
+// The Dialogue tab: what is said in the moment -- the transcript, or the captions as the editor corrected them.
+function shDialogueHtml(c){
+  var cues = c && c.captions && c.captions.cues
+  if(cues && cues.length){
+    return '<div class="sh-note" style="margin-top:0"><b>As corrected in Captions</b> &mdash; this is what the short will show.</div>' +
+      '<div class="sh-note" style="margin-top:4px;color:var(--ink);line-height:1.5">' +
+      cues.map(function(q){ return escapeHtmlLite(q.text || '') }).filter(Boolean).join('<br>') + '</div>'
+  }
+  return c && c.text
+    ? '<div class="sh-note" style="margin-top:0;color:var(--ink);line-height:1.5">' + escapeHtmlLite(c.text) + '</div>'
+    : '<div class="ws-empty">No dialogue was found in this moment.</div>'
+}
+function shDialogueRefresh(c){
+  var p = document.querySelector('.ws-insp-root [data-pane="dialogue"]')
+  if(p && (typeof WS === 'undefined' || !WS.selC || c === WS.selC)) p.innerHTML = shDialogueHtml(c)
+}
+
 // ---- The inspector: Trim / Captions / Framing / Dialogue ----
 var WS_TABS = [['trim', 'Trim'], ['captions', 'Captions'], ['framing', 'Framing'], ['dialogue', 'Dialogue']]
 
@@ -9822,9 +9839,7 @@ function shWsInspector(){
       '</div>' +
       '<div data-pane="captions" style="display:none"><div data-cap-host="' + i + '" style="display:none"></div></div>' +
       '<div data-pane="framing" style="display:none"><div data-frame-host="' + i + '" style="display:none"></div></div>' +
-      '<div data-pane="dialogue" style="display:none">' + (c.text
-        ? '<div class="sh-note" style="margin-top:0;color:var(--ink);line-height:1.5">' + escapeHtmlLite(c.text) + '</div>'
-        : '<div class="ws-empty">No dialogue was found in this moment.</div>') + '</div>' +
+      '<div data-pane="dialogue" style="display:none">' + shDialogueHtml(c) + '</div>' +
     '</div></div>'
   // Marks on the chips the editors add (framing set / captions edited).
   var at = host.querySelector('.sh-times')
@@ -10876,12 +10891,13 @@ async function shCandCaptions(i){
       var v = await ask({start: r.start, end: r.end, cues: cues})
       if(!v.ok) return v.error || 'Those captions could not be used.'
       c.captions = {start: v.start, end: v.end, cues: v.cues}
+      shDialogueRefresh(c)
       chip()
       shReviewChanged()
       if(c === WS.selC) shWsLoad(300)
       say('Kept: this short will be rendered with these ' + v.cues.length + ' line' + (v.cues.length === 1 ? '' : 's') + '.', 'var(--phosphor)')
     },
-    onReset: function(){ delete c.captions; chip(); shReviewChanged(); if(c === WS.selC) shWsLoad(300); host.style.display = 'none'; shCandCaptions(i) }
+    onReset: function(){ delete c.captions; shDialogueRefresh(c); chip(); shReviewChanged(); if(c === WS.selC) shWsLoad(300); host.style.display = 'none'; shCandCaptions(i) }
   })
 }
 
