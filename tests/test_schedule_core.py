@@ -1299,3 +1299,32 @@ def test_a_layer_told_to_go_away_is_drawn_until_then_and_not_after(tmp_path):
     after_a, after_b = a.frame(8.0), b.frame(8.0)
     assert not np.array_equal(after_a[sl], after_b[sl])        # gone
     assert float(np.abs(after_b[sl].astype(int) - 0).mean()) < float(np.abs(after_a[sl].astype(int) - 0).mean())
+
+
+def test_shows_n_names_are_pages_too():
+    for name, number in (('SHOWS 1', 1), ('Shows2', 2), ('SHOW 3', 3), ('show_4', 4), ('Shows #5 late', 5)):
+        assert sk.page_number(name) == number, name
+    for name in ('Show title', 'Shows', 'Showcase 2', 'Show 12x'.replace('12x', 'x')):
+        assert sk.page_number(name) is None, name
+
+
+def test_a_layer_named_sched_bg_is_the_background_and_what_is_under_it_stays_still(tmp_path):
+    psd = psd_tools.PSDImage.new('RGB', (W, H), color=0)
+
+    def px(im, name):
+        box = im.getbbox()
+        return psd.create_pixel_layer(im.crop(box), name=name, top=box[1], left=box[0])
+    psd.append(px(Image.new('RGBA', (W, H), (10, 10, 10, 255)), 'Plate'))
+    psd.append(px(_block([100, 100, 500, 300], (200, 30, 30, 255)), 'Ornament'))
+    psd.append(px(Image.new('RGBA', (W, H), (20, 30, 90, 255)), 'SCHED BG'))
+    psd.append(px(_block([600, 400, 1200, 520], (255, 255, 255, 255)), 'Title'))
+    psd.append(psd.create_group([px(_block([600, 600, 1300, 680], (255, 255, 0, 255)), 'row a')], name='SHOWS 1'))
+    psd.append(psd.create_group([px(_block([600, 600, 1300, 680], (0, 255, 255, 255)), 'row b')], name='SHOWS 2'))
+    path = tmp_path / 'bg.psd'
+    psd.save(str(path))
+    art = sk.load_artwork(str(path))
+    assert art['layers'][0]['role'] == 'background'
+    assert [ly['name'] for ly in art['layers'] if ly['page'] is None][1:] == ['Title']       # the plate and ornament sit under the background
+    assert len(art['pages']) == 2
+    rep = sk.load_artwork(str(path), with_report=True)['report']
+    assert {e['name']: e['role'] for e in rep}['SCHED BG'] == 'background'

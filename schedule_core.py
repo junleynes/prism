@@ -243,13 +243,15 @@ def _load_flat(path, canvas):
     return [dict(_place(bgra, 0, 0, (w, h), canvas), name='Image')], (w, h)
 
 
-_PAGE_NAME = re.compile(r'^\s*(?:page|pg|p)\s*[-_#.]?\s*(\d+)(?!\d)', re.I)
+_PAGE_NAME = re.compile(r'^\s*(?:pages?|pg|shows?|p)\s*[-_#.]?\s*(\d+)(?!\d)', re.I)
+# A top-level layer or group named like this is the background: it stays still, and so does everything under it.
+_BG_NAME = re.compile(r'^\s*sched(?:ule)?[\s_.-]*bg\b', re.I)
 MAX_PAGE_ROWS = 10
 
 
 def page_number(name):
     """The page a top-level layer or group stands for -- 'Page 1', 'PAGE-2',
-    'Pg 3 afternoon', 'P4' -- or None for anything else.
+    'Pg 3 afternoon', 'P4', 'SHOWS 1', 'Show2' -- or None for anything else.
 
     The name has to say so, for two reasons. A file keeps other groups too
     (a header holding the logo and the day), and those must stay on screen
@@ -598,6 +600,11 @@ def _load_psd(path, canvas, overrides=None, report=None):
     # stack, a marker for it ({'page_slot': k}) to be replaced by its rows.
     ov_layers = (overrides or {}).get('layers') or {}
     bg_path = (overrides or {}).get('background_upto')
+    if bg_path is None:
+        # A layer or group named SCHED BG is the background, whatever is under it: the topmost one that is switched on.
+        named = [str(ci) for ci, top_layer in enumerate(psd) if _BG_NAME.match(str(top_layer.name or '')) and top_layer.visible]
+        if named:
+            bg_path = named[-1]
     expand = set((overrides or {}).get('expand') or [])
     notes, layers, plain, found = [], [], True, []
     seq, seq_at = 0, {}
