@@ -13323,6 +13323,8 @@ async function scheduleRender(){
   fd.append('loudness', spEl('sp-level').value)
 
   spEl('sp-result').style.display = 'none'
+  var jobProject = scheduleProjectId()
+  SP.jobProject = jobProject
   spBusy(true, 'Starting...')
   var start
   try{ start = await (await fetch('/api/schedule/render', {method: 'POST', body: fd})).json() }
@@ -13331,7 +13333,11 @@ async function scheduleRender(){
   SP.jobId = start.job_id
   var res = await spPoll(start.job_id)
   SP.jobId = null
+  SP.jobProject = null
   spBusy(false)
+  // Another project was opened while this rendered: its result belongs to the project it was made in (it is
+  // in that project's saved animations), so it is not put on the screen of this one.
+  if(scheduleProjectId() !== jobProject){ if(SKP) SKP.reload(); return }
   if(res.error){ spNote(escapeHtmlLite(res.error), true); return }
   var host = spEl('sp-result')
   host.innerHTML = ''
@@ -13476,11 +13482,47 @@ async function scheduleLoadSaved(){
 
 // ---- Projects: the same screens as Vertical Shorts (static/projects.js) ----
 var SKP = null
+// What is on the Create form belongs to the project it was made in: the artwork read, the changes to its layers, the
+// settings. Opening another project puts this one away and brings back that one's (or a blank form).
+var SP_STASH = {}
+function spBusyView(pid){
+  var mine = !SP.busy || SP.jobProject === pid
+  spEl('sp-progress').style.display = SP.busy && mine ? 'block' : 'none'
+  spEl('sp-cancel-btn').style.display = SP.busy && mine ? 'inline-block' : 'none'
+  var go = spEl('sp-go-btn')
+  go.disabled = !!SP.busy
+  go.title = SP.busy && !mine ? 'A render for another project is still running; this starts when it is done.' : ''
+}
+function spSwitchProject(from, to){
+  if(from) SP_STASH[from] = {info: SP.info, token: SP.token, name: SP.name, ov: SP.ov, sel: SP.sel, page: SP.page, screen: SP.screen,
+    settings: spSettings(), look: SP.look, durTouched: SP.durTouched, board: SP.board, boardUndo: SP.boardUndo, batch: SP.batch}
+  SP.readTok++; clearTimeout(SP.readTimer)
+  SP.token = null; SP.info = null; SP.name = ''; SP.sel = null; SP.page = 0; SP.durTouched = false; SP.look = ''
+  SP.board = null; SP.boardUndo = null; SP.batch = []
+  SP.ov = {background_upto: null, expand: [], layers: {}}
+  ;['sp-image', 'sp-music'].forEach(function(id){ var f = spEl(id); if(f) f.value = '' })
+  ;['schedule_image', 'schedule_music', 'schedule_batch'].forEach(function(k){
+    var n = spEl(k + '_network'); if(n && n.value && typeof clearNetworkField === 'function') clearNetworkField(k) })
+  spEl('sp-prompt').value = ''
+  spPreviewOff(); spBoardPanel('')
+  spEl('sp-note').style.display = 'none'; spEl('sp-note-w').style.display = 'none'
+  var back = SP_STASH[to]
+  if(back){
+    delete SP_STASH[to]
+    SP.info = back.info; SP.token = back.token; SP.name = back.name; SP.ov = back.ov; SP.sel = back.sel; SP.page = back.page
+    SP.look = back.look; SP.board = back.board; SP.boardUndo = back.boardUndo; SP.batch = back.batch || []
+    spApplySettings(back.settings || {})
+    SP.durTouched = back.durTouched
+    if(SP.info) spRenderWork()
+  }
+  if(typeof spBatchDraw === 'function') spBatchDraw()
+  spScreen(back && back.info ? (back.screen === 'result' ? 'work' : back.screen) : 'art')
+}
 function scheduleProjectId(){ return (window.PRISM_PROJECT || {}).schedule || null }
 
 function scheduleProjectsInit(){
   if(SKP || !window.PrismProjects) return
-  var lastOpened = null
+  var lastOpened = null, formProject = null
   SKP = PrismProjects.create({
     kind: 'schedule', prefix: 'sk', mount: 'sk-projects', work: 'sk-work', intro: 'sk-intro', noun: ['animation', 'animations'],
     onOpen: function(p, fresh, refresh){
@@ -13490,8 +13532,13 @@ function scheduleProjectsInit(){
         var create = fresh || !p.count
         switchSubTab(create ? 'p-schedule-create' : 'p-schedule-saved', tabs[create ? 0 : 1])
       }
-      // Another project's result is not this one's.
+      // Another project's result, and its form, are not this one's.
       if(lastOpened !== p.project_id && spEl('sp-result')){ spEl('sp-result').innerHTML = ''; spEl('sp-result').style.display = 'none' }
+      if(formProject !== p.project_id){
+        if(formProject) spSwitchProject(formProject, p.project_id)
+        formProject = p.project_id
+      }
+      spBusyView(p.project_id)
       lastOpened = p.project_id
       scheduleLoadSaved()
     },
