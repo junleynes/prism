@@ -10991,13 +10991,29 @@ async function shCandFraming(i){
     var img = new Image()
     function draw(){ if(img.complete && img.naturalWidth) shDrawShot(canvas, img, d, sh, ch) }
     img.onload = draw
-    function nopic(){ var g = canvas.getContext('2d'); canvas.width = 384; canvas.height = 216; g.fillStyle = '#222'; g.fillRect(0, 0, 384, 216); g.fillStyle = '#aaa'; g.font = '13px sans-serif'; g.fillText('No picture for this shot', 96, 108); if(sh.thumb_error){ g.font = '10px sans-serif'; g.fillText(String(sh.thumb_error).slice(0, 60), 12, 130) } }
+    // Each shot's picture is fetched on its own: it may take a moment (the first time), and is tried again before
+    // giving up; when it cannot be made the reason is said.
     var tried = 0
-    img.onerror = function(){
-      if(sh.thumb && !tried++){ img.src = sh.thumb + (sh.thumb.indexOf('?') < 0 ? '?' : '&') + 'r=' + Date.now(); return }   // one retry, past a cached miss
-      nopic()
+    function loading(){ var g = canvas.getContext('2d'); canvas.width = 384; canvas.height = 216; g.fillStyle = '#222'; g.fillRect(0, 0, 384, 216); g.fillStyle = '#aaa'; g.font = '13px sans-serif'; g.fillText('Getting the picture\u2026', 118, 112) }
+    function nopic(why){
+      var g = canvas.getContext('2d'); canvas.width = 384; canvas.height = 216; g.fillStyle = '#222'; g.fillRect(0, 0, 384, 216)
+      g.fillStyle = '#aaa'; g.font = '13px sans-serif'; g.fillText('No picture for this shot', 96, 100)
+      g.font = '10px sans-serif'; g.fillText(String(why || sh.thumb_error || 'Click to try again').slice(0, 62), 12, 122)
+      canvas.dataset.nopic = '1'
     }
-    if(sh.thumb) img.src = sh.thumb; else nopic()
+    function load(){
+      if(!sh.thumb){ nopic(); return }
+      loading(); canvas.dataset.nopic = ''
+      img.src = sh.thumb + (tried ? '&r=' + Date.now() : '')
+    }
+    img.onerror = async function(){
+      if(tried++ < 2){ setTimeout(load, 1200 * tried); return }
+      var why = ''
+      try{ var r = await fetch(sh.thumb); if(!r.ok) why = (await r.text()).trim().slice(0, 80) }catch(e){ why = String(e).slice(0, 80) }
+      nopic(why); tried = 0
+    }
+    canvas.addEventListener('click', function(){ if(canvas.dataset.nopic === '1'){ tried = 0; load() } }, true)
+    load()
     sel.value = ch.layout
     slide.value = ch.x != null ? ch.x : d.max_x / 2
     slide.style.display = ch.layout === 'crop' ? '' : 'none'

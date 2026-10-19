@@ -3198,6 +3198,79 @@ def _shot_still(cap, a, mid, sa, sb, start_f, fps, info):
     return None, 'neither OpenCV nor ffmpeg could read a frame of the source here'
 
 
+def _ffmpeg_still_file(src, t, path, w, h, timeout=25):
+    """One frame of `src` at `t` seconds, scaled to w x h (square pixels), written as a JPEG. ffmpeg seeks by
+    the file's index, so it is quick even in a long episode on a network share. True when written."""
+    tmp = path + f'.{secrets.token_hex(3)}.tmp.jpg'
+    try:
+        r = subprocess.run([pipeline.FFMPEG, '-v', 'error', '-y', '-ss', f'{max(0.0, t):.3f}', '-i', src,
+                            '-frames:v', '1', '-vf', f'scale={w}:{h}', '-q:v', '4', tmp],
+                           capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    ok = r.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 200
+    if ok:
+        try:
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            pass
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return False
+
+
+@app.route('/api/shorts/shot-still')
+@require_permission('vertical_shorts')
+def api_shorts_shot_still():
+    """The picture of one shot's middle for the framing editor, made when asked for and kept: ffmpeg first, then
+    OpenCV's reading of nearby frames. Plain text with the reason when none can be made."""
+    a, start_f, end_f, err = _moment_request(request.args)
+    if err:
+        return err
+    info = a['info']
+    fps = info['fps']
+    try:
+        mid, sa, sb = int(request.args.get('f')), int(request.args.get('sa')), int(request.args.get('sb'))
+    except (TypeError, ValueError):
+        return 'The shot was not named.', 400
+    mid = max(0, min(mid, info['frames'] - 1))
+    w = 384
+    h = max(2, int(round(w * info['disp_h'] / float(info['disp_w']))))
+    h += h % 2
+    name = 'shf_' + hashlib.sha1(('%s_%d' % (a['path'], mid)).encode()).hexdigest()[:16] + '.jpg'
+    path = os.path.join(app.config['UPLOAD_FOLDER'], name)
+    if os.path.isfile(path) and os.path.getsize(path) < 200:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if not os.path.isfile(path):
+        off = float(info.get('v_offset') or 0.0)
+        made = False
+        for f_try, shift in ((mid, off), (mid, 0.0), (mid + 5, off), (max(0, mid - 5), off)):
+            if _ffmpeg_still_file(a['path'], f_try / fps + shift, path, w, h):
+                made = True
+                break
+        if not made:
+            cap = cv2.VideoCapture(a['path'])
+            try:
+                frame, why = _shot_still(cap, a, mid, sa - start_f, sb - start_f, start_f, fps, info)
+            finally:
+                cap.release()
+            if frame is None:
+                return why or 'No frame could be read here.', 404
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            if not cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80]):
+                return 'The picture could not be saved.', 500
+    resp = send_file(path, mimetype='image/jpeg', conditional=True)
+    resp.headers['Cache-Control'] = 'private, max-age=3600'
+    return resp
+
+
 @app.route('/api/shorts/framing', methods=['POST'])
 @require_permission('vertical_shorts')
 def api_shorts_framing():
@@ -3213,37 +3286,21 @@ def api_shorts_framing():
     segs, shot_starts, kind, alt = _cached_plan(a, start_f, end_f, opts['reframe'], opts['speaker'])
     crop_w, _ = sc.crop_geometry(info['disp_w'], info['disp_h'])
     shots = []
-    cap = cv2.VideoCapture(a['path'])
-    try:
-        for k, (sa, sb) in enumerate(sc.shot_bounds(shot_starts, end_f - start_f)):
-            how, x = _shot_kind([s for s in segs if s['a'] <= sb and s['b'] >= sa])     # joined shots span several
-            mid = start_f + (sa + sb) // 2
-            name = 'shf_' + hashlib.sha1(('%s_%d' % (a['path'], mid)).encode()).hexdigest()[:16] + '.jpg'
-            path = os.path.join(app.config['UPLOAD_FOLDER'], name)
-            if os.path.exists(path) and os.path.getsize(path) < 200:
-                try:
-                    os.remove(path)               # a broken earlier write must not stick
-                except OSError:
-                    pass
-            why = None
-            if not os.path.exists(path):
-                frame, why = _shot_still(cap, a, mid, sa, sb, start_f, fps, info)
-                if frame is not None:
-                    # Square pixels, as the planner measures: x in the picture is x here.
-                    frame = cv2.resize(frame, (384, max(2, int(round(384 * info['disp_h'] / float(info['disp_w']))))),
-                                       interpolation=cv2.INTER_AREA)
-                    if not cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80]):
-                        why = 'the still could not be saved'
-            off = a.get('_offset', 0.0)
-            sp = [t for t in alt if t['a'] <= sb and t['b'] >= sa]
-            split = ({'size': list(sp[0]['size']), 'panes': [list(p) for p in sp[0]['panes']]} if sp else None)
-            shots.append({'index': k, 'can_split': bool(sp), 'split': split, 'start': round((start_f + sa) / fps + off, 3),
-                          'end': round((start_f + sb + 1) / fps + off, 3),
-                          'at': round(mid / fps + off, 3), 'auto': how, 'x': None if x is None else round(x, 1),
-                          'thumb': f'/uploads/{name}' if os.path.exists(path) else None,
-                          'thumb_error': None if os.path.exists(path) else (why or 'no frame could be read')})
-    finally:
-        cap.release()
+    off = a.get('_offset', 0.0)
+    aid = str(data.get('analysis_id') or '').strip()
+    for k, (sa, sb) in enumerate(sc.shot_bounds(shot_starts, end_f - start_f)):
+        how, x = _shot_kind([s for s in segs if s['a'] <= sb and s['b'] >= sa])     # joined shots span several
+        mid = start_f + (sa + sb) // 2
+        sp = [t for t in alt if t['a'] <= sb and t['b'] >= sa]
+        split = ({'size': list(sp[0]['size']), 'panes': [list(p) for p in sp[0]['panes']]} if sp else None)
+        # The picture of each shot is fetched by the browser on its own (see api_shorts_shot_still), so the shot list
+        # opens as soon as the faces are worked out and a slow or failed still never holds the rest back.
+        still = (f"/api/shorts/shot-still?analysis_id={aid}&start={data.get('start')}&end={data.get('end')}"
+                 f"&f={mid}&sa={start_f + sa}&sb={start_f + sb}")
+        shots.append({'index': k, 'can_split': bool(sp), 'split': split, 'start': round((start_f + sa) / fps + off, 3),
+                      'end': round((start_f + sb + 1) / fps + off, 3),
+                      'at': round(mid / fps + off, 3), 'auto': how, 'x': None if x is None else round(x, 1),
+                      'thumb': still})
     return jsonify(ok=True, shots=shots, disp_w=info['disp_w'], disp_h=info['disp_h'], crop_w=crop_w,
                    max_x=max(0, info['disp_w'] - crop_w), detector=kind,
                    start=round(start_f / fps + a.get('_offset', 0.0), 3),
