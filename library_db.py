@@ -447,6 +447,37 @@ _BRANDING_IMAGE_EXTS = {'.svg', '.png', '.jpg', '.jpeg', '.webp', '.gif'}
 _BRANDING_FAVICON_EXTS = {'.ico', '.svg', '.png'}
 _HEX_COLOR_RE = re.compile(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$')
 
+def _lum(h):
+    h = h.lstrip('#')
+    if len(h) == 3: h = ''.join(c * 2 for c in h)
+    r, g, b = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+def _contrast(a, b):
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+def readable_on(color, bg, ratio=4.5):
+    """Darken `color` (mixing toward black) until it reads on `bg` at the given
+    contrast ratio. Neon accents chosen for dark surfaces vanish on white."""
+    h = color.lstrip('#')
+    if len(h) == 3: h = ''.join(c * 2 for c in h)
+    rgb = [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+    for k in range(0, 21):
+        m = [round(c * (1 - k * 0.04)) for c in rgb]
+        out = '#%02x%02x%02x' % tuple(m)
+        if _contrast(out, bg) >= ratio:
+            return out
+    return '#000000'
+
+def _with_light_accents(d):
+    bg = d.get('panel_light', '#ffffff')
+    for k in ('phosphor', 'tally', 'amber', 'accent'):
+        d[k + '_light'] = readable_on(d[k], bg, 4.5)
+    d['phosphor_dim_light'] = readable_on(d['phosphor_dim'], bg, 4.5)
+    return d
+
 def resolve_theme_colors(theme_name, custom_accent):
     """The five hex values actually applied for the given theme choice.
     'custom' (or any unrecognized name -- e.g. a preset removed in a future
@@ -455,11 +486,11 @@ def resolve_theme_colors(theme_name, custom_accent):
     behavior for anyone using it that way."""
     preset = THEME_PRESETS.get(theme_name)
     if preset:
-        return {k: v for k, v in preset.items() if k != 'label'}
+        return _with_light_accents({k: v for k, v in preset.items() if k != 'label'})
     base = dict(THEME_PRESETS[DEFAULT_THEME_NAME])
     base.pop('label', None)
     base['accent'] = custom_accent or DEFAULT_BRAND_ACCENT
-    return base
+    return _with_light_accents(base)
 
 def load_branding():
     """Current brand name/tagline/footer/theme/logo/favicon. Falls back to
