@@ -12527,7 +12527,7 @@ function spOwnAnim(i){ return !!i && Object.keys(i).some(function(k){ return k !
 
 function spRoleChip(l){
   var label = SP_ROLE_LABEL[l.role] || l.role || ''
-  if(l.role === 'page' && l.page != null) label = 'Page ' + l.page
+  if(l.role === 'page' && l.page != null) label = l.card === 'start' ? 'Opening card' : l.card === 'end' ? 'Closing card' : 'Page ' + l.page
   return '<span class="sp-role r-' + escapeHtmlLite(String(l.role)) + '">' + escapeHtmlLite(label) + '</span>'
 }
 
@@ -12633,7 +12633,7 @@ function spRenderLayerPane(){
   var it = SP.ov.layers[l.path] || {}
   var auto = SP_ROLE_LABEL[l.role] || l.role
   var isBg = l.role === 'background' && !container
-  var opts = [['auto', 'As detected (' + (l.role === 'page' ? 'Page ' + l.page : auto) + ')'],
+  var opts = [['auto', 'As detected (' + (l.role === 'page' ? (l.card === 'start' ? 'Opening card' : l.card === 'end' ? 'Closing card' : 'Page ' + l.page) : auto) + ')'],
               ['background', 'Background (this and everything below it)'],
               ['content', 'Logo or schedule text (appears, then holds)'],
               ['decor', 'Moving decoration'],

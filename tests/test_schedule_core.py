@@ -1363,3 +1363,25 @@ def test_background_and_schedule_n_names():
         assert sk._BG_NAME.match(n)
     for n, k in (('Shows 1', 1), ('Page 2', 2), ('Schedule 3', 3), ('SCHEDULE 1', 1)):
         assert sk._PAGE_NAME.match(n).group(1) == str(k) and not sk._BG_NAME.match(n)
+
+
+def test_start_and_end_groups_are_the_opening_and_closing_cards_even_when_hidden(tmp_path):
+    assert sk.page_number('START') == 0 and sk.page_number('End') == 999 and sk.page_number('Intro card') == 0
+    assert sk.page_number('Endless') is None and sk.page_number('Start here') is None
+    psd = psd_tools.PSDImage.new('RGB', (W, H), color=0)
+
+    def px(box, name, col):
+        im = _block(box, col)
+        b = im.getbbox()
+        return psd.create_pixel_layer(im.crop(b), name=name, top=b[1], left=b[0])
+    psd.append(px([0, 0, W, H], 'Background', (20, 30, 90, 255)))
+    for name, y in (('END', 500), ('Schedule 1', 300), ('START', 100)):
+        g = psd.create_group([px([500, y, 1400, y + 90], f'{name} a', (255, 255, 255, 255))], name=name)
+        g.visible = name == 'Schedule 1'
+        psd.append(g)
+    path = str(tmp_path / 'cards.psd')
+    psd.save(path)
+    info = sk.inspect_artwork(path)
+    assert [p['name'] for p in info['pages']] == ['START', 'Schedule 1', 'END']
+    cards = {l['name']: l.get('card') for l in info['layers'] if l['role'] == 'page'}
+    assert cards == {'START': 'start', 'Schedule 1': None, 'END': 'end'}

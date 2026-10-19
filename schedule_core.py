@@ -247,6 +247,9 @@ _PAGE_NAME = re.compile(r'^\s*(?:pages?|pg|shows?|sched(?:ule)?s?|p)\s*[-_#.]?\s
 # A top-level layer or group named like this is the background: it stays still, and so does everything under it.
 _SCHED_BG_NAME = re.compile(r'^\s*sched(?:ule)?[\s_.-]*bg\b', re.I)
 _BG_NAME = re.compile(r'^\s*(?:(?:sched(?:ule)?[\s_.-]*)?(?:bg|background)|sched(?:ule)?[\s_.-]*bg)\b', re.I)
+_START_NAME = re.compile(r'^\s*(?:start|intro|opening|opener|open)\s*(?:card|slide|page)?\s*$', re.I)
+_END_NAME = re.compile(r'^\s*(?:end|outro|closing|closer|close|ending)\s*(?:card|slide|page)?\s*$', re.I)
+START_PAGE, END_PAGE = 0, 999       # an opening card plays before page 1, a closing card after the last page
 MAX_PAGE_ROWS = 10
 
 
@@ -260,8 +263,17 @@ def page_number(name):
     page showing and the others hidden: a group named as a page is read
     whether or not it is showing, where any other hidden layer is left out
     as something the designer switched off."""
+    if _START_NAME.match(str(name or '')):
+        return START_PAGE
+    if _END_NAME.match(str(name or '')):
+        return END_PAGE
     m = _PAGE_NAME.match(str(name or ''))
     return int(m.group(1)) if m else None
+
+
+def card_kind(number):
+    """'start' / 'end' for an opening or closing card's page number, else None."""
+    return 'start' if number == START_PAGE else 'end' if number == END_PAGE else None
 
 
 def _read_layer(layer, doc, canvas, in_page=False):
@@ -638,7 +650,7 @@ def _load_psd(path, canvas, overrides=None, report=None):
             continue
         number = page_number(layer.name)
         if orole == 'page':
-            number = int(ov.get('page') or number or 1)
+            number = int(ov.get('page') or (number if number is not None else 1))
         elif orole in ('content', 'decor'):
             number = None
         if number is not None:
@@ -668,8 +680,8 @@ def _load_psd(path, canvas, overrides=None, report=None):
                     r['motion'] = ov['motion']
                 r['tune'] = _tuning(ov)
             if entry is not None:
-                entry.update(role='page', page=number, rows=len(rows) or 0,
-                             why=('Set as a page by you.' if orole == 'page' else 'Named as a page.')
+                entry.update(role='page', page=number, card=card_kind(number), rows=len(rows) or 0,
+                             why=('Set as a page by you.' if orole == 'page' else ('Named as the opening card: plays first.' if number == START_PAGE else 'Named as the closing card: plays last.' if number == END_PAGE else 'Named as a page.'))
                                  + ('' if it['visible'] else ' Hidden in the file, still played.'))
                 entry['thumb'], entry['box'] = _layer_thumb(parts, canvas)
                 if not rows:
