@@ -118,6 +118,7 @@ SHORTS_AUTO_MIN_STORY = _env_num('SHORTS_AUTO_MIN_STORY', 6, int)
 # in all, at most SHORTS_MOMENT_FRAMES_EACH per moment.
 SHORTS_MOMENT_FRAMES = _env_num('SHORTS_MOMENT_FRAMES', 160, int)
 SHORTS_MOMENT_FRAMES_EACH = _env_num('SHORTS_MOMENT_FRAMES_EACH', 4, int)
+SHORTS_CHAPTER_FRAMES = _env_num('SHORTS_CHAPTER_FRAMES', 240, int)   # frames rated inside a mini-drama's chapters, looking for cards and interviews
 # Delivery formats: the ones the rest of PRISM exports, minus AVC-Intra 100,
 # which is defined for a 1920x1080 picture -- a 1080x1920 file labelled as it
 # is not something the equipment that asks for AVC-Intra will take.
@@ -347,6 +348,7 @@ def _part_view(a, k):
     v['_part'], v['_offset'] = k, P['offset']
     v['_plans'] = a.setdefault('_plans', {})
     v['_faces'] = a.setdefault('_faces', {})
+    v['_facegrid'] = a.setdefault('_facegrid', {})
     return v
 
 
@@ -1056,8 +1058,14 @@ def _run_analysis(jid, params):
         # In and out points onto the sound: not in the middle of a word.
         edges_moved = _refine_by_part(cands, parts, blocked + wall_ranges, min_dur, max_dur)
     # A few frames inside each moment, rated like the first sample.
-    inner = {} if minidrama else sc.inner_sample_times(cands, [v['t'] for v in visual], SHORTS_MOMENT_FRAMES,
-                                                       per_moment=SHORTS_MOMENT_FRAMES_EACH)
+    # A mini-drama is the whole programme, so a title card or an interview the first sparse sample (one frame in
+    # every few tens of seconds) never landed on would stay in it: each chapter is looked into much more closely.
+    if minidrama:
+        inner = sc.inner_sample_times(cands, [v['t'] for v in visual], SHORTS_CHAPTER_FRAMES,
+                                      per_moment=max(SHORTS_MOMENT_FRAMES_EACH, int(math.ceil(max_dur / 6.0))), min_gap=3.0)
+    else:
+        inner = sc.inner_sample_times(cands, [v['t'] for v in visual], SHORTS_MOMENT_FRAMES,
+                                      per_moment=SHORTS_MOMENT_FRAMES_EACH)
     more = sorted({t for ts in inner.values() for t in ts})
     inner_rated = 0
     if more:
@@ -1089,7 +1097,13 @@ def _run_analysis(jid, params):
             pipeline.unload_ollama_model(vision_model)
         # A frame inside a moment may show it reaching into credits or a billboard.
         blocked = sc.not_story_ranges(skips, segments, visual, shots, editor_out, kinds=params.get('exclude_kinds'))
-        cands, gone = sc.clear_of(cands, blocked + wall_ranges, min_dur, fps)
+        if minidrama:
+            # What the closer look found is out of the programme: the chapters are cut again around it.
+            cands = sc.plan_chapters(duration, blocked, segments, cuts, visual, words, min_dur, max_dur,
+                                     fps=fps, walls=walls, limit=SHORTS_MAX_ITEMS)
+            gone = 0
+        else:
+            cands, gone = sc.clear_of(cands, blocked + wall_ranges, min_dur, fps)
         lengths['not_story'] = lengths.get('not_story', 0) + gone
     if blocked:
         warnings.append('Left out of every moment as not part of the drama: ' + sc.describe_ranges(blocked) + '. '
@@ -1215,7 +1229,34 @@ def _framing_overrides(it, start_f, fps):
     """The editor's per-shot framing for a moment, as apply_framing wants
     it: [(frame counted from the clip's first, layout, x)]."""
     fr = it.get('framing') or {}
-    return [(int(round(o['at'] * fps)) - start_f, o['layout'], o.get('x')) for o in fr.get('shots') or []]
+    return [(int(round(o['at'] * fps)) - start_f, o['layout'], o.get('shift') if o['layout'] == 'split' else o.get('x'))
+            for o in fr.get('shots') or []]
+
+
+def _merge_cov(spans):
+    out = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _uncovered(cov, lo, hi):
+    """The parts of [lo, hi) not inside any covered span."""
+    out, a = [], lo
+    for c0, c1 in cov:
+        if c1 <= a:
+            continue
+        if c0 >= hi:
+            break
+        if c0 > a:
+            out.append((a, c0))
+        a = max(a, c1)
+    if a < hi:
+        out.append((a, hi))
+    return out
 
 
 def _face_samples(a, src, info, start_f, n_frames, fps, detector, crop_w, mouth, bodies, focus):
@@ -1224,17 +1265,41 @@ def _face_samples(a, src, info, start_f, n_frames, fps, detector, crop_w, mouth,
     then framed, so changing the reframe mode, or coming back to a moment,
     plans from the same samples. `bodies` and `focus` are filled as the
     sampler would. A look that included the mouths serves one that did not."""
-    store = a.setdefault('_faces', {})
-    base = (a.get('_part', 0), int(start_f), int(n_frames), detector.kind)
-    hit = store.get(base + (True,)) or (store.get(base + (False,)) if not mouth else None)
-    if hit is None:
+    # The faces, looked for once for every sampled frame of the source: a moment whose in or out point is moved
+    # (or another that overlaps it) reads only the frames not yet looked at.
+    grids = a.setdefault('_facegrid', {})
+    step = max(1, int(round(0.2 * fps)))
+    lo, hi = int(start_f), int(start_f) + int(n_frames)
+    gkey = (a.get('_part', 0), detector.kind, bool(mouth))
+    grid = grids.setdefault(gkey, {'cov': [], 'pts': {}})
+    if not mouth:
+        rich = grids.get((a.get('_part', 0), detector.kind, True))
+        if rich and not _uncovered(rich['cov'], lo, hi):
+            grid, mouth_now = rich, True
+        else:
+            mouth_now = False
+    else:
+        mouth_now = True
+    for g0, g1 in (_uncovered(grid['cov'], lo, hi) if grid is grids.get(gkey) else []):
         b, f = [], []
-        smp = sc.sample_faces(src, start_f, n_frames, fps, detector, sar=info['sar'], mouth=bool(mouth),
-                              bodies=b, focus=f, focus_w=crop_w)
-        hit = (smp, b, f)
-        if len(store) > 60:
-            store.pop(next(iter(store)))
-        store[base + (bool(mouth),)] = hit
+        smp = sc.sample_faces(src, g0, g1 - g0, fps, detector, sar=info['sar'], mouth=bool(mouth), bodies=b, focus=f,
+                              focus_w=crop_w, aligned=True)
+        bd, fd = dict(b), dict(f)
+        for i, faces in smp:
+            grid['pts'][g0 + i] = (faces, bd.get(i), fd.get(i))
+        grid['cov'] = _merge_cov(grid['cov'] + [(g0, g1)])
+    if len(grids) > 12:
+        grids.pop(next(iter(grids)))
+    smp, b, f = [], [], []
+    for fr in sorted(k for k in grid['pts'] if lo <= k < hi):
+        hit_ = grid['pts'][fr]
+        smp.append((fr - lo, hit_[0]))
+        if hit_[1] is not None:
+            b.append((fr - lo, hit_[1]))
+        if hit_[2] is not None:
+            f.append((fr - lo, hit_[2]))
+    hit = (smp, b, f)
+    mouth = mouth_now
     smp, b, f = hit
     if not mouth:
         smp = [(i, [d[:4] for d in faces]) for i, faces in smp]
@@ -1296,11 +1361,19 @@ def _parse_framing(raw, label, duration):
             at = float(o.get('at'))
             layout = str(o.get('layout'))
             x = float(o.get('x')) if layout == 'crop' else None
-        except (AttributeError, TypeError, ValueError):
+            shift = None
+            if layout == 'split' and o.get('shift'):
+                shift = [[float(v[0]), float(v[1])] for v in o['shift'][:2]]
+                if len(shift) != 2 or not all(math.isfinite(v) for d in shift for v in d):
+                    raise ValueError('shift')
+        except (AttributeError, TypeError, ValueError, IndexError, KeyError):
             return None, f'"{label}": its framing is not valid.'
         if layout not in ('crop', 'fit', 'split') or not (0.0 <= at <= duration) or (x is not None and not math.isfinite(x)):
             return None, f'"{label}": its framing is not valid.'
-        out.append({'at': round(at, 3), 'layout': layout, 'x': None if x is None else round(max(0.0, x), 1)})
+        entry = {'at': round(at, 3), 'layout': layout, 'x': None if x is None else round(max(0.0, x), 1)}
+        if shift:
+            entry['shift'] = [[round(d[0], 1), round(d[1], 1)] for d in shift]
+        out.append(entry)
     return ({'shots': out} if out else None), None
 
 
@@ -2744,6 +2817,11 @@ def _forget_faces(a, k, t0, t1):
         if key[0] == k and key[1] < ef and key[2] > sf:
             del plans[key]
             gone += 1
+    grids = a.get('_facegrid') or {}
+    for key in list(grids):
+        if key[0] == k:
+            del grids[key]
+            gone += 1
     return gone
 
 
@@ -3009,6 +3087,22 @@ def _ffmpeg_still(path, t, timeout=30):
     return img if img is not None and img.size else None
 
 
+def _playable(path):
+    """True when the file has a first frame that can be decoded: a short or empty copy would only
+    show the browser's "couldn't be played back"."""
+    try:
+        if os.path.getsize(path) < 2000:
+            return False
+        cap = cv2.VideoCapture(path)
+        try:
+            ok, fr = cap.read()
+            return bool(ok and fr is not None and fr.size)
+        finally:
+            cap.release()
+    except (OSError, cv2.error):
+        return False
+
+
 def _usable(frame):
     return frame is not None and getattr(frame, 'size', 0) and float(frame.mean()) >= 1.5
 
@@ -3265,6 +3359,11 @@ def api_shorts_vpreview():
     key = json.dumps([a['path'], start_f, end_f, segs, cues, opts['subtitle_size']], sort_keys=True, default=str)
     out_name = 'shv_' + hashlib.sha1(key.encode()).hexdigest()[:16] + '.mp4'
     out_path = os.path.join(app.config['UPLOAD_FOLDER'], out_name)
+    if os.path.exists(out_path) and (data.get('force') or not _playable(out_path)):
+        try:
+            os.remove(out_path)                    # a copy that cannot be played is made again, not served again
+        except OSError:
+            pass
     if not os.path.exists(out_path):
         work = app.config['UPLOAD_FOLDER']
         tag = secrets.token_hex(6)
@@ -3274,7 +3373,7 @@ def api_shorts_vpreview():
             if ass_name:
                 sc.write_ass(cues, os.path.join(work, ass_name), size=opts['subtitle_size'], font=SHORTS_SUB_FONT)
             ok, err = sc.render_short(pipeline.FFMPEG, a['path'], part, start_f, n_frames, info, segs,
-                                      ass_name=ass_name, work_dir=work, crf=30, preset='veryfast',
+                                      ass_name=ass_name, work_dir=work, crf=32, preset='ultrafast',
                                       loudness=SHORTS_LOUDNESS, true_peak=SHORTS_TRUE_PEAK,
                                       timeout=pipeline.FFMPEG_TIMEOUT, out_w=360, out_h=640)
         except sc.ToolTimeout as e:
@@ -3285,6 +3384,8 @@ def api_shorts_vpreview():
                     os.remove(os.path.join(work, ass_name))
                 except OSError:
                     pass
+        if ok and not _playable(part):
+            ok, err = False, 'the copy it made has no picture that can be read'
         if not ok:
             if os.path.exists(part):
                 os.remove(part)

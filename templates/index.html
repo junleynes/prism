@@ -8364,6 +8364,8 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   <label style="display:flex;gap:6px;align-items:center;font-weight:normal"><input type=checkbox data-kind=teaser checked> Teaser (&ldquo;abangan&hellip;&rdquo;, plugs)</label>
   <label style="display:flex;gap:6px;align-items:center;font-weight:normal"><input type=checkbox data-kind=black checked> Black between acts</label>
   <label style="display:flex;gap:6px;align-items:center;font-weight:normal"><input type=checkbox data-kind=logo checked> Station, programme or product logos</label>
+  <label style="display:flex;gap:6px;align-items:center;font-weight:normal"><input type=checkbox data-kind=tcard checked> Title cards (T-cards), slates</label>
+  <label style="display:flex;gap:6px;align-items:center;font-weight:normal"><input type=checkbox data-kind=interview checked> Interviews, talking heads to camera</label>
 </div>
 <p class="sh-note" style="margin-top:6px">All are left out by default. Untick one to allow that kind of material inside a short, for example narration when the story is told by a narrator.</p>
 
@@ -10823,7 +10825,9 @@ function shDrawShot(canvas, img, d, sh, choice){
     // The two windows that are stacked, top then bottom.
     var kx = w / d.disp_w, ky = h / d.disp_h
     g.fillStyle = 'rgba(0,0,0,.45)'; g.fillRect(0, 0, w, h)
-    sh.split.panes.forEach(function(p, n){
+    sh.split.panes.forEach(function(p0, n){
+      var sft = (choice.shift && choice.shift[n]) || [0, 0]
+      var p = [Math.max(0, Math.min(d.disp_w - sh.split.size[0], p0[0] + sft[0])), Math.max(0, Math.min(d.disp_h - sh.split.size[1], p0[1] + sft[1]))]
       var px = p[0] * kx, py = p[1] * ky, pw = sh.split.size[0] * kx, ph = sh.split.size[1] * ky
       g.drawImage(img, p[0] * (img.naturalWidth / d.disp_w), p[1] * (img.naturalHeight / d.disp_h),
                   sh.split.size[0] * (img.naturalWidth / d.disp_w), sh.split.size[1] * (img.naturalHeight / d.disp_h), px, py, pw, ph)
@@ -10869,17 +10873,17 @@ async function shCandFraming(i){
   var saved = (c.framing && c.framing.shots) || []
   var choices = d.shots.map(function(sh){
     var o = saved.filter(function(o){ return o.at >= sh.start - 1e-3 && o.at < sh.end - 1e-3 })[0]
-    return o ? {layout: o.layout, x: o.x} : {layout: 'auto', x: sh.x}
+    return o ? {layout: o.layout, x: o.x, shift: o.shift || null} : {layout: 'auto', x: sh.x, shift: null}
   })
   var crops = opts.reframe !== 'fit'
   host.innerHTML = '<div class="sh-frame">' +
     '<div class="sh-note" style="margin-top:0">How each shot of this moment will be framed. The dashed box is what was worked out' +
       (d.detector ? '' : ' (no face detector here: shots are centre-cropped)') +
       '; choose <b>Centre crop</b> to crop from the middle, or <b>Crop here</b> and slide the box to put it anywhere, <b>Whole frame</b> to show the whole picture, or <b>Split screen</b> to stack two people, one above the other. ' +
-      '<b>Make vertical preview</b> shows the result in 9:16, captions and all.</div>' +
+      'The 9:16 preview, captions and all, is made when this opens and again each time you press <b>Use this framing</b>.</div>' +
     '<div class="sh-frame-body">' +
-      '<div class="sh-frame-pv"><div class="sh-frame-empty" data-pv>No preview yet</div>' +
-        '<button type=button class="btn-sm" data-pv-make>Make vertical preview</button></div>' +
+      '<div class="sh-frame-pv"><div class="sh-frame-empty" data-pv>Rendering the 9:16 preview&hellip;</div>' +
+        '<button type=button class="btn-sm" data-pv-make>Update 9:16 preview</button></div>' +
       '<div class="sh-frame-shots" data-shots></div></div>' +
     '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">' +
       '<button type=button class=btn data-fr-save>Use this framing</button>' +
@@ -10900,7 +10904,15 @@ async function shCandFraming(i){
           '<option value=fit>Whole frame</option>' +
           (crops ? '<option value=split' + (sh.can_split ? '' : ' disabled') + '>Split screen' + (sh.can_split ? ' (two people, stacked)' : ' (needs two people)') + '</option>' : '') +
           '</select></div>' +
-      '<input type=range data-shot-x min=0 max=' + d.max_x + ' step=1 aria-label="Where the crop of shot ' + (k + 1) + ' sits"></div>'
+      '<input type=range data-shot-x min=0 max=' + d.max_x + ' step=1 aria-label="Where the crop of shot ' + (k + 1) + ' sits">' +
+      (sh.split ? '<div data-split-ctl style="display:none;margin-top:6px;font-size:11px">' +
+        [0, 1].map(function(n){
+          var mx = Math.max(0, d.disp_w - sh.split.size[0]), my = Math.max(0, d.disp_h - sh.split.size[1])
+          return '<div style="display:flex;gap:6px;align-items:center;margin:2px 0"><span style="min-width:74px">' + (n ? 'Bottom person' : 'Top person') + '</span>' +
+            '<span>left/right</span><input type=range data-sp-x="' + n + '" min=' + (-Math.round(sh.split.panes[n][0])) + ' max=' + Math.round(mx - sh.split.panes[n][0]) + ' step=1 value=0 style="width:110px">' +
+            '<span>up/down</span><input type=range data-sp-y="' + n + '" min=' + (-Math.round(sh.split.panes[n][1])) + ' max=' + Math.round(my - sh.split.panes[n][1]) + ' step=1 value=0 style="width:110px"></div>'
+        }).join('') +
+        '<div style="opacity:.65">Slide to move each window over the picture; the stack on the right of the shot is what is kept.</div></div>' : '') + '</div>'
     var canvas = row.querySelector('canvas'), sel = row.querySelector('[data-shot-layout]'), slide = row.querySelector('[data-shot-x]')
     var img = new Image()
     function draw(){ if(img.complete && img.naturalWidth) shDrawShot(canvas, img, d, sh, ch) }
@@ -10915,11 +10927,32 @@ async function shCandFraming(i){
     sel.value = ch.layout
     slide.value = ch.x != null ? ch.x : d.max_x / 2
     slide.style.display = ch.layout === 'crop' ? '' : 'none'
+    var splitCtl = row.querySelector('[data-split-ctl]')
+    function showSplitCtl(){
+      if(!splitCtl) return
+      splitCtl.style.display = (ch.layout === 'split' || (ch.layout === 'auto' && sh.auto === 'split')) ? 'block' : 'none'
+    }
+    if(splitCtl){
+      var sft0 = ch.shift || [[0, 0], [0, 0]]
+      ;[0, 1].forEach(function(n){
+        splitCtl.querySelector('[data-sp-x="' + n + '"]').value = sft0[n][0]
+        splitCtl.querySelector('[data-sp-y="' + n + '"]').value = sft0[n][1]
+      })
+      splitCtl.addEventListener('input', function(){
+        ch.shift = [0, 1].map(function(n){
+          return [parseFloat(splitCtl.querySelector('[data-sp-x="' + n + '"]').value) || 0, parseFloat(splitCtl.querySelector('[data-sp-y="' + n + '"]').value) || 0]
+        })
+        ch.layout = 'split'; sel.value = 'split'
+        draw()
+      })
+      showSplitCtl()
+    }
     sel.addEventListener('change', function(){
       if(sel.value === 'center'){ ch.layout = 'crop'; ch.x = d.max_x / 2; slide.value = ch.x }
       else ch.layout = sel.value
       if(ch.layout === 'crop' && ch.x == null) ch.x = parseFloat(slide.value)
       slide.style.display = ch.layout === 'crop' ? '' : 'none'
+      showSplitCtl()
       draw()
     })
     slide.addEventListener('input', function(){ ch.x = parseFloat(slide.value); sel.value = 'crop'; draw() })
@@ -10938,7 +10971,11 @@ async function shCandFraming(i){
       var ch = choices[k]
       if(ch.layout === 'crop') shots.push({at: sh.at, layout: 'crop', x: Math.round(ch.x)})
       else if(ch.layout === 'fit') shots.push({at: sh.at, layout: 'fit'})
-      else if(ch.layout === 'split' && sh.can_split) shots.push({at: sh.at, layout: 'split'})
+      else if(ch.layout === 'split' && sh.can_split){
+        var e = {at: sh.at, layout: 'split'}
+        if(ch.shift && ch.shift.some(function(s){ return s[0] || s[1] })) e.shift = ch.shift
+        shots.push(e)
+      }
     })
     return shots.length ? {shots: shots} : null
   }
@@ -10947,26 +10984,51 @@ async function shCandFraming(i){
     if(old) old.remove()
     if(at && c.framing) at.insertAdjacentHTML('beforeend', ' <span class="score-chip" data-frame-chip title="Rendered with the framing you set">framing set</span>')
   }
-  host.querySelector('[data-pv-make]').addEventListener('click', async function(){
-    var btn = this, pv = host.querySelector('[data-pv]')
+  // The 9:16 copy is made as soon as the panel opens and again each time the framing is kept: the picture
+  // shown is always the one that will be rendered, with no separate step to ask for it.
+  var pvToken = 0
+  async function makePv(framingNow, force){
+    var btn = host.querySelector('[data-pv-make]'), pv = host.querySelector('[data-pv]'), mine = ++pvToken
+    if(!btn || !pv) return
     btn.disabled = true
-    pv.outerHTML = '<div class="sh-frame-empty" data-pv>Rendering a small 9:16 copy&hellip;</div>'
+    pv.outerHTML = '<div class="sh-frame-empty" data-pv>Rendering the 9:16 preview&hellip;</div>'
     var body = Object.assign({}, base, {subtitles: opts.subtitles, subtitle_size: opts.subtitle_size,
-                                        framing: current(), captions: c.captions || null})
+                                        framing: framingNow, captions: c.captions || null})
+    if(force) body.force = true
     var r
     try{ r = await (await fetch('/api/shorts/vpreview', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})).json() }
     catch(e){ r = {ok: false, error: String(e)} }
+    if(mine !== pvToken) return                 // a newer one was asked for meanwhile
     btn.disabled = false
     var now = host.querySelector('[data-pv]')
-    if(!r.ok){ now.outerHTML = '<div class="sh-frame-empty" data-pv style="color:var(--amber)">' + escapeHtmlLite(r.error || 'Could not make the preview.') + '</div>'; return }
+    if(!now) return
+    if(!r.ok){
+      now.outerHTML = '<div class="sh-frame-empty" data-pv style="color:var(--amber)">' + escapeHtmlLite(r.error || 'Could not make the preview.') + ' <a href="#" data-pv-retry>Try again</a></div>'
+      var rt = host.querySelector('[data-pv-retry]')
+      if(rt) rt.addEventListener('click', function(ev){ ev.preventDefault(); makePv(framingNow, true) })
+      return
+    }
     now.outerHTML = '<video data-pv controls playsinline preload=auto src="' + r.url + '"></video>'
-    btn.textContent = 'Update vertical preview'
-  })
+    var vid = host.querySelector('video[data-pv]')
+    var retried = false
+    vid.addEventListener('error', function(){
+      // Not playable: the server makes the copy again (and checks it), once; then it says so.
+      if(!retried){ retried = true; makePv(framingNow, true); return }
+      var bad = host.querySelector('[data-pv]')
+      if(bad) bad.outerHTML = '<div class="sh-frame-empty" data-pv style="color:var(--amber)">This copy could not be played back by the browser. <a href="#" data-pv-retry>Make it again</a></div>'
+      var rt2 = host.querySelector('[data-pv-retry]')
+      if(rt2) rt2.addEventListener('click', function(ev){ ev.preventDefault(); makePv(framingNow, true) })
+    })
+    btn.textContent = 'Update 9:16 preview'
+  }
+  host.querySelector('[data-pv-make]').addEventListener('click', function(){ makePv(current()) })
+  makePv(c.framing || current())
   host.querySelector('[data-fr-save]').addEventListener('click', function(){
     var f = current()
     if(f) c.framing = f; else delete c.framing
     chip()
     shReviewChanged()
+    makePv(f)
     out.style.color = 'var(--phosphor)'
     out.textContent = f ? 'Kept: ' + f.shots.length + ' shot' + (f.shots.length === 1 ? '' : 's') + ' will be framed as you set.' : 'Every shot will be framed automatically.'
   })
@@ -11622,7 +11684,7 @@ function shSelApplyValues(v){
   Object.keys(SH_SEL.num).forEach(function(k){ var el = shEl(SH_SEL.num[k]); if(el && v[k] !== undefined) el.value = v[k] })
   Object.keys(SH_SEL.bool).forEach(function(k){ var el = shEl(SH_SEL.bool[k]); if(el && v[k] !== undefined) el.checked = !!v[k] })
   if(v.exclude_kinds){
-    document.querySelectorAll('#sh-exclude-kinds input[data-kind]').forEach(function(c){ c.checked = v.exclude_kinds.indexOf(c.getAttribute('data-kind')) >= 0 })
+    document.querySelectorAll('#sh-exclude-kinds input[data-kind]').forEach(function(c){ var k = c.getAttribute('data-kind'); c.checked = v.exclude_kinds.indexOf(k) >= 0 || ((k === 'tcard' || k === 'interview') && v.exclude_kinds.length > 0 && v.exclude_kinds.indexOf('tcard') < 0 && v.exclude_kinds.indexOf('interview') < 0) })
   }
   if(typeof shWordHlSync === 'function') shWordHlSync()
   if(typeof shModeSync === 'function') shModeSync()

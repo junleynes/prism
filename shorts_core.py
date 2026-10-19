@@ -238,7 +238,11 @@ VISION_PROMPT = (
     'Also describe the frame in at most 12 words: who is visible and what they are doing.\n'
     'And say what kind of picture it is:\n'
     '"story" = a scene of the drama itself (on-screen text over a scene, such as a place name, is still story);\n'
-    '"credits" = credits, a title card, or text or a graphic filling the screen;\n'
+    '"tcard" = a title card or slate: a plain or designed card with a programme title, episode title or caption, '
+    'with no scene behind it;\n'
+    '"interview" = a person speaking to the camera in an interview, testimonial or talking-head setup (a name '
+    'caption under them, an interviewer off screen), not a scene of the drama;\n'
+    '"credits" = opening or end credits, or text or a graphic filling the screen;\n'
     '"logo" = a sponsor billboard, a product, a station or programme logo, an advertisement;\n'
     '"host" = a host, presenter or narrator speaking to the camera or in a studio, not part of the drama;\n'
     '"black" = a black or blank screen.\n'
@@ -247,7 +251,7 @@ VISION_PROMPT = (
 
 # What the vision model can say a frame is. Anything but "story" is material
 # a short must not contain: billboards, credits, a host, black between acts.
-VISION_KINDS = ('story', 'credits', 'logo', 'host', 'black')
+VISION_KINDS = ('story', 'tcard', 'interview', 'credits', 'logo', 'host', 'black')
 
 VISION_FORMAT = {
     'type': 'object',
@@ -259,7 +263,11 @@ VISION_FORMAT = {
 
 
 _KIND_WORDS = {'story': 'story', 'scene': 'story', 'drama': 'story',
-               'credits': 'credits', 'credit': 'credits', 'title': 'credits', 'text': 'credits', 'graphic': 'credits',
+               'credits': 'credits', 'credit': 'credits', 'text': 'credits', 'graphic': 'credits',
+               'tcard': 'tcard', 't-card': 'tcard', 't card': 'tcard', 'title': 'tcard', 'title card': 'tcard',
+               'titlecard': 'tcard', 'slate': 'tcard', 'card': 'tcard',
+               'interview': 'interview', 'interviewee': 'interview', 'testimonial': 'interview',
+               'talking head': 'interview', 'talking-head': 'interview',
                'logo': 'logo', 'billboard': 'logo', 'sponsor': 'logo', 'ad': 'logo', 'advertisement': 'logo',
                'host': 'host', 'presenter': 'host', 'narrator': 'host', 'anchor': 'host',
                'black': 'black', 'blank': 'black'}
@@ -366,7 +374,7 @@ STORY_FORMAT = {
                     'first_id': {'type': 'integer'},
                     'last_id': {'type': 'integer'},
                     'kind': {'type': 'string', 'enum': ['billboard', 'credits', 'narration', 'host',
-                                                        'recap', 'teaser', 'sponsor']},
+                                                        'recap', 'teaser', 'sponsor', 'tcard', 'interview']},
                 },
                 'required': ['first_id', 'last_id', 'kind'],
             },
@@ -424,7 +432,9 @@ def build_story_prompt(segments, lo, hi, visual, min_dur, max_dur, max_moments=3
         ('host', '- host: a host or presenter speaking to the audience (introducing the episode, a studio '
                  'segment, a closing message);\n'),
         ('recap', '- recap: "previously" / "sa nakaraang" summaries of earlier episodes;\n'),
-        ('teaser', '- teaser: "next time" / "abangan" previews and plugs for other shows.\n'),
+        ('teaser', '- teaser: "next time" / "abangan" previews and plugs for other shows;\n'),
+        ('tcard', '- tcard: a title card or slate (programme or episode title, a caption card);\n'),
+        ('interview', '- interview: a person interviewed or giving a testimonial to the camera, outside the drama.\n'),
     ]
     use = [t for k, t in kind_lines if exclude_kinds is None or k in exclude_kinds]
     if use:
@@ -531,7 +541,8 @@ def parse_story_reply(text, lo, hi):
 
 NOT_STORY_LABELS = {'billboard': 'billboard', 'sponsor': 'sponsor read', 'credits': 'credits',
                     'narration': 'narration', 'host': 'host', 'recap': 'recap', 'teaser': 'teaser',
-                    'logo': 'billboard / logo', 'black': 'black', 'editor': 'left out by you'}
+                    'logo': 'billboard / logo', 'black': 'black', 'editor': 'left out by you',
+                    'tcard': 'title card', 'interview': 'interview'}
 
 
 def parse_story_skips(text, lo, hi):
@@ -635,7 +646,7 @@ NOT_STORY_FRAME_REACH = 8.0     # a non-story frame in a long shot stands for th
 NOT_STORY_BRIDGE = 20.0         # two non-story frames this close, with no story frame between, are one run
 
 
-EXCLUDE_KINDS = ('billboard', 'sponsor', 'credits', 'narration', 'host', 'recap', 'teaser', 'black', 'logo')
+EXCLUDE_KINDS = ('billboard', 'sponsor', 'credits', 'narration', 'host', 'recap', 'teaser', 'black', 'logo', 'tcard', 'interview')
 
 
 def parse_exclude_kinds(raw):
@@ -1810,7 +1821,7 @@ def _focus_targets(focus, a, b, max_x, crop_w):
 
 
 def sample_faces(path, start_f, n_frames, fps, detector, step_sec=0.2, sar=1.0, mouth=False, bodies=None,
-                 focus=None, focus_w=None):
+                 focus=None, focus_w=None, aligned=False):
     """Runs the detector over a clip at ~1/step_sec samples a second.
 
     Returns [(frame index relative to the clip start, [(cx, cy, w, h), ...])]
@@ -1831,16 +1842,22 @@ def sample_faces(path, start_f, n_frames, fps, detector, step_sec=0.2, sar=1.0, 
 
     `focus`, likewise, collects (frame index, focus_point()) for those
     frames, for a window `focus_w` display pixels wide (the crop's): the
-    next thing plan_reframe falls back on."""
+    next thing plan_reframe falls back on.
+
+    `aligned` samples the frames of the SOURCE that are multiples of the step, not every step from the clip's
+    first frame, so a look at one stretch and a look at an overlapping one sample the same frames and can share."""
     out = []
     cap = cv2.VideoCapture(path)
     try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_f))
         step = max(1, int(round(step_sec * fps)))
+        phase = ((-int(start_f)) % step) if aligned else 0
+        # Start a little before the first sample, so a seek that lands early still reads the right frames.
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_f))
         lag = min(step - 1, max(1, int(round(MOUTH_LAG_SEC * fps)))) if mouth else 0
         pending = None
         for i in range(int(n_frames)):
-            if i % step == 0:
+            j = i - phase
+            if j >= 0 and j % step == 0:
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -1852,7 +1869,7 @@ def sample_faces(path, start_f, n_frames, fps, detector, step_sec=0.2, sar=1.0, 
                 if focus is not None and not dets and focus_w:
                     focus.append((i, focus_point(frame, focus_w, sar)))
                 pending = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), dets) if lag and dets else None
-            elif pending is not None and i % step == lag:
+            elif pending is not None and j >= 0 and j % step == lag:
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -2578,7 +2595,8 @@ def apply_framing(segs, shot_starts, n_frames, overrides, max_x, splits=None, di
             continue                                # the rest of a shot already replaced
         layout, x = chosen[own]
         if layout == 'split':
-            out.extend(dict(t, a=max(own[0], t['a']), b=min(own[1], t['b']), _editor=own)
+            out.extend(dict(t, a=max(own[0], t['a']), b=min(own[1], t['b']), _editor=own,
+                            _shift=x if isinstance(x, (list, tuple)) else None)
                        for t in splits if t['a'] <= own[1] and t['b'] >= own[0])
             continue
         out.append({'a': own[0], 'b': own[1], 'layout': layout, 'keys': None, '_editor': own,
@@ -2587,6 +2605,14 @@ def apply_framing(segs, shot_starts, n_frames, overrides, max_x, splits=None, di
         s.pop('_editor', None)
     if any(s['layout'] == 'split' for s in out) and disp:
         _finish_split(out, disp[0], disp[1])      # one window size for every split in the clip
+    for s in out:
+        shift = s.pop('_shift', None)
+        if shift and s.get('layout') == 'split' and s.get('panes') and disp:
+            # The editor moved the windows: by so much from where the planner put each one, kept inside the picture.
+            w, h = s['size']
+            s['panes'] = [(int(round(min(max(0.0, px + float(d[0])), max(0.0, disp[0] - w)))),
+                           int(round(min(max(0.0, py + float(d[1])), max(0.0, disp[1] - h)))))
+                          for (px, py), d in zip(s['panes'], shift)]
     return out
 
 
