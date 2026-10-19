@@ -243,9 +243,10 @@ def _load_flat(path, canvas):
     return [dict(_place(bgra, 0, 0, (w, h), canvas), name='Image')], (w, h)
 
 
-_PAGE_NAME = re.compile(r'^\s*(?:pages?|pg|shows?|p)\s*[-_#.]?\s*(\d+)(?!\d)', re.I)
+_PAGE_NAME = re.compile(r'^\s*(?:pages?|pg|shows?|sched(?:ule)?s?|p)\s*[-_#.]?\s*(\d+)(?!\d)', re.I)
 # A top-level layer or group named like this is the background: it stays still, and so does everything under it.
-_BG_NAME = re.compile(r'^\s*sched(?:ule)?[\s_.-]*bg\b', re.I)
+_SCHED_BG_NAME = re.compile(r'^\s*sched(?:ule)?[\s_.-]*bg\b', re.I)
+_BG_NAME = re.compile(r'^\s*(?:(?:sched(?:ule)?[\s_.-]*)?(?:bg|background)|sched(?:ule)?[\s_.-]*bg)\b', re.I)
 MAX_PAGE_ROWS = 10
 
 
@@ -606,7 +607,9 @@ def _load_psd(path, canvas, overrides=None, report=None):
     by_name = False
     if bg_path is None:
         # A layer or group named SCHED BG is the background, whatever is under it: the topmost one that is switched on.
-        named = [str(ci) for ci, top_layer in enumerate(psd) if _BG_NAME.match(str(top_layer.name or '')) and top_layer.visible]
+        # "Background" / "BG" alone only counts for a group: a plain layer of that name is found by its position.
+        named = [str(ci) for ci, top_layer in enumerate(psd) if top_layer.visible and _BG_NAME.match(str(top_layer.name or ''))
+                 and (_SCHED_BG_NAME.match(str(top_layer.name or '')) or top_layer.is_group())]
         if named:
             bg_path = named[-1]
             by_name = True

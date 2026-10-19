@@ -1356,3 +1356,10 @@ def test_a_file_with_a_sched_bg_layer_is_animated_by_layers_even_if_it_differs_f
     info = sk.inspect_artwork(path)
     assert info['layered'] and not info['flat']
     assert any('SCHED BG' in n and 'levels' in n for n in info['notes'])
+
+
+def test_background_and_schedule_n_names():
+    for n in ('SCHED BG', 'Schedule BG', 'Background', 'BG'):
+        assert sk._BG_NAME.match(n)
+    for n, k in (('Shows 1', 1), ('Page 2', 2), ('Schedule 3', 3), ('SCHEDULE 1', 1)):
+        assert sk._PAGE_NAME.match(n).group(1) == str(k) and not sk._BG_NAME.match(n)
