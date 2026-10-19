@@ -3976,6 +3976,8 @@ def build_render_cmd(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_n
     the word being spoken is finished (see word_end). Left as None it stops
     where the picture does, which is how shorts were made before the sound
     was measured, and how one of those is made again."""
+    # `loudness=None` skips the levelling: loudnorm is the slowest step on the sound, and a preview is only looked at.
+    ln = f'loudnorm=I={loudness}:TP={true_peak}:LRA=11' if loudness is not None else 'anull'
     fps = info['fps']
     dur = n_frames / fps
     # A quarter of a frame early, so accurate seek lands on exactly start_f
@@ -4008,7 +4010,7 @@ def build_render_cmd(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_n
         stops = min(stops, (stop + hold) / fps - 0.5 - out)
         polish = (f'afade=t=in:st=0:d=0.04,atrim=end={stops + out:.3f},'
                   f'afade=t=out:st={stops:.3f}:d={out:.3f}:curve=cub,'
-                  f'loudnorm=I={loudness}:TP={true_peak}:LRA=11,apad=whole_dur={dur + extra / fps:.3f}')
+                  f'{ln},apad=whole_dur={dur + extra / fps:.3f}')
         if ending_sfx and ending_sfx.get('path'):
             total = dur + extra / fps
             begins = stop / fps                         # the instant the action stops
@@ -4045,11 +4047,11 @@ def build_render_cmd(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_n
         if fade_s:
             # A long fade goes on AFTER the levelling: measured with it in, the quiet tail
             # would be counted and the whole short turned up to make up for it.
-            polish = (f'afade=t=in:st=0:d=0.04,loudnorm=I={loudness}:TP={true_peak}:LRA=11,'
+            polish = (f'afade=t=in:st=0:d=0.04,{ln},'
                       f'afade=t=out:st={fade_out:.3f}:d={fade_len:.3f}')
         else:
             polish = (f'afade=t=in:st=0:d=0.04,afade=t=out:st={fade_out:.3f}:d={fade_len:.3f},'
-                      f'loudnorm=I={loudness}:TP={true_peak}:LRA=11')
+                      f'{ln}')
     take = info.get('audio_take')
     # The sounds laid over the dialogue: the ending's effect and the overlay's own sound.
     extras = [(c, l) for c, l in ((sfx_chain, '[sfx]'), (ov_chain, '[ovs]')) if c]

@@ -3489,7 +3489,7 @@ def api_shorts_vpreview():
                 sc.write_ass(cues, os.path.join(work, ass_name), size=opts['subtitle_size'], font=SHORTS_SUB_FONT)
             ok, err = sc.render_short(pipeline.FFMPEG, a['path'], part, start_f, n_frames, info, segs,
                                       ass_name=ass_name, work_dir=work, crf=32, preset='ultrafast',
-                                      loudness=SHORTS_LOUDNESS, true_peak=SHORTS_TRUE_PEAK,
+                                      loudness=None, true_peak=SHORTS_TRUE_PEAK,
                                       timeout=pipeline.FFMPEG_TIMEOUT, out_w=360, out_h=640)
         except sc.ToolTimeout as e:
             ok, err = False, f'The preview took too long ({e}).'

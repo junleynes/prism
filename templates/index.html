@@ -10186,7 +10186,12 @@ function shWsTick(){
   var v = shEl('ws-video'), b = shEl('ws-play')
   if(!v) return
   v.addEventListener('loadedmetadata', function(){ shWsMsg(''); shWsPaint() })
-  v.addEventListener('error', function(){ if(v.getAttribute('src')) shWsMsg("This couldn't be played back.") })
+  v.addEventListener('error', function(){
+    if(!v.getAttribute('src')) return
+    // An exact copy that cannot be played is made again once (the server checks it), then it is said.
+    if(WS.exact && !WS.exactTry){ shWsExact(WS.draft, true); return }
+    shWsMsg("This couldn't be played back.")
+  })
   v.addEventListener('play', function(){ b.innerHTML = '&#10074;&#10074;'; if(!WS.raf) WS.raf = requestAnimationFrame(shWsTick) })
   v.addEventListener('pause', function(){ b.innerHTML = '&#9654;' })
   v.addEventListener('ended', function(){ b.innerHTML = '&#9654;'; shWsPaint() })
@@ -10255,9 +10260,11 @@ function shWsExactBtn(){
   b.setAttribute('aria-pressed', on ? 'true' : 'false')
   b.style.borderColor = on ? 'var(--accent, #34e6c5)' : ''
 }
-async function shWsExact(){
+// `draft`: a framing being worked on in the Framing tab, shown here before it is kept; left out, the moment's own.
+async function shWsExact(draft, force){
   var c = WS.selC, a = SH.analysis, v = shEl('ws-video'), btn = shEl('ws-exact')
   if(!c || !a) return
+  WS.draft = draft; WS.exactTry = !!force
   var tok = ++WS.token
   shWsStop()
   btn.disabled = true
@@ -10265,7 +10272,8 @@ async function shWsExact(){
   var o = shRenderOptions(), r
   try{
     r = await shWsPost('/api/shorts/vpreview', {analysis_id: a.analysis_id, start: c.start, end: c.end, reframe: o.reframe,
-      speaker: o.speaker, subtitles: o.subtitles, subtitle_size: o.subtitle_size, framing: c.framing || null, captions: c.captions || null})
+      speaker: o.speaker, subtitles: o.subtitles, subtitle_size: o.subtitle_size,
+      framing: draft !== undefined ? draft : (c.framing || null), captions: c.captions || null, force: !!force})
   }catch(err){ r = {ok: false, error: String(err)} }
   btn.disabled = false
   if(tok !== WS.token) return
@@ -11017,10 +11025,11 @@ async function shCandFraming(i){
     '<div class="sh-note" style="margin-top:0">How each shot of this moment will be framed. The dashed box is what was worked out' +
       (d.detector ? '' : ' (no face detector here: shots are centre-cropped)') +
       '; choose <b>Centre crop</b> to crop from the middle, or <b>Crop here</b> and slide the box to put it anywhere, <b>Whole frame</b> to show the whole picture, or <b>Split screen</b> to stack two people, one above the other. ' +
-      'The 9:16 preview, captions and all, is made when this opens and again each time you press <b>Use this framing</b>.</div>' +
+      'The 9:16 preview above shows these choices, captions and all, when this opens and each time you press <b>Show in the preview</b> or <b>Use this framing</b>.</div>' +
     '<div class="sh-frame-body">' +
-      '<div class="sh-frame-pv"><div class="sh-frame-empty" data-pv>Rendering the 9:16 preview&hellip;</div>' +
-        '<button type=button class="btn-sm" data-pv-make>Update 9:16 preview</button></div>' +
+      '<div class="sh-frame-pv" style="justify-content:flex-start">' +
+        '<button type=button class="btn-sm" data-pv-make>Show in the preview</button>' +
+        '<div style="font-size:11px;opacity:.65;max-width:170px">The 9:16 preview is the player above.</div></div>' +
       '<div class="sh-frame-shots" data-shots></div></div>' +
     '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">' +
       '<button type=button class=btn data-fr-save>Use this framing</button>' +
@@ -11182,42 +11191,11 @@ async function shCandFraming(i){
     if(old) old.remove()
     if(at && c.framing) at.insertAdjacentHTML('beforeend', ' <span class="score-chip" data-frame-chip title="Rendered with the framing you set">framing set</span>')
   }
-  // The 9:16 copy is made as soon as the panel opens and again each time the framing is kept: the picture
-  // shown is always the one that will be rendered, with no separate step to ask for it.
-  var pvToken = 0
-  async function makePv(framingNow, force){
-    var btn = host.querySelector('[data-pv-make]'), pv = host.querySelector('[data-pv]'), mine = ++pvToken
-    if(!btn || !pv) return
-    btn.disabled = true
-    pv.outerHTML = '<div class="sh-frame-empty" data-pv>Rendering the 9:16 preview&hellip;</div>'
-    var body = Object.assign({}, base, {subtitles: opts.subtitles, subtitle_size: opts.subtitle_size,
-                                        framing: framingNow, captions: c.captions || null})
-    if(force) body.force = true
-    var r
-    try{ r = await (await fetch('/api/shorts/vpreview', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})).json() }
-    catch(e){ r = {ok: false, error: String(e)} }
-    if(mine !== pvToken) return                 // a newer one was asked for meanwhile
-    btn.disabled = false
-    var now = host.querySelector('[data-pv]')
-    if(!now) return
-    if(!r.ok){
-      now.outerHTML = '<div class="sh-frame-empty" data-pv style="color:var(--amber)">' + escapeHtmlLite(r.error || 'Could not make the preview.') + ' <a href="#" data-pv-retry>Try again</a></div>'
-      var rt = host.querySelector('[data-pv-retry]')
-      if(rt) rt.addEventListener('click', function(ev){ ev.preventDefault(); makePv(framingNow, true) })
-      return
-    }
-    now.outerHTML = '<video data-pv controls playsinline preload=auto src="' + r.url + '"></video>'
-    var vid = host.querySelector('video[data-pv]')
-    var retried = false
-    vid.addEventListener('error', function(){
-      // Not playable: the server makes the copy again (and checks it), once; then it says so.
-      if(!retried){ retried = true; makePv(framingNow, true); return }
-      var bad = host.querySelector('[data-pv]')
-      if(bad) bad.outerHTML = '<div class="sh-frame-empty" data-pv style="color:var(--amber)">This copy could not be played back by the browser. <a href="#" data-pv-retry>Make it again</a></div>'
-      var rt2 = host.querySelector('[data-pv-retry]')
-      if(rt2) rt2.addEventListener('click', function(ev){ ev.preventDefault(); makePv(framingNow, true) })
-    })
-    btn.textContent = 'Update 9:16 preview'
+  // One preview: the player in the workspace. The framing being worked on is shown there, as soon as the panel
+  // opens and each time it is asked for or kept.
+  function makePv(framingNow, force){
+    if(WS.selC !== c) shWsSelect(c, 'framing')
+    if(WS.selC === c) shWsExact(framingNow || null, force)
   }
   host.querySelector('[data-pv-make]').addEventListener('click', function(){ makePv(current()) })
   makePv(c.framing || current())

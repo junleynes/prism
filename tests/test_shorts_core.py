@@ -2068,3 +2068,13 @@ def test_caption_lines_timed_to_the_hundredth_only_drift_a_little():
     assert out[1]['start'] == 5.5, 'a start 2.5 s before the sound is more than a drift: left as given'
     free, _ = sc.align_segments(segs, db)
     assert free[1]['start'] > 7.5, 'without the limit it would have moved'
+
+
+def test_preview_render_skips_loudnorm():
+    import shorts_core as sc
+    info = {'fps': 25.0, 'disp_w': 1920, 'disp_h': 1080, 'audio_index': 0, 'v_offset': 0.0}
+    segs = [{'a': 0, 'b': 49, 'layout': 'fit'}]
+    full = sc.build_render_cmd('ffmpeg', 'in.mp4', 'o.mp4', 0, 50, info, segs, loudness=-14.0)
+    quick = sc.build_render_cmd('ffmpeg', 'in.mp4', 'o.mp4', 0, 50, info, segs, loudness=None)
+    assert any('loudnorm' in x for x in full)
+    assert not any('loudnorm' in x for x in quick)
