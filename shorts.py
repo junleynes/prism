@@ -3009,6 +3009,43 @@ def _ffmpeg_still(path, t, timeout=30):
     return img if img is not None and img.size else None
 
 
+def _usable(frame):
+    return frame is not None and getattr(frame, 'size', 0) and float(frame.mean()) >= 1.5
+
+
+def _shot_still(cap, a, mid, sa, sb, start_f, fps, info):
+    """(frame, why) -- a picture of the shot's middle. OpenCV's seek first (quick), then nearby frames, then
+    ffmpeg at the moment with and without the file's video offset, then the shot's first and last frames.
+    A dark frame is skipped for a lit one when any is found; dark is still better than nothing."""
+    off = float(info.get('v_offset') or 0.0)
+    dark = None
+    if not os.path.exists(a['path']):
+        return None, 'the source video is no longer where it was analysed'
+    tries = [mid, mid + 5, mid - 5, start_f + sa + 2, start_f + sb - 2]
+    for f in tries:
+        if f < 0:
+            continue
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f)
+            ok, fr = cap.read()
+        except cv2.error:
+            ok, fr = False, None
+        if ok and fr is not None and getattr(fr, 'size', 0):
+            if _usable(fr):
+                return fr, None
+            dark = dark if dark is not None else fr
+    for f in tries:
+        for shift in (off, 0.0):
+            fr = _ffmpeg_still(a['path'], max(0.0, f / fps + shift))
+            if fr is not None:
+                if _usable(fr):
+                    return fr, None
+                dark = dark if dark is not None else fr
+    if dark is not None:
+        return dark, None
+    return None, 'neither OpenCV nor ffmpeg could read a frame of the source here'
+
+
 @app.route('/api/shorts/framing', methods=['POST'])
 @require_permission('vertical_shorts')
 def api_shorts_framing():
@@ -3031,27 +3068,28 @@ def api_shorts_framing():
             mid = start_f + (sa + sb) // 2
             name = 'shf_' + hashlib.sha1(('%s_%d' % (a['path'], mid)).encode()).hexdigest()[:16] + '.jpg'
             path = os.path.join(app.config['UPLOAD_FOLDER'], name)
+            if os.path.exists(path) and os.path.getsize(path) < 200:
+                try:
+                    os.remove(path)               # a broken earlier write must not stick
+                except OSError:
+                    pass
+            why = None
             if not os.path.exists(path):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, mid)
-                ok, frame = cap.read()
-                if not ok or frame is None or float(frame.mean()) < 1.5:
-                    # OpenCV's seek can miss in a long-GOP file (and land on nothing, or black): ask ffmpeg for the frame.
-                    alt_frame = _ffmpeg_still(a['path'], mid / fps + float(info.get('v_offset') or 0.0))
-                    if alt_frame is not None:
-                        ok, frame = True, alt_frame
-                if ok:
-                    h, w = frame.shape[:2]
+                frame, why = _shot_still(cap, a, mid, sa, sb, start_f, fps, info)
+                if frame is not None:
                     # Square pixels, as the planner measures: x in the picture is x here.
                     frame = cv2.resize(frame, (384, max(2, int(round(384 * info['disp_h'] / float(info['disp_w']))))),
                                        interpolation=cv2.INTER_AREA)
-                    cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if not cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80]):
+                        why = 'the still could not be saved'
             off = a.get('_offset', 0.0)
             sp = [t for t in alt if t['a'] <= sb and t['b'] >= sa]
             split = ({'size': list(sp[0]['size']), 'panes': [list(p) for p in sp[0]['panes']]} if sp else None)
             shots.append({'index': k, 'can_split': bool(sp), 'split': split, 'start': round((start_f + sa) / fps + off, 3),
                           'end': round((start_f + sb + 1) / fps + off, 3),
                           'at': round(mid / fps + off, 3), 'auto': how, 'x': None if x is None else round(x, 1),
-                          'thumb': f'/uploads/{name}' if os.path.exists(path) else None})
+                          'thumb': f'/uploads/{name}' if os.path.exists(path) else None,
+                          'thumb_error': None if os.path.exists(path) else (why or 'no frame could be read')})
     finally:
         cap.release()
     return jsonify(ok=True, shots=shots, disp_w=info['disp_w'], disp_h=info['disp_h'], crop_w=crop_w,
