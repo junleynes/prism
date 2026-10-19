@@ -8571,7 +8571,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
         <button type=button class="btn-sm" id=ws-setin title="Start the moment here (I)">Set In here</button>
         <button type=button class="btn-sm" id=ws-setout title="End the moment here (O)">Set Out here</button>
         <button type=button class="btn-sm" id=ws-cut title="Cut a part out of the middle of this moment: press at the start of the part to remove, then again at its end (C)">&#9986; Cut from here</button>
-        <button type=button class="btn-sm" id=ws-exact title="Render a small exact copy: framing, corrections and captions burned in">Exact 9:16 preview</button>
+        <button type=button class="btn-sm" id=ws-exact title="On: the preview is a small exact copy with framing, corrections and captions burned in. Off: the quick unframed clip.">Exact 9:16 preview: on</button>
         <label class="ws-beyond" title="Play a few seconds before and after the moment too, so In and Out can be set further out than they are now (extend it) as well as closer in"><input type=checkbox id=ws-beyond> show 5 s beyond the ends</label>
       </div>
       <div class="ws-keys"><kbd>Space</kbd> play &middot; <kbd>&uarr;</kbd><kbd>&darr;</kbd> moment &middot; <kbd>I</kbd> / <kbd>O</kbd> set in / out &middot; <kbd>C</kbd> cut out a part &middot; <kbd>,</kbd> <kbd>.</kbd> (or <kbd>&lt;</kbd> <kbd>&gt;</kbd>) one frame back / forward &middot; <kbd>X</kbd> tick</div>
@@ -9891,7 +9891,7 @@ function shWsCuts(){
 // One press marks where the removed part starts, the next where it ends.
 function shWsCutHere(){
   var c = WS.selC, v = shEl('ws-video')
-  if(!c || WS.exact || !v.getAttribute('src')) return
+  if(!c || !v.getAttribute('src')) return
   var t = Math.round((c.start - WS.lead + (v.currentTime || 0)) * 100) / 100
   if(WS.cutFrom == null){
     if(t <= c.start + 0.2 || t >= c.end - 0.2){ shWsMsg('Cuts go inside the moment. To shorten its start or end, set In or Out.'); setTimeout(function(){ shWsMsg('') }, 2200); return }
@@ -10124,10 +10124,10 @@ function shPartBounds(c){
 var WS_BEYOND = 5
 function shWsTotal(){ return WS.lead + WS.dur + WS.tail }
 
-function shWsLoad(delay){
+function shWsLoad(delay, raw){
   clearTimeout(WS.loadT)
   var tok = ++WS.token
-  if(delay){ WS.loadT = setTimeout(function(){ if(tok === WS.token) shWsLoad(0) }, delay); return }
+  if(delay){ WS.loadT = setTimeout(function(){ if(tok === WS.token) shWsLoad(0, raw) }, delay); return }
   var c = WS.selC, a = SH.analysis, v = shEl('ws-video')
   shWsStop()
   WS.exact = false; v.style.objectFit = ''; shWsCapVis()
@@ -10139,6 +10139,9 @@ function shWsLoad(delay){
   WS.tail = WS.beyond ? Math.max(0, Math.min(WS_BEYOND, bnd[1] - c.end)) : 0
   WS.cues = []
   shEl('ws-cap').textContent = ''
+  // The exact 9:16 copy (framing, corrections and captions in) is what opens, unless it is switched off or the
+  // padded "beyond the moment" view, which needs the raw footage, is on.
+  if(shWsExactOn() && !raw && !WS.beyond){ shWsExact(); return }
   shWsMsg('Preparing the clip…')
   Promise.all([
     shWsPost('/api/shorts/clip', {analysis_id: a.analysis_id, start: c.start - WS.lead, end: c.end + WS.tail}),
@@ -10198,7 +10201,12 @@ function shWsTick(){
   shEl('ws-setout').addEventListener('click', function(){ shWsSetHere('end') })
   shEl('ws-cut').addEventListener('click', shWsCutHere)
   shEl('ws-beyond').addEventListener('change', function(){ WS.beyond = this.checked; if(WS.selC) shWsLoad(0) })
-  shEl('ws-exact').addEventListener('click', shWsExact)
+  shWsExactBtn()
+  shEl('ws-exact').addEventListener('click', function(){
+    try{ localStorage.setItem('prism_ws_exact', shWsExactOn() ? '0' : '1') }catch(e){}
+    shWsExactBtn()
+    if(WS.selC) shWsLoad(0)
+  })
   window.shWsToggle = toggle
 })()
 
@@ -10228,7 +10236,7 @@ function shWsStep(dir){
 
 function shWsSetHere(which){
   var c = WS.selC, v = shEl('ws-video')
-  if(!c || WS.exact || !v.getAttribute('src')) return
+  if(!c || !v.getAttribute('src')) return
   var t = c.start - WS.lead + (v.currentTime || 0)
   if(!shPointSet(c, which, Math.round(t * 100) / 100)){
     var tok = WS.token
@@ -10237,6 +10245,16 @@ function shWsSetHere(which){
   }
 }
 
+function shWsExactOn(){
+  try{ return localStorage.getItem('prism_ws_exact') !== '0' }catch(e){ return true }
+}
+function shWsExactBtn(){
+  var b = shEl('ws-exact'); if(!b) return
+  var on = shWsExactOn()
+  b.textContent = 'Exact 9:16 preview: ' + (on ? 'on' : 'off')
+  b.setAttribute('aria-pressed', on ? 'true' : 'false')
+  b.style.borderColor = on ? 'var(--accent, #34e6c5)' : ''
+}
 async function shWsExact(){
   var c = WS.selC, a = SH.analysis, v = shEl('ws-video'), btn = shEl('ws-exact')
   if(!c || !a) return
@@ -10251,11 +10269,16 @@ async function shWsExact(){
   }catch(err){ r = {ok: false, error: String(err)} }
   btn.disabled = false
   if(tok !== WS.token) return
-  if(!r.ok){ shWsMsg(r.error || 'Could not make the preview.'); return }
-  WS.exact = true; WS.loadedC = c
+  if(!r.ok){
+    // Could not make the exact copy: show the raw clip instead, so there is always something to look at.
+    shWsMsg((r.error || 'Could not make the exact preview.') + ' Showing the unframed clip.')
+    shWsLoad(0, true); return
+  }
+  WS.exact = true; WS.loadedC = c; WS.dur = c.end - c.start
   shWsCapVis(); shEl('ws-cap').textContent = ''
   v.style.objectFit = 'contain'
   v.src = r.url; v.load(); shWsMsg('')
+  shEl('ws-scrub').max = shWsTotal()
   v.play().catch(function(){})
 }
 
