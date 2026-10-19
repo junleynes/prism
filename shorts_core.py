@@ -344,6 +344,47 @@ def vision_sample_times(shots, duration, budget=90, min_gap=6.0):
     return times
 
 
+EDGE_HEAD, EDGE_HEAD_STEP = 75.0, 5.0       # a programme opens with its billboard and title: looked at closely
+EDGE_TAIL, EDGE_TAIL_STEP = 150.0, 10.0     # and closes with credits and a billboard
+EDGE_MAX = 90
+
+
+def edge_sample_times(spans, shots, taken=()):
+    """Extra places to grab frames: the opening and the close of each part. Even sampling over a long programme
+    is one frame in half a minute, which steps right over a ten-second opening billboard. `spans` is
+    [(offset, duration)] per part; each time is nudged inside its shot as in vision_sample_times, and any within
+    a second of one already `taken` is dropped. At most EDGE_MAX in all."""
+    starts = [s for s, _ in shots]
+    have = sorted(float(t) for t in taken)
+    out = []
+
+    def add(t, lo, hi):
+        at = t
+        k = bisect.bisect_right(starts, t) - 1
+        if 0 <= k < len(shots):
+            a, b = shots[k]
+            at = (a + b) / 2.0 if b - a <= 0.8 else min(max(t, a + 0.3), b - 0.3)
+        at = round(min(max(at, lo), max(lo, hi - 0.05)), 3)
+        i = bisect.bisect_left(have, at)
+        near = [have[j] for j in (i - 1, i) if 0 <= j < len(have)]
+        if any(abs(at - h) < 1.0 for h in near):
+            return
+        bisect.insort(have, at)
+        out.append(at)
+
+    for off, dur in spans:
+        lo, hi = float(off), float(off) + float(dur)
+        t = lo + EDGE_HEAD_STEP / 2.0
+        while t < min(hi, lo + EDGE_HEAD):
+            add(t, lo, hi)
+            t += EDGE_HEAD_STEP
+        t = hi - EDGE_TAIL_STEP / 2.0
+        while t > max(lo, hi - EDGE_TAIL):
+            add(t, lo, hi)
+            t -= EDGE_TAIL_STEP
+    return sorted(out)[:EDGE_MAX]
+
+
 # --------------------------------------------------------------------------
 # Layer 2: narrative beats (prompt + reply parsing)
 # --------------------------------------------------------------------------
@@ -674,7 +715,10 @@ def not_story_ranges(skips, segments, visual, shots, editor=None, kinds=None):
     n = len(segments or [])
     if kinds is not None:
         skips = [k for k in skips or [] if k.get('kind') in kinds]
-        visual = [v for v in visual or [] if v.get('kind') in kinds or not v.get('kind') or v.get('kind') == 'story']
+        # The picture model has one word for a billboard, a sponsor card and a logo ('logo'); ticking any of those
+        # leaves such a frame out.
+        visual = [v for v in visual or [] if not v.get('kind') or v.get('kind') == 'story' or v.get('kind') in kinds
+                  or (v.get('kind') == 'logo' and kinds & {'billboard', 'sponsor'})]
     for k in skips or []:
         i, j = max(0, k['start_id']), min(n - 1, k['end_id'])
         if i <= j:
@@ -2188,6 +2232,22 @@ def _finish_split(segs, disp_w, disp_h):
     for s in splits:
         s['size'] = (w, h)
         s['panes'] = [tuple(int(round(v)) for v in _pane_origin(f, w, h, disp_w, disp_h)) for f in s['people']]
+
+
+def forced_splits(shot_starts, n_frames, splits, disp_w, disp_h):
+    """Split segments for every shot the planner found no two people in, so the editor can still ask for a split
+    screen there: the two windows start on the left and right thirds of the picture, to be moved onto the people by
+    hand. Marked 'forced'. `splits` are the ones the planner made; a shot they cover is left to them."""
+    full = split_pane_size(disp_w, disp_h)
+    face = max(8.0, disp_h * 0.18)
+    people = ((disp_w * 0.3, disp_h * 0.42, face, face), (disp_w * 0.7, disp_h * 0.42, face, face))
+    out = []
+    for a, b in shot_bounds(shot_starts, n_frames):
+        if any(t['a'] <= b and t['b'] >= a for t in splits):
+            continue
+        out.append({'a': a, 'b': b, 'layout': 'split', 'x': None, 'keys': None, 'people': people,
+                    'size': full, 'forced': True})
+    return out
 
 
 EXPR_SUM_GROUP = 8

@@ -824,6 +824,8 @@ def _run_analysis(jid, params):
 
     # ---- Layer 1: how dramatic does it look ----
     times = sc.vision_sample_times(shots, duration, budget=params['vision_frames'])
+    # The opening and close of every part are looked at closely, so a billboard of ten seconds is not stepped over.
+    times = sorted(set(times) | set(sc.edge_sample_times([(P['offset'], P['duration']) for P in parts], shots, taken=times)))
     report(percent=20, step=f'Rating {len(times)} frames (AI vision)')
     items = [(t, b) for t, b in _grab_by_part(parts, times) if b]
     visual, errors = [], []
@@ -1333,10 +1335,18 @@ def _plan_moment(a, src, info, start_f, end_f, reframe, speaker, detector, frami
     # Where the screen could be split, for the editor to offer and to apply:
     # the same samples planned as 'split', so no second look at the faces.
     splits = []
-    if (splits_out is not None or any(o[1] == 'split' for o in framing or [])) and samples and reframe != 'fit':
+    wanted = (splits_out is not None or any(o[1] == 'split' for o in framing or [])) and reframe != 'fit'
+    if wanted and samples:
         splits = [x for x in sc.plan_reframe(samples, shot_starts, n_frames, info['disp_w'], info['disp_h'], crop_w,
                                              mode=('nowide' if reframe == 'nowide' else 'split'), fps=fps, speaker=False, speech=None, bodies=bodies,
                                              focus=focus) if x['layout'] == 'split']
+    if wanted and info['disp_w'] > crop_w:
+        # A shot with no two people found can still be split by hand: its windows start on the two thirds of the
+        # picture, for the editor to move onto the people.
+        forced = sc.forced_splits(shot_starts, n_frames, splits, info['disp_w'], info['disp_h'])
+        if forced:
+            splits = splits + forced
+            sc._finish_split(splits, info['disp_w'], info['disp_h'])
     if splits_out is not None:
         splits_out.extend(splits)
     if framing:
@@ -3292,7 +3302,8 @@ def api_shorts_framing():
         how, x = _shot_kind([s for s in segs if s['a'] <= sb and s['b'] >= sa])     # joined shots span several
         mid = start_f + (sa + sb) // 2
         sp = [t for t in alt if t['a'] <= sb and t['b'] >= sa]
-        split = ({'size': list(sp[0]['size']), 'panes': [list(p) for p in sp[0]['panes']]} if sp else None)
+        split = ({'size': list(sp[0]['size']), 'panes': [list(p) for p in sp[0]['panes']],
+                  'forced': bool(sp[0].get('forced'))} if sp else None)
         # The picture of each shot is fetched by the browser on its own (see api_shorts_shot_still), so the shot list
         # opens as soon as the faces are worked out and a slow or failed still never holds the rest back.
         still = (f"/api/shorts/shot-still?analysis_id={aid}&start={data.get('start')}&end={data.get('end')}"

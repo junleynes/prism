@@ -11084,7 +11084,7 @@ async function shCandFraming(i){
         '<select data-shot-layout aria-label="Framing of shot ' + (k + 1) + '">' +
           '<option value=auto>As worked out</option>' + (crops ? '<option value=center>Centre crop</option><option value=crop>Crop here</option>' : '') +
           '<option value=fit>Whole frame</option>' +
-          (crops ? '<option value=split' + (sh.can_split ? '' : ' disabled') + '>Split screen' + (sh.can_split ? ' (two people, stacked)' : ' (needs two people)') + '</option>' : '') +
+          (crops ? '<option value=split' + (sh.can_split ? '' : ' disabled') + '>Split screen' + (sh.can_split ? (sh.split && sh.split.forced ? ' (no two faces found: you place the squares)' : ' (two people, stacked)') : ' (not available)') + '</option>' : '') +
           '</select></div>' +
       '<input type=range data-shot-x min=0 max=' + d.max_x + ' step=1 aria-label="Where the crop of shot ' + (k + 1) + ' sits">' +
       (sh.split ? '<div data-split-ctl style="display:none;margin-top:6px;font-size:11px">' +

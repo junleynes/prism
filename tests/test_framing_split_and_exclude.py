@@ -105,3 +105,48 @@ def test_the_chosen_sound_is_cut_out_of_the_effect_in_the_render_graph():
     opts = {'ending': 'cliffhanger', 'ending_sfx_name': 'x.wav', 'ending_sfx_in': 2.0, 'ending_sfx_out': 1.0}
     res, err = shorts._resolve_ending_sfx(opts)
     assert res is None and err                              # staged file missing: refused, not guessed at
+
+
+def test_an_opening_billboard_is_looked_at_and_a_billboard_tick_covers_a_logo_frame():
+    import shorts_core as sc
+    shots = [(0.0, 12.0), (12.0, 600.0), (600.0, 2700.0)]
+    base = sc.vision_sample_times(shots, 2700.0, budget=90)
+    assert min(base) > 10.0                        # the even sampling starts after a ten-second billboard
+    extra = sc.edge_sample_times([(0.0, 2700.0)], shots, taken=base)
+    allt = sorted(base + extra)
+    assert allt[0] < 6.0 and sum(1 for t in allt if t < 12.0) >= 2
+    assert max(allt) > 2700.0 - 20.0
+    assert not any(abs(a - b) < 1.0 for a, b in zip(allt, allt[1:]))
+    assert len(extra) <= sc.EDGE_MAX
+    # Each part is looked at at both ends.
+    parts = sc.edge_sample_times([(0.0, 1000.0), (1000.0, 1000.0)], [(0.0, 2000.0)], taken=[])
+    assert any(1000.0 <= t < 1012.0 for t in parts) and any(990.0 < t < 1000.0 for t in parts)
+    # Only "billboard" ticked: a frame the picture model calls a logo is still left out.
+    vis = [{'t': 30.0, 'kind': 'logo'}]
+    got = sc.not_story_ranges([], [], vis, [(0.0, 100.0)], None, kinds={'billboard'})
+    assert got and got[0][0] <= 30.0 <= got[0][1]
+    assert not sc.not_story_ranges([], [], vis, [(0.0, 100.0)], None, kinds={'host'})
+
+
+def test_a_shot_with_no_two_faces_can_still_be_split_by_hand():
+    import shorts_core as sc
+    W, H = 1920, 1080
+    crop_w, _ = sc.crop_geometry(W, H)
+    shot_starts = [100]
+    segs = [{'a': 0, 'b': 99, 'layout': 'crop', 'x': 400.0, 'keys': None},
+            {'a': 100, 'b': 199, 'layout': 'crop', 'x': 900.0, 'keys': None}]
+    forced = sc.forced_splits(shot_starts, 200, [], W, H)
+    assert [(t['a'], t['b']) for t in forced] == [(0, 99), (100, 199)] and all(t['forced'] for t in forced)
+    # One shot already has a real split: only the other is forced.
+    real = {'a': 0, 'b': 99, 'layout': 'split', 'x': None, 'keys': None, 'people': ((500, 400, 80, 80), (1400, 400, 80, 80)),
+            'size': (600, 338)}
+    assert [(t['a'], t['b']) for t in sc.forced_splits(shot_starts, 200, [real], W, H)] == [(100, 199)]
+    sc._finish_split(forced, W, H)
+    out = sc.apply_framing(segs, shot_starts, 200, [(150, 'split', [[40, 0], [0, 0]])], max(0, W - crop_w), splits=forced, disp=(W, H))
+    split = [s for s in out if s['layout'] == 'split']
+    assert len(split) == 1 and (split[0]['a'], split[0]['b']) == (100, 199)
+    (x0, y0), (x1, y1) = split[0]['panes']
+    base = sc.apply_framing(segs, shot_starts, 200, [(150, 'split', None)], max(0, W - crop_w), splits=forced, disp=(W, H))
+    assert split[0]['panes'][0][0] == min(base[-1]['panes'][0][0] + 40, W - split[0]['size'][0])
+    assert x0 < x1 or y0 != y1
+    assert any(s['layout'] == 'crop' and s['a'] == 0 for s in out)       # the other shot keeps its plan
