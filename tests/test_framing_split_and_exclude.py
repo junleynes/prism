@@ -70,3 +70,38 @@ def test_faces_are_shared_between_overlapping_looks(monkeypatch):
     s2 = shorts._face_samples(a, 'p', info, 150, 100, 25.0, D(), 300, False, [], [])
     assert calls == [(100, 100), (200, 50)], 'the second look reads only what the first had not'
     assert [i for i, _ in s2][0] == 0 and len(s2) == 20
+
+
+def test_an_effect_file_with_several_sounds_is_split_and_one_can_be_chosen(tmp_path):
+    import subprocess
+    import pipeline
+    import wave
+    import numpy as np
+    wav = str(tmp_path / 'multi.wav')
+    sr = 44100
+
+    def tone(f, d):
+        return 0.5 * np.sin(2 * np.pi * f * np.arange(int(sr * d)) / sr)
+    gap = np.zeros(int(sr * 0.5))
+    pcm = np.concatenate([tone(600, 0.4), gap, tone(900, 0.3), gap, tone(400, 0.5)])
+    with wave.open(wav, 'wb') as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes((pcm * 32767).astype('<i2').tobytes())
+    total = pipeline.probe_duration(wav)
+    sounds = shorts._split_sounds(wav, total)
+    assert [s['index'] for s in sounds] == [1, 2, 3]
+    assert sounds[0]['start'] == 0.0 and 0.4 <= sounds[0]['end'] <= 0.6
+    assert 0.8 <= sounds[1]['start'] <= 1.0 and sounds[1]['end'] < sounds[2]['start']
+    # one steady sound is nothing to choose between
+    one = str(tmp_path / 'one.wav')
+    subprocess.run([pipeline.FFMPEG, '-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=f=500:d=1', one], check=True)
+    assert shorts._split_sounds(one, pipeline.probe_duration(one)) == []
+
+
+def test_the_chosen_sound_is_cut_out_of_the_effect_in_the_render_graph():
+    import inspect
+    src = inspect.getsource(sc.cliffhanger_graph) if hasattr(sc, 'cliffhanger_graph') else ''
+    assert shorts._sfx_point('1.25') == 1.25 and shorts._sfx_point('') is None and shorts._sfx_point('-3') is None
+    opts = {'ending': 'cliffhanger', 'ending_sfx_name': 'x.wav', 'ending_sfx_in': 2.0, 'ending_sfx_out': 1.0}
+    res, err = shorts._resolve_ending_sfx(opts)
+    assert res is None and err                              # staged file missing: refused, not guessed at

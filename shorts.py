@@ -1422,7 +1422,8 @@ def _kept_sfx(bdir, options):
     """A batch's ending sound effect, as kept beside its shorts, for rendering one of them again."""
     fx = (options or {}).get('ending_sfx') or {}
     path = os.path.join(bdir, os.path.basename(fx.get('file') or '')) if fx.get('file') else None
-    return {'path': path, 'gain': fx.get('gain') or 0.0} if path and os.path.isfile(path) else None
+    return ({'path': path, 'gain': fx.get('gain') or 0.0, 'in': fx.get('in'), 'out': fx.get('out')}
+            if path and os.path.isfile(path) else None)
 
 
 def _kept_overlay(bdir, options):
@@ -1709,7 +1710,8 @@ def _run_render(jid, params):
                             'fade_last': bool(params.get('fade_last')),
                             'ending_fade': params.get('ending_fade') if params.get('fade_last') else None,
                             'ending_sfx': ({'file': sfx_kept, 'name': params['ending_sfx']['name'],
-                                            'gain': params['ending_sfx']['gain']} if sfx_kept else None),
+                                            'gain': params['ending_sfx']['gain'],
+                                            'in': params['ending_sfx'].get('in'), 'out': params['ending_sfx'].get('out')} if sfx_kept else None),
                             'ending_overlay': ({'file': ov_kept, 'name': params['ending_overlay']['name'],
                                                 'dur': params['ending_overlay']['dur'],
                                                 'audio': params['ending_overlay']['audio']} if ov_kept else None),
@@ -1731,7 +1733,8 @@ def _run_render(jid, params):
             'ending_zoom': params.get('ending_zoom') if ending else None,
             'ending_look': params.get('ending_look') if ending else None,
             'ending_motion': params.get('ending_motion') if ending else None,
-            'ending_sfx': ({'path': os.path.join(bdir, sfx_kept), 'gain': params['ending_sfx']['gain']}
+            'ending_sfx': ({'path': os.path.join(bdir, sfx_kept), 'gain': params['ending_sfx']['gain'],
+                            'in': params['ending_sfx'].get('in'), 'out': params['ending_sfx'].get('out')}
                            if sfx_kept else None),
             'ending_overlay': (dict(params['ending_overlay'], path=os.path.join(bdir, ov_kept)) if ov_kept else None)}
     ext = pipeline.EXPORT_FORMATS[fmt]['ext']
@@ -2288,6 +2291,14 @@ def _num_or(v, default):
         return default
 
 
+def _sfx_point(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(f, 3) if math.isfinite(f) and 0.0 <= f < 3600.0 else None
+
+
 def _resolve_ending_sfx(opts):
     """The ending's sound effect as {'path', 'name', 'gain'} (or None), or an error to show.
     It is a file picked from the SFX folder with Browse library: only a name that this
@@ -2299,7 +2310,11 @@ def _resolve_ending_sfx(opts):
     ext = os.path.splitext(name)[1].lower().lstrip('.')
     if not name.startswith('net_') or ext not in pipeline.AUDIO_EXTENSIONS or not os.path.isfile(path):
         return None, 'The ending sound effect is no longer available -- pick it again.'
-    return {'path': path, 'name': re.sub(r'^net_\d+_', '', name), 'gain': opts.get('ending_sfx_gain') or 0.0}, None
+    a, b = opts.get('ending_sfx_in'), opts.get('ending_sfx_out')
+    if a is not None and b is not None and b <= a:
+        a = b = None
+    return {'path': path, 'name': re.sub(r'^net_\d+_', '', name), 'gain': opts.get('ending_sfx_gain') or 0.0,
+            'in': a, 'out': b}, None
 
 
 _OVERLAY_EXTS = {'mov', 'webm', 'mp4', 'mkv', 'avi'}
@@ -2363,6 +2378,9 @@ def _render_options(data):
             'ending_motion': sc.clamp_choice(data.get('ending_motion'), sc.CLIFF_MOTIONS, sc.DEFAULT_MOTION),
             'ending_sfx_name': os.path.basename(str(data.get('ending_sfx') or '').strip()),
             'ending_sfx_gain': max(-30.0, min(6.0, _num_or(data.get('ending_sfx_gain'), 0.0))),
+            # One sound out of a file that holds several: from here to there, in seconds (blank = the whole file).
+            'ending_sfx_in': _sfx_point(data.get('ending_sfx_in')),
+            'ending_sfx_out': _sfx_point(data.get('ending_sfx_out')),
             # What is handed over: MP4 unless one of the other formats is named.
             'format': data.get('format') if data.get('format') in SHORTS_FORMATS else 'mp4_high',
             # How loud: this tab's usual level unless another is asked for.
@@ -2387,6 +2405,46 @@ def api_shorts_sfx_preview(name):
     resp = send_file(path, mimetype=_SFX_PREVIEW_EXTS[ext], conditional=True)
     resp.headers['Cache-Control'] = 'private, max-age=300'
     return resp
+
+
+@app.route('/api/shorts/sfx-split/<name>')
+@require_permission('vertical_shorts')
+def api_shorts_sfx_split(name):
+    """The separate sounds inside one effect file (a whoosh, then a hit, then a tail ...), found where the
+    sound drops to near silence, each as {index, start, end} in seconds, so each can be heard and picked alone.
+    Same rule as the preview: only a file this server staged from the library."""
+    ext = os.path.splitext(name)[1].lower()
+    if os.path.basename(name) != name or not name.startswith('net_') or ext not in _SFX_PREVIEW_EXTS:
+        return jsonify(ok=False, error='That is not a sound effect picked from the library.'), 404
+    path = pipeline.staged_path(name)
+    if not os.path.isfile(path):
+        return jsonify(ok=False, error='That sound effect is no longer available -- pick it again.'), 404
+    total = pipeline.probe_duration(path) or 0.0
+    return jsonify(ok=True, duration=round(total, 3), sounds=_split_sounds(path, total))
+
+
+def _split_sounds(path, total, noise_db=-42.0, min_gap=0.12, min_len=0.06):
+    """[{index, start, end}] for the stretches of `path` that carry sound, split at gaps of `min_gap` seconds or more
+    quieter than `noise_db`. A file with one sound, or none found, gives [] (nothing to choose between)."""
+    if total <= 0:
+        return []
+    quiet = sorted(pipeline._detect_silence_intervals(path, noise_db=noise_db, min_dur=min_gap, sample_rate=16000))
+    loud, a = [], 0.0
+    for s0, s1 in quiet:
+        if s0 - a >= min_len:
+            loud.append((a, s0))
+        a = max(a, s1)
+    if total - a >= min_len:
+        loud.append((a, total))
+    if len(loud) < 2:
+        return []
+    pad_in, pad_out = 0.02, 0.06                      # a breath of room either side, never into the next sound
+    out = []
+    for k, (s0, s1) in enumerate(loud):
+        lo = max(0.0, s0 - pad_in, loud[k - 1][1] if k else 0.0)
+        hi = min(total, s1 + pad_out, loud[k + 1][0] if k + 1 < len(loud) else total)
+        out.append({'index': k + 1, 'start': round(lo, 3), 'end': round(max(hi, lo + min_len), 3)})
+    return out
 
 
 @app.route('/api/shorts/options')
@@ -3712,7 +3770,7 @@ def api_shorts_project(pid):
 
 _SEL_TEXT = ('highlight_color', 'cut_join', 'ending_look', 'ending_motion', 'mode', 'language', 'focus', 'avoid', 'leave_out', 'stt_prompt', 'vision_model', 'story_model',
              'reframe', 'subtitle_size', 'ending', 'format', 'loudness')
-_SEL_NUM = ('min_dur', 'max_dur', 'count', 'vision_frames', 'ending_hold', 'ending_zoom', 'ending_fade', 'ending_sfx_gain', 'parts_shown')
+_SEL_NUM = ('min_dur', 'max_dur', 'count', 'vision_frames', 'ending_hold', 'ending_zoom', 'ending_fade', 'ending_sfx_gain', 'ending_sfx_in', 'ending_sfx_out', 'parts_shown')
 _SEL_BOOL = ('word_highlight', 'speaker', 'subtitles', 'episode_labels', 'fade_last', 'caption_drop_sounds', 'caption_drop_speakers')
 _SEL_LIST = ('exclude_kinds',)
 _SEL_FILES = re.compile(r'^(?:shorts_file\d{0,2}|shorts_caption\d{0,2}|shorts_sfx|shorts_overlay)$')
@@ -3803,7 +3861,7 @@ def _restage(kept):
 # --- Templates: the Output settings under a name, shared by everyone with Vertical Shorts -----------------
 TEMPLATE_KEYS = ('reframe', 'speaker', 'subtitles', 'subtitle_size', 'episode_labels', 'word_highlight',
                  'highlight_color', 'cut_join', 'ending', 'ending_hold', 'ending_zoom', 'ending_look', 'ending_motion',
-                 'fade_last', 'ending_fade', 'ending_sfx_gain', 'format', 'loudness')
+                 'fade_last', 'ending_fade', 'ending_sfx_gain', 'ending_sfx_in', 'ending_sfx_out', 'format', 'loudness')
 TEMPLATE_NAME_MAX, TEMPLATES_MAX = 60, 100
 _TEMPLATES_LOCK = threading.Lock()
 

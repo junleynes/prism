@@ -4016,7 +4016,12 @@ def build_render_cmd(ffmpeg, src, out_path, start_f, n_frames, info, segs, ass_n
             ramp = min(0.25, room_s / 2)
             ms = int(round(begins * 1000))
             gain = max(-40.0, min(12.0, float(ending_sfx.get('gain') or 0.0)))
-            sfx_chain = (f'[1:a]aresample=48000,aformat=channel_layouts=stereo,'
+            pick = ''
+            s_in, s_out = ending_sfx.get('in'), ending_sfx.get('out')
+            if s_in is not None and s_out is not None and float(s_out) > float(s_in):
+                # One sound out of a file that holds several.
+                pick = f'atrim=start={float(s_in):.3f}:end={float(s_out):.3f},asetpts=PTS-STARTPTS,'
+            sfx_chain = (f'[1:a]{pick}aresample=48000,aformat=channel_layouts=stereo,'
                          f'silenceremove=start_periods=1:start_threshold=-50dB:start_duration=0.01:start_silence=0.01,volume={gain:.1f}dB,'
                          f'atrim=end={room_s:.3f},afade=t=out:st={max(0.0, room_s - ramp):.3f}:d={ramp:.3f},'
                          f'adelay={ms}|{ms},apad=whole_dur={total:.3f}')

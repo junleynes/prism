@@ -8502,6 +8502,8 @@ document.getElementById('vf').addEventListener('submit', async function(e){
       <input type=number id=sh-ending-sfx-gain min=-30 max=6 step=1 value=0 style="width:64px;margin:0;padding:5px 7px;font-size:12px"> dB
     </span>
     </span>
+    <input type=hidden id=sh-sfx-in value=""><input type=hidden id=sh-sfx-out value="">
+    <div id=sh-sfx-sounds style="display:none;margin:8px 0 2px"></div>
     <div class="sh-note" style="margin:6px 0 0">The effect comes in the instant the picture stops and goes out with the black. It is mixed in after the dialogue is levelled, so the Audio level setting applies to the dialogue, not to the effect.</div>
   </div>
         <div id=sh-ending-pv style="margin-top:10px;display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
@@ -9019,6 +9021,69 @@ var shSfxAudio = null
 function shSfxStop(){
   if(shSfxAudio){ try{ shSfxAudio.pause() }catch(e){} shSfxAudio = null }
   var b = shEl('sh-sfx-play'); if(b) b.innerHTML = '&#9654; Play'
+  document.querySelectorAll('#sh-sfx-sounds [data-snd-play]').forEach(function(x){ x.innerHTML = '&#9654;' })
+}
+// Plays [from, to] of the picked effect (the whole file when no range is given), at the Level set here.
+function shSfxPlayRange(from, to, btn){
+  var wasThis = shSfxAudio && shSfxAudio._btn === btn
+  shSfxStop()
+  if(wasThis) return
+  var name = shEl('shorts_sfx_network').value
+  if(!name) return
+  var a = new Audio('/api/shorts/sfx-preview/' + encodeURIComponent(name))
+  var gain = parseFloat(shEl('sh-ending-sfx-gain').value) || 0
+  a.volume = Math.max(0, Math.min(1, Math.pow(10, gain / 20)))
+  a._btn = btn
+  a.onended = shSfxStop
+  a.onerror = function(){ shSfxStop(); shNote('The sound effect could not be played: pick it again.', true) }
+  if(to != null) a.ontimeupdate = function(){ if(a.currentTime >= to){ shSfxStop() } }
+  a.addEventListener('loadedmetadata', function(){ if(from) a.currentTime = from })
+  shSfxAudio = a
+  if(btn) btn.innerHTML = '&#9632;'
+  a.play().catch(function(){ shSfxStop() })
+}
+// The separate sounds inside the picked file: each with its own play button, one of them (or the whole file) used.
+var shSfxSplitFor = null
+async function shSfxSplit(){
+  var box = shEl('sh-sfx-sounds'), name = shEl('shorts_sfx_network').value
+  if(!box) return
+  if(!name){ box.style.display = 'none'; box.innerHTML = ''; shEl('sh-sfx-in').value = ''; shEl('sh-sfx-out').value = ''; shSfxSplitFor = null; return }
+  if(name === shSfxSplitFor) return
+  shSfxSplitFor = name
+  var keepIn = parseFloat(shEl('sh-sfx-in').value)
+  var d
+  try{ d = await (await fetch('/api/shorts/sfx-split/' + encodeURIComponent(name))).json() }
+  catch(e){ return }
+  if(name !== shEl('shorts_sfx_network').value) return
+  var sounds = (d && d.ok && d.sounds) || []
+  if(sounds.length < 2){ box.style.display = 'none'; box.innerHTML = ''; shEl('sh-sfx-in').value = ''; shEl('sh-sfx-out').value = ''; return }
+  var fmt = function(s){ return (Math.round(s * 100) / 100).toFixed(2) + ' s' }
+  var picked = 0
+  sounds.forEach(function(s, i){ if(isFinite(keepIn) && Math.abs(s.start - keepIn) < 0.05) picked = i + 1 })
+  var rows = ['<label style="display:flex;gap:8px;align-items:center;margin:2px 0;font-weight:normal"><input type=radio name=sh-sfx-pick value=0' + (picked ? '' : ' checked') + '> ' +
+    '<button type=button class="browse-btn" data-snd-play data-from="" data-to="" style="padding:2px 8px">&#9654;</button> Whole file (all ' + sounds.length + ' sounds, ' + fmt(d.duration) + ')</label>']
+  sounds.forEach(function(s, i){
+    rows.push('<label style="display:flex;gap:8px;align-items:center;margin:2px 0;font-weight:normal"><input type=radio name=sh-sfx-pick value=' + (i + 1) + (picked === i + 1 ? ' checked' : '') + '> ' +
+      '<button type=button class="browse-btn" data-snd-play data-from="' + s.start + '" data-to="' + s.end + '" style="padding:2px 8px">&#9654;</button> ' +
+      'Sound ' + s.index + ' <span style="opacity:.65">' + fmt(s.start) + ' &ndash; ' + fmt(s.end) + ' (' + fmt(s.end - s.start) + ')</span></label>')
+  })
+  box.innerHTML = '<div class="sh-note" style="margin:0 0 4px"><b>This file holds ' + sounds.length + ' sounds.</b> Play each one, then pick the one the ending should use.</div>' + rows.join('')
+  box.style.display = 'block'
+  var apply = function(){
+    var r = box.querySelector('input[name=sh-sfx-pick]:checked'), n = r ? parseInt(r.value, 10) : 0
+    shEl('sh-sfx-in').value = n ? sounds[n - 1].start : ''
+    shEl('sh-sfx-out').value = n ? sounds[n - 1].end : ''
+    if(typeof shSelSchedule === 'function') shSelSchedule()
+    if(typeof shEndingPreviewSoon === 'function') shEndingPreviewSoon()
+  }
+  box.querySelectorAll('input[name=sh-sfx-pick]').forEach(function(r){ r.addEventListener('change', apply) })
+  box.querySelectorAll('[data-snd-play]').forEach(function(b){
+    b.addEventListener('click', function(){
+      var f = b.getAttribute('data-from'), to = b.getAttribute('data-to')
+      shSfxPlayRange(f === '' ? 0 : parseFloat(f), to === '' ? null : parseFloat(to), b)
+    })
+  })
+  apply()
 }
 function shSfxPreview(){
   if(shSfxAudio){ shSfxStop(); return }
@@ -9029,6 +9094,12 @@ function shSfxPreview(){
   a.volume = Math.max(0, Math.min(1, Math.pow(10, gain / 20)))
   a.onended = shSfxStop
   a.onerror = function(){ shSfxStop(); shNote('The sound effect could not be played: pick it again.', true) }
+  // The sound picked out of the file is what is heard here too.
+  var pf = parseFloat(shEl('sh-sfx-in').value), pt = parseFloat(shEl('sh-sfx-out').value)
+  if(isFinite(pf) && isFinite(pt) && pt > pf){
+    a.addEventListener('loadedmetadata', function(){ a.currentTime = pf })
+    a.ontimeupdate = function(){ if(a.currentTime >= pt) shSfxStop() }
+  }
   shSfxAudio = a
   shEl('sh-sfx-play').innerHTML = '&#9632; Stop'
   a.play().catch(function(){ shSfxStop() })
@@ -9039,6 +9110,7 @@ function shSfxSync(){
   var has = !!shEl('shorts_sfx_network').value
   b.style.display = has ? '' : 'none'
   if(!has) shSfxStop()
+  shSfxSplit()
   // The transition overlay is shown in the ending preview: picked or cleared, it is made again.
   var ov = shEl('shorts_overlay_network').value
   if(ov !== shSfxSync._ov){ shSfxSync._ov = ov; shEndingPreviewSoon() }
@@ -9128,6 +9200,8 @@ function shRenderOptions(){
           ending_fade: shEl('sh-ending-fade').value,
           ending_sfx: shEl('shorts_sfx_network').value,
           ending_sfx_gain: shEl('sh-ending-sfx-gain').value,
+          ending_sfx_in: shEl('sh-sfx-in').value,
+          ending_sfx_out: shEl('sh-sfx-out').value,
           format: shEl('sh-format').value,
           loudness: shEl('sh-level').value}
 }
@@ -11644,7 +11718,7 @@ var SH_SEL = {
          stt_prompt: 'sh-stt-prompt', vision_model: 'sh-vision-model', story_model: 'sh-story-model', reframe: 'sh-reframe',
          subtitle_size: 'sh-caption-size', highlight_color: 'sh-hl-color', cut_join: 'sh-cut-join', ending_look: 'sh-ending-look', ending_motion: 'sh-ending-motion', ending: 'sh-ending', format: 'sh-format', loudness: 'sh-level'},
   num: {min_dur: 'sh-min', max_dur: 'sh-max', vision_frames: 'sh-frames', ending_hold: 'sh-ending-hold', ending_zoom: 'sh-ending-zoom',
-        ending_fade: 'sh-ending-fade', ending_sfx_gain: 'sh-ending-sfx-gain'},
+        ending_fade: 'sh-ending-fade', ending_sfx_gain: 'sh-ending-sfx-gain', ending_sfx_in: 'sh-sfx-in', ending_sfx_out: 'sh-sfx-out'},
   bool: {word_highlight: 'sh-word-hl', speaker: 'sh-speaker', subtitles: 'sh-captions', episode_labels: 'sh-ep-labels', fade_last: 'sh-fade-last',
          caption_drop_sounds: 'sh-cap-sounds', caption_drop_speakers: 'sh-cap-speakers'}
 }
