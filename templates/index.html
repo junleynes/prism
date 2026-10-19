@@ -12535,8 +12535,12 @@ function spRenderWork(){
     (d.layered ? n + ' layers' : 'a flat image') +
     (d.pages.length ? ' &middot; ' + d.pages.length + ' page' + (d.pages.length === 1 ? '' : 's') : '') +
     '. Check what each one will do; change any that is wrong. A group can be split into its own layers.'
-  spEl('sp-warnings').innerHTML = (d.notes || []).map(function(w){ return '<div class="sh-warn">' + escapeHtmlLite(w) + '</div>' }).join('')
+  spEl('sp-warnings').innerHTML = (d.notes || []).map(function(w){ return '<div class="sh-warn">' + escapeHtmlLite(w) + '</div>' }).join('') +
+    (d.flat ? '<div style="margin:6px 0"><button type=button class="btn-sm" data-sp-force>Animate by layers anyway</button>' +
+      '<span class="sh-note" style="margin-left:8px">Skips the check against the file\'s own picture; layers with blend modes or effects may then look different.</span></div>' : '')
   spEl('sp-layer-count').textContent = n + (n === 1 ? ' layer' : ' layers')
+  var forceBtn = spEl('sp-warnings').querySelector('[data-sp-force]')
+  if(forceBtn) forceBtn.addEventListener('click', function(){ SP.ov.force = true; spStale(); spInspect({keep: true}) })
   var host = spEl('sp-layers'), keep = host.scrollTop
   host.innerHTML = ''
   d.layers.forEach(function(l){

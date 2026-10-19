@@ -410,6 +410,8 @@ def clean_overrides(raw):
     out = {'background_upto': None, 'expand': [], 'layers': {}}
     if not isinstance(raw, dict):
         return out
+    if raw.get('force') is True:
+        out['force'] = True          # animate layer by layer even where the file's own picture says it may not match
     if raw.get('background_upto') is not None:
         out['background_upto'] = _path_key(raw['background_upto'])
     seen = set()
@@ -600,6 +602,7 @@ def _load_psd(path, canvas, overrides=None, report=None):
     # stack, a marker for it ({'page_slot': k}) to be replaced by its rows.
     ov_layers = (overrides or {}).get('layers') or {}
     bg_path = (overrides or {}).get('background_upto')
+    force = bool((overrides or {}).get('force'))
     if bg_path is None:
         # A layer or group named SCHED BG is the background, whatever is under it: the topmost one that is switched on.
         named = [str(ci) for ci, top_layer in enumerate(psd) if _BG_NAME.match(str(top_layer.name or '')) and top_layer.visible]
@@ -731,10 +734,13 @@ def _load_psd(path, canvas, overrides=None, report=None):
     flat_reason = None
     if not layers:
         flat_reason = 'no visible layer in it has pixels PRISM can read'
-    elif reference is not None and ov_layers:
-        # The editor has switched layers on or off, so the file's own
-        # picture no longer says what the result should look like.
-        if not plain:
+    elif reference is not None and (ov_layers or force):
+        # The editor has switched layers on or off (or asked for the layers to be animated as they are), so the
+        # file's own picture no longer says what the result should look like.
+        if force and not ov_layers:
+            notes.append('Animated layer by layer, as you asked, without checking it against the file\'s own picture. '
+                         'Layers with blend modes, effects or masks may look different here; check the result.')
+        elif not plain:
             notes.append('Some layers use blend modes, effects or clipping, which are not reproduced when a layer '
                          'is animated on its own; check the result against the artwork.')
     elif reference is not None:
@@ -747,8 +753,9 @@ def _load_psd(path, canvas, overrides=None, report=None):
                             - want.astype(np.int16)).mean())
         if diff > 2.5:
             flat_reason = ('its layers use blend modes, effects, masks or adjustment layers that cannot be '
-                           'animated one at a time without changing how the artwork looks')
-    elif not plain and not ov_layers:
+                           'animated one at a time without changing how the artwork looks (stacked as layers they '
+                           f'differ from the file\'s own picture by {diff:.1f} levels; up to 2.5 is allowed)')
+    elif not plain and not ov_layers and not force:
         flat_reason = ('its layers use blend modes or effects and the file was saved without a flattened '
                        'preview to check the result against')
     if flat_reason:
@@ -1059,7 +1066,8 @@ def inspect_artwork(path, canvas=CANVAS, overrides=None):
         previews.append({'label': 'The artwork', 'image': _data_uri(_flatten(layers, canvas), 640)})
     roles = [e['role'] for e in art['report']]
     bg = [e['index'] for e in art['report'] if e['role'] == 'background']
-    return {'size': list(art['size']), 'layered': art['layered'], 'notes': art['notes'],
+    flat_file = any(e.get('role') == 'flat' for e in art['report'])
+    return {'size': list(art['size']), 'layered': art['layered'], 'flat': flat_file, 'notes': art['notes'],
             'layers': art['report'], 'previews': previews,
             'pages': [{'name': pg['name'], 'rows': pg['rows'], 'shown': pg['shown']} for pg in pages],
             'counts': {'content': roles.count('content'), 'decor': roles.count('decor'),

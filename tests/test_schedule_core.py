@@ -1328,3 +1328,16 @@ def test_a_layer_named_sched_bg_is_the_background_and_what_is_under_it_stays_sti
     assert len(art['pages']) == 2
     rep = sk.load_artwork(str(path), with_report=True)['report']
     assert {e['name']: e['role'] for e in rep}['SCHED BG'] == 'background'
+
+
+def test_a_file_that_would_be_flat_can_be_animated_by_layers_when_asked(tmp_path, monkeypatch):
+    path = _inspect_psd(tmp_path / 'p.psd')
+    real = sk._flatten
+    monkeypatch.setattr(sk, '_flatten', lambda layers, canvas: np.zeros_like(real(layers, canvas)))
+    flat = sk.inspect_artwork(path)
+    assert flat['flat'] and not flat['layered']
+    assert any('differ from the file' in n and 'levels' in n for n in flat['notes'])
+    forced = sk.inspect_artwork(path, overrides={'force': True})
+    assert forced['layered'] and not forced['flat']
+    assert any('as you asked' in n for n in forced['notes'])
+    assert sk.clean_overrides({'force': True})['force'] is True and 'force' not in sk.clean_overrides({'force': 'yes'})
