@@ -1341,3 +1341,18 @@ def test_a_file_that_would_be_flat_can_be_animated_by_layers_when_asked(tmp_path
     assert forced['layered'] and not forced['flat']
     assert any('as you asked' in n for n in forced['notes'])
     assert sk.clean_overrides({'force': True})['force'] is True and 'force' not in sk.clean_overrides({'force': 'yes'})
+
+
+def test_a_file_with_a_sched_bg_layer_is_animated_by_layers_even_if_it_differs_from_its_preview(tmp_path, monkeypatch):
+    psd = psd_tools.PSDImage.new('RGB', (W, H), color=0)
+    for name, box, col in (('SCHED BG', [0, 0, W, H], (20, 30, 90, 255)), ('Show', [500, 300, 1400, 400], (255, 255, 255, 255))):
+        im = _block(box, col)
+        b = im.getbbox()
+        psd.append(psd.create_pixel_layer(im.crop(b), name=name, top=b[1], left=b[0]))
+    path = str(tmp_path / 'n.psd')
+    psd.save(path)
+    real = sk._flatten
+    monkeypatch.setattr(sk, '_flatten', lambda layers, canvas: np.zeros_like(real(layers, canvas)))
+    info = sk.inspect_artwork(path)
+    assert info['layered'] and not info['flat']
+    assert any('SCHED BG' in n and 'levels' in n for n in info['notes'])

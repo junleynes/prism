@@ -603,11 +603,13 @@ def _load_psd(path, canvas, overrides=None, report=None):
     ov_layers = (overrides or {}).get('layers') or {}
     bg_path = (overrides or {}).get('background_upto')
     force = bool((overrides or {}).get('force'))
+    by_name = False
     if bg_path is None:
         # A layer or group named SCHED BG is the background, whatever is under it: the topmost one that is switched on.
         named = [str(ci) for ci, top_layer in enumerate(psd) if _BG_NAME.match(str(top_layer.name or '')) and top_layer.visible]
         if named:
             bg_path = named[-1]
+            by_name = True
     expand = set((overrides or {}).get('expand') or [])
     notes, layers, plain, found = [], [], True, []
     seq, seq_at = 0, {}
@@ -751,7 +753,12 @@ def _load_psd(path, canvas, overrides=None, report=None):
         paste(want, ref_layer['px'], ref_layer['x'], ref_layer['y'])
         diff = float(np.abs(_flatten(with_pages(layers, only_shown=True), canvas).astype(np.int16)
                             - want.astype(np.int16)).mean())
-        if diff > 2.5:
+        if diff > 2.5 and by_name:
+            # The file is built to the SCHED BG / SHOWS n convention, so the layers are meant to be played as layers.
+            notes.append(f'Animated layer by layer because the file uses SCHED BG / SHOWS n names, although stacked as layers '
+                         f'it differs from the file\'s own picture by {diff:.1f} levels (blend modes, effects or masks); '
+                         'check the result against the artwork.')
+        elif diff > 2.5:
             flat_reason = ('its layers use blend modes, effects, masks or adjustment layers that cannot be '
                            'animated one at a time without changing how the artwork looks (stacked as layers they '
                            f'differ from the file\'s own picture by {diff:.1f} levels; up to 2.5 is allowed)')
