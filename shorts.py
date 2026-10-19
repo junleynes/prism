@@ -2495,8 +2495,8 @@ def api_shorts_analyze():
     # Checked before the source is resolved: resolving a direct upload
     # writes the whole file to disk, which is not worth doing for a request
     # that is about to be refused anyway.
-    min_dur = _form_num('min_dur', 60, 5, 240)
-    max_dur = _form_num('max_dur', 120, 10, SHORTS_MAX_CLIP)
+    min_dur = _form_num('min_dur', 120, 5, 240)
+    max_dur = _form_num('max_dur', 180, 10, SHORTS_MAX_CLIP)
     if max_dur < min_dur + 5:
         return jsonify(error='The maximum length must be at least 5 seconds more than the minimum.'), 400
     # Before the source too, for the same reason: shorts are filed under a

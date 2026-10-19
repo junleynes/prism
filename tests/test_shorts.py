@@ -1429,7 +1429,7 @@ def test_lengths_default_to_60_to_120_seconds_and_a_hundred_moments_can_be_asked
         assert client.post('/api/shorts/analyze', data=data, headers=headers).status_code == 200
         return started[-1]
     p = post()
-    assert (p['min_dur'], p['max_dur'], p['count']) == (60, 120, 8)
+    assert (p['min_dur'], p['max_dur'], p['count']) == (120, 180, 8)
     assert [post(count=c)['count'] for c in ('50', '100', '250', 'auto', 'AUTO', 'lots')] == \
         [50, 100, 100, 'auto', 'auto', 8]
 
