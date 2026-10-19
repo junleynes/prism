@@ -1087,8 +1087,9 @@ def test_a_length_is_suggested_from_the_pages():
     assert sk.suggest_duration([])[0] == 10
     assert sk.suggest_duration([{'rows': 4}, {'rows': 4}])[0] == 15
     assert sk.suggest_duration([{'rows': 5}] * 3)[0] in (20, 30)
-    d, why = sk.suggest_duration([{'rows': 8}] * 9)
-    assert d == 30 and 'more than the longest' in why
+    assert sk.suggest_duration([{'rows': 4}] * 5)[0] == 30 and sk.suggest_duration([{'rows': 4}] * 8)[0] == 45
+    d, why = sk.suggest_duration([{'rows': 8}] * 20)
+    assert d == 60 and 'more than the longest' in why
 
 
 def test_a_look_is_kept_by_layer_name_and_fits_another_file(tmp_path):

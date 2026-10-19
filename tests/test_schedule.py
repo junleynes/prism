@@ -171,7 +171,7 @@ def test_tab_is_registered_under_create_and_gated_by_its_own_permission(users_db
 def test_options_and_the_artwork_network_folder():
     client, _ = _client()
     d = client.get('/api/schedule/options').get_json()
-    assert d['ok'] and d['durations'] == [10, 15, 20, 30] and d['psd_supported'] is True
+    assert d['ok'] and d['durations'] == [10, 15, 20, 30, 45, 60] and d['psd_supported'] is True
     assert [f['key'] for f in d['formats']] == list(pipeline.EXPORT_FORMATS)
     cat = pipeline._network_categories()['schedule']
     assert {'psd', 'png', 'jpg', 'tif'} <= cat['exts'] and 'mp4' not in cat['exts'] and 'fallback' not in cat
@@ -189,7 +189,7 @@ def test_render_refuses_bad_requests_before_starting_a_job(env, monkeypatch):
         return client.post('/api/schedule/render', data=form, headers=headers)
     for bad in ('12', '0', 'abc', '', '300'):
         r = post(schedule_image_network=env['psd'], duration=bad)
-        assert r.status_code == 400 and '10, 15, 20, 30' in r.get_json()['error'], bad
+        assert r.status_code == 400 and '10, 15, 20, 30, 45, 60' in r.get_json()['error'], bad
     assert 'Pick the schedule artwork' in post(duration='15').get_json()['error']
     assert post(duration='15', schedule_image_network='net_1_gone.psd').status_code == 400
     assert post(duration='15', schedule_image_network='../../etc/passwd').status_code == 400

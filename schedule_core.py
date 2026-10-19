@@ -40,7 +40,7 @@ import numpy as np
 
 
 CANVAS = (1920, 1080)
-DURATIONS = (10, 15, 20, 30)
+DURATIONS = (10, 15, 20, 30, 45, 60)
 IMAGE_EXTENSIONS = {'psd', 'psb', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'webp', 'bmp'}
 MAX_LAYERS = 12             # more than this and the lowest ones are merged into the background
 EFFECTS = ('wipe', 'slide', 'fade', 'pop', 'cut')
