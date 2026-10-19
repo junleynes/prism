@@ -249,6 +249,8 @@ _SCHED_BG_NAME = re.compile(r'^\s*sched(?:ule)?[\s_.-]*bg\b', re.I)
 _BG_NAME = re.compile(r'^\s*(?:(?:sched(?:ule)?[\s_.-]*)?(?:bg|background)|sched(?:ule)?[\s_.-]*bg)\b', re.I)
 _START_NAME = re.compile(r'^\s*(?:start|intro|opening|opener|open)\s*(?:card|slide|page)?\s*$', re.I)
 _END_NAME = re.compile(r'^\s*(?:end|outro|closing|closer|close|ending)\s*(?:card|slide|page)?\s*$', re.I)
+_DAYPART_NAME = re.compile(r'^\s*(?:early\s+|late\s+)?(morning|afternoon|evening|night)\b', re.I)
+DAYPARTS = {'morning': 1, 'afternoon': 2, 'evening': 3, 'night': 4}     # a page named for its part of the day
 START_PAGE, END_PAGE = 0, 999       # an opening card plays before page 1, a closing card after the last page
 MAX_PAGE_ROWS = 10
 
@@ -268,7 +270,10 @@ def page_number(name):
     if _END_NAME.match(str(name or '')):
         return END_PAGE
     m = _PAGE_NAME.match(str(name or ''))
-    return int(m.group(1)) if m else None
+    if m:
+        return int(m.group(1))
+    m = _DAYPART_NAME.match(str(name or ''))
+    return DAYPARTS[m.group(1).lower()] if m else None
 
 
 def card_kind(number):

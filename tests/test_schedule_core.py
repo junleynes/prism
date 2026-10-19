@@ -1386,3 +1386,8 @@ def test_start_and_end_groups_are_the_opening_and_closing_cards_even_when_hidden
     assert [p['name'] for p in info['pages']] == ['START', 'Schedule 1', 'END']
     cards = {l['name']: l.get('card') for l in info['layers'] if l['role'] == 'page'}
     assert cards == {'START': 'start', 'Schedule 1': None, 'END': 'end'}
+
+
+def test_parts_of_the_day_are_pages_in_day_order():
+    assert [sk.page_number(n) for n in ('Morning', 'AFTERNOON', 'Evening', 'Late night', 'evening copy')] == [1, 2, 3, 4, 3]
+    assert sk.page_number('Eveningwear') is None and sk.page_number('Logo') is None
