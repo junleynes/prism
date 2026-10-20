@@ -2126,6 +2126,8 @@ EXPORT_FORMATS = {
     'prores_hq_2997':  {'ext': 'mov', 'label': 'Apple ProRes 422 HQ — 29.97fps'},
     'prores_hq_2398':  {'ext': 'mov', 'label': 'Apple ProRes 422 HQ — 23.976fps'},
     'avci100i':        {'ext': 'mov', 'label': 'AVC-Intra 100i (H.264 Intra approximation)'},
+    # 9:16 upload file for TikTok (also fine for Reels and Shorts); listed for Vertical Shorts only.
+    'tiktok':          {'ext': 'mp4', 'label': 'TikTok upload (MP4 1080x1920, 30 fps, H.264 + AAC)', 'vertical': True},
 }
 
 # ---- Audio level (integrated loudness of the finished file) ----
@@ -2374,6 +2376,15 @@ def build_export_cmd(src, dst, fmt_key):
                 '-c:v', 'libx264', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
                 '-preset', 'slow', '-crf', '16',
                 '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', dst]
+    if fmt_key == 'tiktok':
+        # TikTok's recommended spec: 1080x1920, 9:16, 30 fps, H.264 + AAC, MP4, capped bitrate
+        # so a long short stays well under the upload size limit.
+        return [FFMPEG, '-y', '-i', src,
+                '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,'
+                       'pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30',
+                '-c:v', 'libx264', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
+                '-preset', 'slow', '-crf', '18', '-maxrate', '12M', '-bufsize', '24M',
+                '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-movflags', '+faststart', dst]
     if fmt_key == 'prores_hq_2997':
         return [FFMPEG, '-y', '-i', src, '-vf', 'fps=30000/1001',
                 '-c:v', 'prores_ks', '-profile:v', '3', '-vendor', 'apl0',

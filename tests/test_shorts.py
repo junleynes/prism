@@ -4143,3 +4143,11 @@ def test_re_rendering_one_chapter_keeps_its_cliffhanger_even_with_fade_last():
     assert shorts._is_final_short(a, {}, 2, 2, 5) is True         # the programme's last chapter
     assert shorts._is_final_short({}, {}, 1, 1, None) is False    # one moment alone is not "the last"
     assert shorts._is_final_short({}, {}, 3, 3, None) is True
+
+
+def test_tiktok_delivery_format():
+    import pipeline
+    assert 'tiktok' in shorts.SHORTS_FORMATS
+    cmd = pipeline.build_export_cmd('in.mp4', 'out.mp4', 'tiktok')
+    assert '1080:1920' in ' '.join(cmd) and 'fps=30' in ' '.join(cmd)
+    assert pipeline.EXPORT_FORMATS['tiktok']['ext'] == 'mp4'

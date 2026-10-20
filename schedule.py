@@ -346,7 +346,7 @@ def api_schedule_options():
     except ImportError:
         psd = False
     return jsonify(ok=True, durations=list(sk.DURATIONS),
-                   formats=[{'key': k, 'label': v['label']} for k, v in pipeline.EXPORT_FORMATS.items()],
+                   formats=[{'key': k, 'label': v['label']} for k, v in pipeline.EXPORT_FORMATS.items() if not v.get('vertical')],
                    loudness=_house_loudness(), levels=pipeline.loudness_choices(_house_loudness()),
                    styles=[{'key': k, 'label': label, 'arrives': v['effect'], 'then': v['ambient'],
                              'mood': 'Calm' if v['ambient'] in ('none', 'shine', 'float', 'breathe') else 'Lively'}

@@ -8716,10 +8716,13 @@ function shFillLevels(sel, levels){
 function shFormatNote(){
   var note = shEl('sh-format-note'), sel = shEl('sh-format')
   if(!note || !sel) return
-  var prores = sel.value.indexOf('prores') === 0
-  note.style.display = prores ? 'block' : 'none'
+  var prores = sel.value.indexOf('prores') === 0, tt = sel.value === 'tiktok'
+  note.style.display = (prores || tt) ? 'block' : 'none'
   note.innerHTML = prores ? '<b>ProRes 422 HQ</b> is a large file: roughly 1.3&ndash;1.7 GB per minute at this size. ' +
-    'Each short is still rendered as an MP4 too, which is what plays here; the .mov is what Download, Download all and Send hand over.' : ''
+    'Each short is still rendered as an MP4 too, which is what plays here; the .mov is what Download, Download all and Send hand over.' :
+    tt ? '<b>TikTok upload</b>: MP4, 1080&times;1920 (9:16), 30 fps, H.264 + AAC at up to 12 Mb/s. ' +
+    'Each short is still rendered as the usual MP4 for playing here; the TikTok file is what Download, Download all and Send hand over. ' +
+    'Pair it with the &minus;14 LUFS audio level.' : ''
 }
 
 function shModeSync(){
