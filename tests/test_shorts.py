@@ -2484,7 +2484,7 @@ def test_options_reports_models_and_what_this_server_can_do(env, monkeypatch):
     assert d['face_detector'] in ('haar', 'yunet') and isinstance(d['captions_available'], bool)
     assert d['max_items'] == 100 and d['default_vision_model'] and d['auto_min_story'] == 6
     # The delivery formats: what the rest of PRISM exports, without AVC-Intra (a 1920x1080 format).
-    assert [f['key'] for f in d['formats']] == ['mp4_high', 'prores_hq_2997', 'prores_hq_2398']
+    assert [f['key'] for f in d['formats']] == ['mp4_high', 'prores_hq_2997', 'prores_hq_2398', 'tiktok']
     assert d['formats'][0] == {'key': 'mp4_high', 'label': 'MP4 (H.264 High Profile)', 'ext': 'mp4'}
     assert d['speaker_default'] is False, '"Follow the speaker" starts unticked unless SHORTS_SPEAKER_CROP says otherwise'
     monkeypatch.setattr(shorts, 'SHORTS_SPEAKER_CROP', True)
