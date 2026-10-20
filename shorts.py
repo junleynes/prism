@@ -4113,11 +4113,18 @@ def api_shorts_batch_delete(bid):
     # been touched and the batch stays listed, intact -- instead of the
     # manifest going and the media it described being left behind unlisted.
     tomb = os.path.join(SHORTS_DIR, f'.deleting_{bid}_{secrets.token_hex(2)}')
-    try:
-        os.rename(_batch_dir(bid), tomb)
-    except OSError:
-        return jsonify(ok=False, error='One of these shorts is in use (playing or downloading). '
-                                       'Close it and try again.'), 409
+    # A browser that has just stopped playing keeps the connection (and so the file) open for a moment,
+    # so it is tried a few times before giving up.
+    for attempt in range(4):
+        try:
+            os.rename(_batch_dir(bid), tomb)
+            break
+        except OSError:
+            if attempt == 3:
+                return jsonify(ok=False, error='One of these shorts is in use (playing, downloading, open in the '
+                                               'caption editor, or open in a File Explorer window). Close it, '
+                                               'wait a few seconds and try again.'), 409
+            time.sleep(0.6)
     shutil.rmtree(tomb, ignore_errors=True)
     audit_log('shorts_delete', target=f"{m.get('orig_name')} ({len(m.get('shorts') or [])} shorts)",
               user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
