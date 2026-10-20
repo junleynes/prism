@@ -2613,7 +2613,7 @@ def test_a_batch_interrupted_by_a_restart_is_settled_at_startup(env):
     assert not os.path.exists(kept)
 
 
-def test_delete_is_all_or_nothing_when_a_file_is_in_use(env, monkeypatch):
+def test_delete_waits_for_a_file_in_use_then_finishes_on_its_own(env, monkeypatch):
     bid = '1700000005_eeeeee'
     d = os.path.join(shorts.SHORTS_DIR, bid)
     os.makedirs(d)
@@ -2625,14 +2625,16 @@ def test_delete_is_all_or_nothing_when_a_file_is_in_use(env, monkeypatch):
     def locked(src, dst):          # what Windows does while a file inside the folder is open
         raise PermissionError(13, 'The process cannot access the file because it is being used by another process')
     monkeypatch.setattr(os, 'rename', locked)
+    monkeypatch.setattr(shorts.time, 'sleep', lambda s: None)
     client, headers = _client()
     r = client.delete(f'/api/shorts/batches/{bid}', headers=headers)
-    assert r.status_code == 409 and 'in use' in r.get_json()['error']
-    assert sorted(os.listdir(d)) == ['a.mp4', 'batch.json'], 'nothing was removed'
-    assert len(client.get('/api/shorts/batches').get_json()['items']) == 1, 'and it is still listed'
-    monkeypatch.setattr(os, 'rename', real)
-    assert client.delete(f'/api/shorts/batches/{bid}', headers=headers).status_code == 200
-    assert os.listdir(shorts.SHORTS_DIR) == []
+    assert r.status_code == 200 and r.get_json().get('pending'), 'no restart needed to get rid of it'
+    assert os.path.exists(os.path.join(d, 'a.mp4')), 'the held file is still there'
+    assert client.get('/api/shorts/batches').get_json()['items'] == [], 'but the batch is gone from the list'
+    assert client.get(f'/api/shorts/file/{bid}/a.mp4').status_code in (403, 404)
+    monkeypatch.setattr(os, 'rename', real)       # the file is let go
+    assert client.get('/api/shorts/batches').get_json()['items'] == []
+    assert os.listdir(shorts.SHORTS_DIR) == [], 'the next listing removed the folder'
 
 
 def test_manifest_write_retries_when_the_file_is_briefly_held(env, monkeypatch):

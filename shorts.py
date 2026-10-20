@@ -527,6 +527,16 @@ def _read_manifest(bdir):
                 m = json.load(f)
         except (OSError, ValueError):
             return None
+    # A batch whose delete is waiting on a file Windows still holds open is gone as far as anything else is concerned.
+    return m if isinstance(m, dict) and not m.get('deleting') else None
+
+
+def _read_manifest_raw(bdir):
+    try:
+        with open(os.path.join(bdir, 'batch.json'), encoding='utf-8') as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        return None
     return m if isinstance(m, dict) else None
 
 
@@ -3693,6 +3703,7 @@ def api_shorts_batches():
     see."""
     want, unfiled = (request.args.get('project_id') or '').strip(), request.args.get('unfiled') in ('1', 'true')
     out = []
+    sweep_pending_deletes()
     for m in _all_manifests():
         filed = m.get('project_id') if m.get('project_id') and sp.load(SHORTS_PROJECTS_DIR, m['project_id']) else None
         if not m.get('shorts') or not _may_see(m):
@@ -4114,16 +4125,27 @@ def api_shorts_batch_delete(bid):
     # manifest going and the media it described being left behind unlisted.
     tomb = os.path.join(SHORTS_DIR, f'.deleting_{bid}_{secrets.token_hex(2)}')
     # A browser that has just stopped playing keeps the connection (and so the file) open for a moment,
-    # so it is tried a few times before giving up.
+    # so it is tried a few times first.
+    bdir = _batch_dir(bid)
     for attempt in range(4):
         try:
-            os.rename(_batch_dir(bid), tomb)
+            os.rename(bdir, tomb)
             break
         except OSError:
             if attempt == 3:
-                return jsonify(ok=False, error='One of these shorts is in use (playing, downloading, open in the '
-                                               'caption editor, or open in a File Explorer window). Close it, '
-                                               'wait a few seconds and try again.'), 409
+                # Still held open (Windows keeps a file a dropped browser connection was reading until the
+                # service lets go of it). Rather than make the person restart the service, the batch is hidden
+                # now and its folder removed as soon as the file is released -- at the next delete or listing,
+                # or at the latest the next start.
+                raw = _read_manifest_raw(bdir)
+                if raw is None:
+                    return jsonify(ok=False, error='One of these shorts is in use. Close it and try again.'), 409
+                raw['deleting'] = True
+                _write_manifest(bdir, raw)
+                audit_log('shorts_delete', target=f"{m.get('orig_name')} ({len(m.get('shorts') or [])} shorts, "
+                          'files still open: removal pending)', user_id=session.get('user_id'),
+                          username=session.get('username'), ip=_client_ip())
+                return jsonify(ok=True, pending=True)
             time.sleep(0.6)
     shutil.rmtree(tomb, ignore_errors=True)
     audit_log('shorts_delete', target=f"{m.get('orig_name')} ({len(m.get('shorts') or [])} shorts)",
@@ -4463,6 +4485,24 @@ def _run_recaption(jid, params):
                     pass
 
 
+def sweep_pending_deletes():
+    """Removes the folders of batches whose delete was waiting on an open file; the ones still held stay for next time."""
+    try:
+        names = [n for n in os.listdir(SHORTS_DIR) if _BATCH_ID.match(n)]
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(SHORTS_DIR, n)
+        raw = _read_manifest_raw(p)
+        if raw and raw.get('deleting'):
+            tomb = os.path.join(SHORTS_DIR, f'.deleting_{n}_{secrets.token_hex(2)}')
+            try:
+                os.rename(p, tomb)
+            except OSError:
+                continue
+            shutil.rmtree(tomb, ignore_errors=True)
+
+
 def settle_interrupted_batches():
     """Run once at import. A batch still marked 'rendering' now belonged to
     a process that no longer exists -- the same reasoning jobs_db_init()
@@ -4492,4 +4532,5 @@ def settle_interrupted_batches():
 
 os.makedirs(SHORTS_DIR, exist_ok=True)
 os.makedirs(SHORTS_PROJECTS_DIR, exist_ok=True)
+sweep_pending_deletes()
 settle_interrupted_batches()
