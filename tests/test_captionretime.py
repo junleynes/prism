@@ -143,3 +143,16 @@ def test_route_retimes_several_scc_files_onto_a_cut_video(monkeypatch):
     assert d['summary']['dropped'] == 4 and len(d['summary']['cuts']) == 1 and abs(d['summary']['cuts'][0]['seconds'] - 16.0) < 1.0
     assert 'MYLA' not in d['srt'] and d['scc'].startswith('Scenarist_SCC')
     assert seen['language'] == 'tl' and seen['prompt'], 'the captions\' own words are given to Whisper'
+
+
+def test_unsure_captions_can_be_dropped_instead_of_kept():
+    S, cut, vt, p1, p2, words = _case()
+    p1 = [dict(c) for c in p1]
+    p1[3]['text'] = 'zzzz qqqq xxxx vvvv'          # nothing like what was said
+    kept = rt.align([p1, p2], words, [])
+    gone = rt.align([p1, p2], words, [], drop_unsure=True)
+    k = next(c for c in kept['cues'] if c['part'] == 0 and c['idx'] == 3)
+    g = next(c for c in gone['cues'] if c['part'] == 0 and c['idx'] == 3)
+    assert k['status'] == 'check' and not k['drop'] and abs(k['new_start'] - vt[3]) < 1.5
+    assert g['drop'] and g['status'] == 'dropped'
+    assert 'zzzz' in rt.write_srt(kept) and 'zzzz' not in rt.write_srt(gone)

@@ -10695,7 +10695,7 @@ def api_stt_retime():
         reason = outcome.get('reason') or 'no reason was given'
         return jsonify(ok=False, error=(f'Nothing to match the captions against: {reason}.' if outcome.get('ok')
                                         else f'Transcription failed: {reason}.')), 422 if outcome.get('ok') else 502
-    result = captionretime.align(parts, words, segments)
+    result = captionretime.align(parts, words, segments, drop_unsure=request.form.get('unsure') == 'drop')
     labels = request.form.get('strip_labels') in ('1', 'true', 'on')
     descs = request.form.get('strip_descriptors') in ('1', 'true', 'on')
     scc = captionretime.write_scc(texts, parts, result)

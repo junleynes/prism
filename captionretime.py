@@ -324,7 +324,7 @@ def _resolve_gap(cues, lo, hi, d_prev, d_next, tr, a_end0, b_start0):
     return best[1], best[2]
 
 
-def align(parts, words, segments, labels=True, descriptors=True):
+def align(parts, words, segments, labels=True, descriptors=True, drop_unsure=False):
     """Places every caption of `parts` (a list of cue lists, each zero-based and in order) on the video the
     transcript came from. -> {'cues': [flat list with offset/status/new start & end], 'cuts': [...], ...}"""
     cues = _flatten(parts, labels, descriptors)
@@ -389,6 +389,11 @@ def align(parts, words, segments, labels=True, descriptors=True):
             c['score'] = tr.similarity_near(c['spoken'], c['start'] + c['offset'], c['end'] + c['offset'])
             if c['score'] < CHECK_BELOW:
                 c['status'] = 'check'
+        if drop_unsure and c['status'] == 'check' and by_part.get(c['part']):
+            # Only inside a file that has anchors: a file with none is all 'check', and dropping it would lose it whole.
+            c['drop'] = True
+            c['status'] = 'dropped'
+            continue
         c['new_start'] = max(0.0, c['start'] + c['offset'])
         c['new_end'] = max(c['new_start'] + 0.2, c['end'] + c['offset'])
     # video order, never overlapping the next caption

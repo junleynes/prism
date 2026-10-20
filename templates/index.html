@@ -6587,6 +6587,7 @@ async function runRetime(){
   caps.forEach(function(c){ fd.append('captions', c, c.name) })
   fd.append('order', 'name')
   fd.append('language', document.getElementById('rt-lang').value)
+  fd.append('unsure', document.getElementById('rt-unsure').value)
   if(document.getElementById('rt-strip-labels').checked) fd.append('strip_labels', '1')
   if(document.getElementById('rt-strip-desc').checked) fd.append('strip_descriptors', '1')
   try{
@@ -14169,6 +14170,8 @@ document.addEventListener('DOMContentLoaded', function(){
   <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;cursor:pointer;margin:0"><input type=checkbox id=rt-strip-desc> Remove sound descriptors</label>
 </div>
 <p style="font-size:12px;opacity:.7;margin:0 0 10px">Unticked, both stay in the captions exactly as written. Ticked, they are taken out of the .srt; the .scc always keeps the original captions and only has its timecodes moved. Parts are taken in file-name order, so name them part1, part2, part3...</p>
+<label>A caption it cannot place with confidence:</label>
+<select id=rt-unsure style="width:360px"><option value=keep>Keep it, placed between its neighbours (flagged)</option><option value=drop>Drop it</option></select>
 <label>Spoken language (helps Whisper):</label>
 <select id=rt-lang style="width:200px"><option value="">Auto-detect</option><option value=tl>Tagalog</option><option value=en>English</option></select>
 <div style="margin-top:14px"><button class=btn type=button id=rt-btn onclick="runRetime()">Retime captions</button></div>
