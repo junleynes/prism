@@ -4185,3 +4185,12 @@ def test_network_sources_routes(tmp_path, monkeypatch):
     assert shares['sources'][0]['name'] == 'Drama' and 'password' not in shares['sources'][0]
     assert post(category='shorts', source=r['source'], delete=True)['ok']
     assert c.get('/api/network/sources?category=shorts').get_json()['sources'] == []
+
+
+def test_reference_docs_for_assistant():
+    import pipeline
+    docs = pipeline._reference_docs()
+    assert any('Vertical Shorts' in d['title'] for d in docs)
+    hit = pipeline.reference_docs_for([{'role': 'user', 'content': 'How do I reframe a short?'}])
+    assert 'Framing' in hit and 'Sign in' in hit
+    assert pipeline.reference_docs_for([{'role': 'user', 'content': 'hello there'}]) == ''

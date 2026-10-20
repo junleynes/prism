@@ -6145,6 +6145,48 @@ def api_chat_models():
     except Exception as e:
         return jsonify(ok=False, models=[], error=f'Could not reach Ollama at {OLLAMA_URL}: {e}')
 
+# ---- Reference documents for the AI Assistant ----
+# Every docs/reference/*.md is a how-to the assistant can answer from (for example the Vertical Shorts
+# procedure). A file starts with a "keywords:" line (comma separated) and an optional "title:" line, then a
+# blank line and the text. It is added to the system prompt only when the conversation mentions one of its
+# keywords, so a question about something else does not pay for it in a small local model's context.
+REFERENCE_DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs', 'reference')
+REFERENCE_DOC_MAX_CHARS = int(os.environ.get('CHAT_REFERENCE_MAX_CHARS', 12000))
+
+
+def _reference_docs():
+    """[{title, keywords, text}] for every reference file."""
+    out = []
+    try:
+        names = sorted(n for n in os.listdir(REFERENCE_DOCS_DIR) if n.lower().endswith('.md'))
+    except OSError:
+        return out
+    for n in names:
+        try:
+            raw = open(os.path.join(REFERENCE_DOCS_DIR, n), encoding='utf-8').read()
+        except OSError:
+            continue
+        head, _, body = raw.partition('\n\n')
+        meta = {}
+        for line in head.splitlines():
+            k, _, v = line.partition(':')
+            meta[k.strip().lower()] = v.strip()
+        kws = [k.strip().lower() for k in meta.get('keywords', '').split(',') if k.strip()]
+        if kws and body.strip():
+            out.append({'title': meta.get('title') or n, 'keywords': kws, 'text': body.strip()})
+    return out
+
+
+def reference_docs_for(messages):
+    """The reference text relevant to what the person has been asking (their last few messages)."""
+    said = ' '.join(m.get('content', '') for m in messages[-6:] if m.get('role') == 'user').lower()
+    parts = []
+    for d in _reference_docs():
+        if any(k in said for k in d['keywords']):
+            parts.append(f"Reference: {d['title']}\n{d['text'][:REFERENCE_DOC_MAX_CHARS]}")
+    return '\n\n'.join(parts)
+
+
 @app.route('/api/chat', methods=['POST'])
 @require_permission('ai_chat')
 def api_chat():
@@ -6205,7 +6247,8 @@ def api_chat():
     # existing uses like "be concise" or "answer in Tagalog" keep working
     # exactly as before -- both apply together.
     if data.get('include_app_help', True):
-        system = f'{APP_KNOWLEDGE_PROMPT}\n\n{system}'.strip()
+        ref = reference_docs_for(clean)
+        system = f"{APP_KNOWLEDGE_PROMPT}\n\n{ref + chr(10) * 2 if ref else ''}{system}".strip()
     if system:
         clean = [{'role': 'system', 'content': system}] + clean
 
