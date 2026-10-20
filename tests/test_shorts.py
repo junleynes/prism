@@ -2171,8 +2171,10 @@ def test_full_flow_render_save_download_send_delete(env, monkeypatch):
     assert abs(s2['duration'] - 4.0) < 0.05 and s2['layouts'] == {'crop': 1, 'fit': 0, 'tracked': 0, 'speaker': 0, 'split': 0}, \
         'two faceless shots, both centre-cropped at the same x, merge into one instruction'
     bdir = os.path.join(shorts.SHORTS_DIR, batch['batch_id'])
-    assert sorted(os.listdir(bdir)) == sorted(['batch.json'] + [s[k] for s in (s1, s2) for k in ('file', 'srt')] +
+    # The light preview copies sit in a folder of their own, so the batch folder holds only what is delivered.
+    assert sorted(os.listdir(bdir)) == sorted(['batch.json', 'preview'] + [s[k] for s in (s1, s2) for k in ('file', 'srt')] +
                                               [os.path.basename(s['thumb_url']) for s in (s1, s2)])
+    assert sorted(os.listdir(os.path.join(bdir, 'preview'))) == sorted(os.path.basename(s['preview_url']) for s in (s1, s2))
 
     # The files themselves.
     fr = _frames(os.path.join(bdir, s2['file']))

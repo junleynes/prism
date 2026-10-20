@@ -584,7 +584,7 @@ def _batch_public(m):
         d['srt_url'] = f"/api/shorts/file/{bid}/{s['srt']}{v}" if s.get('srt') else None
         # The file that is handed over. For MP4 it is the one that plays; for
         # any other format it is a second file beside it.
-        d['preview_url'] = f"/api/shorts/file/{bid}/{s['preview']}{v}" if s.get('preview') else None
+        d['preview_url'] = f"/api/shorts/preview/{bid}/{s['preview']}{v}" if s.get('preview') else None
         d['delivery'] = s.get('delivery') or s['file']
         d['delivery_url'] = f"/api/shorts/file/{bid}/{d['delivery']}{v}"
         d['delivery_size'] = s.get('delivery_size') or s.get('size')
@@ -645,7 +645,7 @@ def _may_see(m):
 def _batch_file_names(m):
     names = set()
     for s in m.get('shorts') or []:
-        for k in ('file', 'srt', 'thumb', 'delivery', 'preview'):
+        for k in ('file', 'srt', 'thumb', 'delivery'):
             if s.get(k):
                 names.add(s[k])
     return names
@@ -1219,6 +1219,13 @@ def _refine_by_part(cands, parts, blocked, min_dur, max_dur):
 
 SHORTS_PROXY_H = _env_num('SHORTS_PROXY_HEIGHT', 960, int)
 SHORTS_PROXY_KBPS = _env_num('SHORTS_PROXY_KBPS', 1800, int)
+
+
+def _proxy_path(bdir, name):
+    """Where a short's light preview copy lives: a folder of its own, so the batch folder holds only what is delivered."""
+    d = os.path.join(bdir, 'preview')
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, os.path.basename(name))
 
 
 def _make_proxy(video_path, proxy_path):
@@ -1921,8 +1928,8 @@ def _run_render(jid, params):
             entry['srt'] = name + '.srt'
         if _poster(out_path, os.path.join(bdir, name + '.jpg'), entry['duration'] * 0.3):
             entry['thumb'] = name + '.jpg'
-        if _make_proxy(out_path, os.path.join(bdir, name + '_pv.mp4')):
-            entry['preview'] = name + '_pv.mp4'
+        if _make_proxy(out_path, _proxy_path(bdir, name + '.mp4')):
+            entry['preview'] = name + '.mp4'
         manifest['shorts'].append(entry)
         if it_global.get('replaces'):
             replaced.append(it_global['replaces'])
@@ -2086,8 +2093,8 @@ def _build_reels(bdir, manifest, fmt, ext, stem, burn, _unused=False):
             entry['srt'] = name + '.srt'
         if _poster(mp4, os.path.join(bdir, name + '.jpg'), dur * 0.3):
             entry['thumb'] = name + '.jpg'
-        if _make_proxy(mp4, os.path.join(bdir, name + '_pv.mp4')):
-            entry['preview'] = name + '_pv.mp4'
+        if _make_proxy(mp4, _proxy_path(bdir, name + '.mp4')):
+            entry['preview'] = name + '.mp4'
         out.append(entry)
     manifest['shorts'] = out
 
@@ -4133,6 +4140,20 @@ def api_shorts_file(bid, name):
     return resp
 
 
+@app.route('/api/shorts/preview/<bid>/<name>')
+@require_permission('vertical_shorts')
+def api_shorts_preview_file(bid, name):
+    """The light copy of a short that plays in the browser."""
+    m, err = _batch_or_error(bid)
+    if err:
+        return err
+    if name not in {s.get('preview') for s in m.get('shorts') or [] if s.get('preview')}:
+        return jsonify(ok=False, error='Not found'), 404
+    resp = send_from_directory(os.path.join(_batch_dir(bid), 'preview'), name, conditional=True)
+    resp.headers['Cache-Control'] = 'private, max-age=3600'
+    return resp
+
+
 @app.route('/api/shorts/batches/<bid>/zip')
 @require_permission('vertical_shorts')
 def api_shorts_batch_zip(bid):
@@ -4418,8 +4439,8 @@ def _run_recaption(jid, params):
             s['delivery_size'] = os.path.getsize(os.path.join(bdir, delivery))
         if s.get('thumb'):
             _poster(os.path.join(bdir, s['file']), os.path.join(bdir, s['thumb']), float(s.get('duration') or 0) * 0.3)
-        pv = s.get('preview') or os.path.splitext(s['file'])[0] + '_pv.mp4'
-        if _make_proxy(os.path.join(bdir, s['file']), os.path.join(bdir, pv)):
+        pv = s.get('preview') or os.path.splitext(s['file'])[0] + '.mp4'
+        if _make_proxy(os.path.join(bdir, s['file']), _proxy_path(bdir, pv)):
             s['preview'] = pv
         _write_manifest(bdir, m)
         pipeline.job_set(jid, percent=100, step='Done', done=True, result={'batch': _batch_public(m)})
