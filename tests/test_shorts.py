@@ -1518,6 +1518,8 @@ def test_a_short_can_be_delivered_as_prores_and_that_is_the_file_handed_over(env
 
     # Both are served; the download-all and Send hand over the .mov.
     assert client.get(s['delivery_url']).status_code == 200 and client.get(s['url']).status_code == 200
+    # What plays in the browser is a light copy, so it does not buffer over wifi or a VPN.
+    assert s['preview_url'] and client.get(s['preview_url']).status_code == 200 and s['preview_url'] != s['url']
     r = client.get(f"/api/shorts/batches/{batch['batch_id']}/zip")
     assert sorted(zipfile.ZipFile(io.BytesIO(r.data)).namelist()) == sorted([s['delivery'], s['srt']])
     r.close()

@@ -11307,7 +11307,7 @@ async function shBatchCaptions(card, b, s){
     : escapeHtmlLite(r.why || '') + ' <b>Saving here updates the .srt only.</b>'
   shCapEditor(host, r.cues, {
     dur: r.duration, readOnly: !r.can_change, note: head + note, size: (b.options || {}).subtitle_size || 'm',
-    clip: function(){ return Promise.resolve(s.url) }, clipHidden: !!r.burned,
+    clip: function(){ return Promise.resolve(s.preview_url || s.url) }, clipHidden: !!r.burned,
     saveLabel: r.how === 'render' ? 'Save and render again' : 'Save to the .srt',
     onSave: async function(cues, say){
       var p = await (await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -11469,7 +11469,7 @@ function shBatchCard(b, fresh){
     (fresh ? '<p class="sh-note">Saved in this project' + (b.project_name ? ', <b>' + escapeHtmlLite(b.project_name) + '</b>' : '') + ': see <b>Shorts in this project</b>. Render again with a different reframe or other moments at any time while this cut is open.</p>' : '')
   card.addEventListener('click', function(e){
     var p = e.target.closest('[data-play]')
-    if(p){ var s = b.shorts[parseInt(p.getAttribute('data-play'), 10)]; shortsPlay(s.url, s.title); return }
+    if(p){ var s = b.shorts[parseInt(p.getAttribute('data-play'), 10)]; shortsPlay(s.preview_url || s.url, s.title); return }
     var dt = e.target.closest('[data-details]')
     if(dt){
       var pn = card.querySelector('[data-details-panel]'), open = pn.style.display === 'none'

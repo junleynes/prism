@@ -584,6 +584,7 @@ def _batch_public(m):
         d['srt_url'] = f"/api/shorts/file/{bid}/{s['srt']}{v}" if s.get('srt') else None
         # The file that is handed over. For MP4 it is the one that plays; for
         # any other format it is a second file beside it.
+        d['preview_url'] = f"/api/shorts/file/{bid}/{s['preview']}{v}" if s.get('preview') else None
         d['delivery'] = s.get('delivery') or s['file']
         d['delivery_url'] = f"/api/shorts/file/{bid}/{d['delivery']}{v}"
         d['delivery_size'] = s.get('delivery_size') or s.get('size')
@@ -644,7 +645,7 @@ def _may_see(m):
 def _batch_file_names(m):
     names = set()
     for s in m.get('shorts') or []:
-        for k in ('file', 'srt', 'thumb', 'delivery'):
+        for k in ('file', 'srt', 'thumb', 'delivery', 'preview'):
             if s.get(k):
                 names.add(s[k])
     return names
@@ -1215,6 +1216,34 @@ def _refine_by_part(cands, parts, blocked, min_dur, max_dur):
 # --------------------------------------------------------------------------
 # Render job
 # --------------------------------------------------------------------------
+
+SHORTS_PROXY_H = _env_num('SHORTS_PROXY_HEIGHT', 960, int)
+SHORTS_PROXY_KBPS = _env_num('SHORTS_PROXY_KBPS', 1800, int)
+
+
+def _make_proxy(video_path, proxy_path):
+    """A light copy of a finished short for playing in the browser over wifi or a VPN: a quarter of the pixels at
+    under 2 Mbit/s, with the moov atom first so it starts at once. The full file stays what is delivered. True when made."""
+    k = SHORTS_PROXY_KBPS
+    cmd = [pipeline.FFMPEG, '-y', '-loglevel', 'error', '-i', video_path,
+           '-vf', f'scale=-2:{SHORTS_PROXY_H}', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27',
+           '-maxrate', f'{k}k', '-bufsize', f'{2 * k}k', '-pix_fmt', 'yuv420p',
+           '-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-movflags', '+faststart', proxy_path + '.tmp.mp4']
+    try:
+        r = pipeline.run_ffmpeg(cmd, timeout=pipeline.FFMPEG_TIMEOUT, label='shorts preview copy')
+        if getattr(r, 'returncode', 1) != 0 or not os.path.getsize(proxy_path + '.tmp.mp4'):
+            return False
+        os.replace(proxy_path + '.tmp.mp4', proxy_path)
+        return True
+    except Exception as e:
+        print(f'Vertical Shorts: the preview copy of {os.path.basename(video_path)} could not be made: {e}')
+        return False
+    finally:
+        try:
+            os.remove(proxy_path + '.tmp.mp4')
+        except OSError:
+            pass
+
 
 def _poster(video_path, thumb_path, at):
     try:
@@ -1892,6 +1921,8 @@ def _run_render(jid, params):
             entry['srt'] = name + '.srt'
         if _poster(out_path, os.path.join(bdir, name + '.jpg'), entry['duration'] * 0.3):
             entry['thumb'] = name + '.jpg'
+        if _make_proxy(out_path, os.path.join(bdir, name + '_pv.mp4')):
+            entry['preview'] = name + '_pv.mp4'
         manifest['shorts'].append(entry)
         if it_global.get('replaces'):
             replaced.append(it_global['replaces'])
@@ -2055,6 +2086,8 @@ def _build_reels(bdir, manifest, fmt, ext, stem, burn, _unused=False):
             entry['srt'] = name + '.srt'
         if _poster(mp4, os.path.join(bdir, name + '.jpg'), dur * 0.3):
             entry['thumb'] = name + '.jpg'
+        if _make_proxy(mp4, os.path.join(bdir, name + '_pv.mp4')):
+            entry['preview'] = name + '_pv.mp4'
         out.append(entry)
     manifest['shorts'] = out
 
@@ -4385,6 +4418,9 @@ def _run_recaption(jid, params):
             s['delivery_size'] = os.path.getsize(os.path.join(bdir, delivery))
         if s.get('thumb'):
             _poster(os.path.join(bdir, s['file']), os.path.join(bdir, s['thumb']), float(s.get('duration') or 0) * 0.3)
+        pv = s.get('preview') or os.path.splitext(s['file'])[0] + '_pv.mp4'
+        if _make_proxy(os.path.join(bdir, s['file']), os.path.join(bdir, pv)):
+            s['preview'] = pv
         _write_manifest(bdir, m)
         pipeline.job_set(jid, percent=100, step='Done', done=True, result={'batch': _batch_public(m)})
     finally:
