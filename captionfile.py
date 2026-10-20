@@ -77,25 +77,33 @@ def _scc_time(tc):
 
 def parse_scc(text):
     cues = []
-    state = {'mode': 'pop', 'shown': '', 'hidden': '', 'open': None, 'line': '', 'line_t': None, 'row': None}
+    # 'li' / 'touch': which lines of the file made each caption (and the one that erased it), so a caller that
+    # retimes the file can move exactly those lines.
+    state = {'mode': 'pop', 'shown': '', 'hidden': '', 'open': None, 'line': '', 'line_t': None, 'row': None,
+             'li': 0, 'touch': set()}
 
     def close(t):
         o = state['open']
         if o and o['text']:
-            cues.append({'start': o['start'], 'end': max(t, o['start'] + 0.2), 'text': o['text']})
+            cues.append({'start': o['start'], 'end': max(t, o['start'] + 0.2), 'text': o['text'],
+                         'lines': o['lines'], 'erase': o.get('erase')})
         state['open'] = None
 
     def show(text_, t):
         close(t)
         text_ = ' '.join(text_.split())
+        lines = sorted(state['touch'])
+        state['touch'] = set()
         if text_:
-            state['open'] = {'start': t, 'text': text_}
+            state['open'] = {'start': t, 'text': text_, 'lines': lines}
 
     def flush_line(t):
         # roll-up / paint-on: a finished line is a cue of its own
         line = ' '.join(state['line'].split())
         if line and state['line_t'] is not None:
-            cues.append({'start': state['line_t'], 'end': max(t, state['line_t'] + 0.5), 'text': line})
+            cues.append({'start': state['line_t'], 'end': max(t, state['line_t'] + 0.5), 'text': line,
+                         'lines': sorted(state['touch']), 'erase': None})
+            state['touch'] = set()
         state['line'], state['line_t'] = '', None
 
     def put(ch, t):
@@ -107,13 +115,15 @@ def parse_scc(text):
             state['line'] += ch
 
     last_cc = None
-    for raw_line in text.replace('\r', '\n').split('\n'):
+    for li, raw_line in enumerate(text.replace('\r', '\n').split('\n')):
         parts = raw_line.strip().split(None, 1)
         if len(parts) < 2:
             continue
         t0 = _scc_time(parts[0])
         if t0 is None:
             continue
+        state['li'] = li
+        state['touch'].add(li)
         last_cc = None
         for k, word in enumerate(parts[1].split()):
             if not re.fullmatch(r'[0-9a-fA-F]{4}', word):
@@ -135,6 +145,9 @@ def parse_scc(text):
                     elif b2 == 0x2C:                       # erase displayed memory
                         if state['mode'] == 'pop':
                             state['shown'] = ''
+                            if state['open']:
+                                state['open']['erase'] = state['li']
+                                state['touch'].discard(state['li'])
                             close(t)
                         else:
                             flush_line(t)

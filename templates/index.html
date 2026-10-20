@@ -6563,6 +6563,69 @@ async function runTranscribe(){
   }
 }
 
+// ---- Retime captions to a cut video ----
+function rtNatural(a, b){
+  return a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'})
+}
+function rtShowFiles(){
+  var f = document.getElementById('rt-caps').files, box = document.getElementById('rt-files')
+  var list = Array.prototype.slice.call(f).sort(rtNatural)
+  box.innerHTML = list.length ? 'Parts, in this order: ' + list.map(function(x, i){ return (i + 1) + '. ' + escapeHtmlLite(x.name) }).join(' &nbsp; ') : ''
+}
+async function runRetime(){
+  var btn = document.getElementById('rt-btn'), note = document.getElementById('rt-note'), out = document.getElementById('rt-result')
+  var v = document.getElementById('rt-video'), net = document.getElementById('rt_video_network').value
+  var caps = Array.prototype.slice.call(document.getElementById('rt-caps').files).sort(rtNatural)
+  var hasLocal = v && v.files && v.files[0]
+  function warn(t){ note.style.display = 'block'; note.innerHTML = '<span style="color:var(--amber)">' + escapeHtmlLite(t) + '</span>' }
+  if(!hasLocal && !net){ warn('Pick the combined video first, or use Browse library.'); return }
+  if(!caps.length){ warn('Add the caption files, one per part.'); return }
+  btn.disabled = true; out.style.display = 'none'
+  note.style.display = 'block'; note.textContent = 'Listening to the video and matching the captions\u2026 a full episode takes a few minutes.'
+  var fd = new FormData()
+  if(hasLocal) fd.append('rt_video', v.files[0]); else fd.append('rt_video_network', net)
+  caps.forEach(function(c){ fd.append('captions', c, c.name) })
+  fd.append('order', 'name')
+  fd.append('language', document.getElementById('rt-lang').value)
+  if(document.getElementById('rt-strip-labels').checked) fd.append('strip_labels', '1')
+  if(document.getElementById('rt-strip-desc').checked) fd.append('strip_descriptors', '1')
+  try{
+    var r = await fetch('/api/stt/retime', {method: 'POST', body: fd})
+    var d = await r.json()
+    if(!d.ok){ warn(d.error || 'Retiming failed.'); return }
+    note.style.display = 'none'
+    var s = d.summary
+    var label = {matched: 'matched', placed: 'placed', check: 'check this', dropped: 'in a cut'}
+    var col = {matched: 'var(--phosphor)', placed: 'inherit', check: 'var(--amber)', dropped: 'var(--ink-dim)'}
+    var rows = d.rows.map(function(x){
+      return '<div style="display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--line);color:' + (col[x.status] || 'inherit') + '">' +
+        '<span style="min-width:30px;opacity:.6">P' + x.part + '</span>' +
+        '<span style="min-width:150px;font-family:monospace;font-size:11px">' + tcFmt(x.old) + ' \u2192 ' + (x.new === null ? '\u2014' : tcFmt(x.new)) + '</span>' +
+        '<span style="min-width:70px;font-size:11px">' + label[x.status] + '</span><span>' + escapeHtmlLite(x.text) + '</span></div>'
+    }).join('')
+    var cuts = (s.cuts || []).map(function(c){ return c.seconds + ' s' }).join(', ')
+    out.innerHTML = '<div style="font-size:12px;margin-bottom:8px">' + s.captions + ' captions \u00b7 ' + s.matched + ' matched \u00b7 ' +
+      s.placed + ' placed from their neighbours \u00b7 <b style="color:var(--amber)">' + s.check + ' to check</b> \u00b7 ' + s.dropped +
+      ' in cuts (dropped)' + (cuts ? ' \u00b7 cuts found: ' + cuts : ' \u00b7 no cuts found') + '</div>' +
+      '<div style="max-height:340px;overflow-y:auto;font-size:12px;line-height:1.6">' + rows + '</div>' +
+      '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">' +
+      '<button type=button class=btn style="padding:6px 12px;font-size:12px" onclick="rtDownload(\'srt\')">Download .srt</button>' +
+      (d.scc ? '<button type=button class=btn style="padding:6px 12px;font-size:12px" onclick="rtDownload(\'scc\')">Download .scc</button>' : '') +
+      '</div>' + (d.scc ? '' : '<p style="font-size:12px;opacity:.7">An .scc is only made when every caption file is an .scc.</p>')
+    out.style.display = 'block'
+    window._rt = {srt: d.srt, scc: d.scc}
+  }catch(e){ warn('Request failed: ' + e) }
+  finally{ btn.disabled = false }
+}
+function rtDownload(kind){
+  if(!window._rt || !window._rt[kind]) return
+  var a = document.createElement('a')
+  a.href = URL.createObjectURL(new Blob([window._rt[kind]], {type: 'text/plain'}))
+  a.download = 'captions_retimed.' + kind
+  a.click()
+}
+window.rtShowFiles = rtShowFiles; window.runRetime = runRetime; window.rtDownload = rtDownload
+
 function copySttText(){
   if(!window._sttText) return
   navigator.clipboard.writeText(window._sttText).then(function(){
@@ -14087,6 +14150,31 @@ document.addEventListener('DOMContentLoaded', function(){
 </div>
 <div id=stt-result style="display:none;margin-top:16px"></div>
 <div id=stt-prompt class=no-data style="margin-top:14px">Upload a file to transcribe. A full episode takes a few minutes; the upload itself is quick because only the audio is sent.</div>
+
+<div class=card style="margin-top:28px">
+<h3 style="margin:0 0 6px;font-size:15px">Retime captions to a cut video</h3>
+<p style="font-size:12px;opacity:.75;margin:0 0 12px">For caption files that each start at zero and have no cuts (one per part), and a video that is all of them in one file with some parts cut out. Each caption is found in what is said in the video, the cuts are worked out from where the captions stop lining up, and you get captions that fit the cut video. Captions inside a cut are dropped. Matching tolerates Whisper's spelling mistakes; only captions it cannot place with confidence are flagged for you to check.</p>
+<label>Combined video:</label>
+<input type=hidden id=rt_video_network name=rt_video_network value="">
+<div class="browse-row" style="margin-bottom:10px">
+  {% if allow_local_upload %}<input type=file id=rt-video accept="video/*,audio/*" data-net-field="rt_video">{% endif %}
+  <span class="net-file-chip" id=rt_video_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('rt_video')">&#10005;</span></span>
+  <button type=button class="browse-btn" onclick="openNetworkBrowser('rt_video','hires','Video (HIRES)')">Browse library</button>
+</div>
+<label>Caption files (all the parts, .scc / .srt / .vtt):</label>
+<input type=file id=rt-caps multiple accept=".scc,.srt,.vtt" onchange="rtShowFiles()">
+<div id=rt-files style="font-size:12px;opacity:.8;margin:6px 0 10px"></div>
+<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">
+  <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;cursor:pointer;margin:0"><input type=checkbox id=rt-strip-labels> Remove speaker labels</label>
+  <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;cursor:pointer;margin:0"><input type=checkbox id=rt-strip-desc> Remove sound descriptors</label>
+</div>
+<p style="font-size:12px;opacity:.7;margin:0 0 10px">Unticked, both stay in the captions exactly as written. Ticked, they are taken out of the .srt; the .scc always keeps the original captions and only has its timecodes moved. Parts are taken in file-name order, so name them part1, part2, part3...</p>
+<label>Spoken language (helps Whisper):</label>
+<select id=rt-lang style="width:200px"><option value="">Auto-detect</option><option value=tl>Tagalog</option><option value=en>English</option></select>
+<div style="margin-top:14px"><button class=btn type=button id=rt-btn onclick="runRetime()">Retime captions</button></div>
+<div id=rt-note class=no-data style="margin-top:12px;display:none"></div>
+<div id=rt-result style="display:none;margin-top:14px"></div>
+</div>
 </div>
 
 <div id="p-vision" class="panel{{ ' active' if default_tab == 'p-vision' else '' }}">

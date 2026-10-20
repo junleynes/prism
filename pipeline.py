@@ -10657,6 +10657,52 @@ def api_stt_transcribe():
                    srt=srt, duration=round(segments[-1]['end'], 1) if segments else 0,
                    model=WHISPER_MODEL)
 
+@app.route('/api/stt/retime', methods=['POST'])
+@require_permission('speech_to_text')
+def api_stt_retime():
+    """Retimes caption files (SCC / SRT / VTT, one per part, each starting at zero and uncut) onto a combined
+    video that has had parts cut out. See captionretime.py for how the captions are found in the speech."""
+    import captionfile, captionretime
+    files = [f for f in request.files.getlist('captions') if f and f.filename]
+    if not files:
+        return jsonify(ok=False, error='Add the caption files (.scc, .srt or .vtt), one per part.'), 400
+    if len(files) > 40:
+        return jsonify(ok=False, error='That is more caption files than a programme has parts (40 at most).'), 400
+    if request.form.get('order', 'name') == 'name':
+        files.sort(key=lambda f: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', f.filename)])
+    parts, texts = [], []
+    for f in files:
+        raw = f.read(captionfile.MAX_BYTES + 1)
+        cues, err = captionfile.parse_captions(raw, f.filename)
+        if err:
+            return jsonify(ok=False, error=err), 400
+        parts.append(cues)
+        texts.append(captionfile.decode_bytes(raw) if f.filename.lower().endswith('.scc') else None)
+    src = _resolve_upload('rt_video', ALLOWED_EXTENSIONS | AUDIO_EXTENSIONS)
+    if not src:
+        return jsonify(ok=False, error='Pick the combined video (or audio) the captions are for.'), 400
+    sample = ' '.join(captionretime.clean_text(c['text']) for c in parts[0][:12])[:400]
+    try:
+        words, segments, outcome = transcribe_video_detailed(src, language=(request.form.get('language') or None),
+                                                            prompt=sample or None)
+    finally:
+        if os.path.exists(src) and inside_uploads(src) and not os.path.basename(src).startswith('net_'):
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+    if not segments and not words:
+        reason = outcome.get('reason') or 'no reason was given'
+        return jsonify(ok=False, error=(f'Nothing to match the captions against: {reason}.' if outcome.get('ok')
+                                        else f'Transcription failed: {reason}.')), 422 if outcome.get('ok') else 502
+    result = captionretime.align(parts, words, segments)
+    labels = request.form.get('strip_labels') in ('1', 'true', 'on')
+    descs = request.form.get('strip_descriptors') in ('1', 'true', 'on')
+    scc = captionretime.write_scc(texts, parts, result)
+    return jsonify(ok=True, srt=captionretime.write_srt(result, labels=labels, descriptors=descs), scc=scc,
+                   summary=captionretime.summary(result), rows=captionretime.report(result),
+                   files=[f.filename for f in files], model=WHISPER_MODEL)
+
 @app.route('/api/voices/tags')
 def api_voice_tags():
     """Inline delivery tags for Fish Audio, in the syntax the configured model
