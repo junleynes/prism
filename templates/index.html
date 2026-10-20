@@ -10296,8 +10296,7 @@ async function shWsExact(draft, force){
   shWsCapVis(); shEl('ws-cap').textContent = ''
   v.style.objectFit = 'contain'
   v.src = r.url; v.load(); shWsMsg('')
-  shEl('ws-scrub').max = shWsTotal()
-  v.play().catch(function(){})
+  shEl('ws-scrub').max = shWsTotal()      // ready to play, not playing: the editor presses play
 }
 
 // ---- The timelines ----
