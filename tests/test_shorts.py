@@ -741,7 +741,7 @@ def test_generate_without_preview_analyses_then_renders_everything_as_one_job(en
     assert [s['title'] for s in batch['shorts']] == [c['title'] for c in a['candidates']]
     assert [(s['start'], s['end']) for s in batch['shorts']] == \
         [(round(c['start'] * 25) / 25, round(c['end'] * 25) / 25) for c in a['candidates']]
-    assert batch['options'] == {'reframe': 'fit', 'subtitles': False, 'subtitle_size': 'l', 'episode_labels': True, 'word_highlight': False, 'highlight_color': None, 'cut_join': None, 'face_detector': None,
+    assert batch['options'] == {'reframe': 'fit', 'subtitles': False, 'subtitle_size': 'l', 'split_caption': 'join', 'episode_labels': True, 'word_highlight': False, 'highlight_color': None, 'cut_join': None, 'face_detector': None,
                                 'speaker': False, 'ending': 'none', 'ending_hold': None, 'ending_zoom': None, 'ending_look': None, 'ending_motion': None, 'fade_last': False, 'ending_fade': None, 'ending_sfx': None, 'ending_overlay': None, 'format': 'mp4_high',
                                 'format_label': 'MP4 (H.264 High Profile)', 'loudness': -14.0}, \
         'the Output settings sent with the request'
