@@ -172,7 +172,7 @@ def test_options_and_the_artwork_network_folder():
     client, _ = _client()
     d = client.get('/api/schedule/options').get_json()
     assert d['ok'] and d['durations'] == [10, 15, 20, 30, 45, 60] and d['psd_supported'] is True
-    assert [f['key'] for f in d['formats']] == list(pipeline.EXPORT_FORMATS)
+    assert [f['key'] for f in d['formats']] == [k for k, v in pipeline.EXPORT_FORMATS.items() if not v.get('vertical')]
     cat = pipeline._network_categories()['schedule']
     assert {'psd', 'png', 'jpg', 'tif'} <= cat['exts'] and 'mp4' not in cat['exts'] and 'fallback' not in cat
     assert 'schedule' in pipeline.NETWORK_CATEGORY_KEYS
