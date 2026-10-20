@@ -4149,7 +4149,10 @@ def api_shorts_preview_file(bid, name):
         return err
     if name not in {s.get('preview') for s in m.get('shorts') or [] if s.get('preview')}:
         return jsonify(ok=False, error='Not found'), 404
-    resp = send_from_directory(os.path.join(_batch_dir(bid), 'preview'), name, conditional=True)
+    bdir = _batch_dir(bid)
+    # Batches rendered by the first version of the preview copy keep it beside the short, not in preview/.
+    folder = os.path.join(bdir, 'preview') if os.path.isfile(os.path.join(bdir, 'preview', os.path.basename(name))) else bdir
+    resp = send_from_directory(folder, name, conditional=True)
     resp.headers['Cache-Control'] = 'private, max-age=3600'
     return resp
 

@@ -1520,6 +1520,12 @@ def test_a_short_can_be_delivered_as_prores_and_that_is_the_file_handed_over(env
     assert client.get(s['delivery_url']).status_code == 200 and client.get(s['url']).status_code == 200
     # What plays in the browser is a light copy, so it does not buffer over wifi or a VPN.
     assert s['preview_url'] and client.get(s['preview_url']).status_code == 200 and s['preview_url'] != s['url']
+    # A batch rendered by the first version kept its preview copy beside the short rather than in preview/.
+    bd = shorts._batch_dir(batch['batch_id'])
+    nm = os.path.basename(s['preview_url'].split('?')[0])
+    shutil.move(os.path.join(bd, 'preview', nm), os.path.join(bd, nm))
+    assert client.get(s['preview_url']).status_code == 200
+    shutil.move(os.path.join(bd, nm), os.path.join(bd, 'preview', nm))
     r = client.get(f"/api/shorts/batches/{batch['batch_id']}/zip")
     assert sorted(zipfile.ZipFile(io.BytesIO(r.data)).namelist()) == sorted([s['delivery'], s['srt']])
     r.close()
