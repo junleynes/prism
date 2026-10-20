@@ -147,6 +147,15 @@ When finished, press "Show the shorts", or open the "Shorts in this project" tab
 
 - Settings are saved per project and restored on reload.
 
+## Creating a new project (what to fill in)
+Press Vertical Shorts, then New project. Only the Programme title is required.
+- Programme title (required): the show name, for example Tadhana.
+- Episode: the episode number, for example Ep. 101. Episode title: for example Ang Pagbabalik.
+- Artist/s: optional, cast separated by commas. Air date: when the episode airs (defaults to today).
+- Status: New for a project just started. Assigned to: the responsible team member, or Unassigned. Group: shows your own group.
+- Has a deadline: tick it to enter a due date. Thumbnail: optional JPEG, PNG or WebP; without one the project shows a frame from its newest short. Description: optional notes.
+- Press Create project (or Cancel). The project page opens on the Source screen. Edit details and Delete project are at the top of the project page.
+
 ## Extra facts
 - Format choices in Output settings > Delivery include MP4 (H.264 High Profile), TikTok upload (MP4 1080x1920, 30 fps, H.264 + AAC, up to 12 Mb/s), and Apple ProRes 422 HQ (29.97 or 23.976 fps, 1080x1920 .mov made with ffmpeg's prores_ks). Each short is also rendered as an MP4 for playing in the browser.
 - For a target of 90 s, set the length range around it (for example 80 to 100), not one number. Mini-drama chapters can come out shorter than the minimum because the leftover at the end of a stretch is not padded.
