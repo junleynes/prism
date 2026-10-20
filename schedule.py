@@ -28,6 +28,7 @@ from library_db import LIBRARY_DIR, audit_log, network_destination_get
 from auth import require_permission
 import pipeline
 import project_routes
+import shorts_projects as sp
 import schedule_core as sk
 import shorts_core
 
@@ -624,6 +625,99 @@ def api_schedule_inspect():
         extra = {'overrides': applied, 'settings': preset.get('settings') or {}, 'preset_missing': missing,
                  'preset_name': preset.get('name')}
     return jsonify(ok=True, name=name, token=token, **info, **extra)
+
+
+# --------------------------------------------------------------------------
+# A project's saved selections: the artwork, the storyboard and every choice made for it, kept in the project's
+# own folder so a refresh, another browser or a restart of the server finds them again.
+# --------------------------------------------------------------------------
+
+_SEL_FIELDS = ('schedule_image', 'schedule_music', 'schedule_storyboard')
+_SEL_STATE_MAX = 600_000
+
+
+def _sel_root():
+    return project_routes._FEATURES['schedule'].root
+
+
+def _sel_origin(local):
+    org = pipeline.staged_origin(local)
+    if org:
+        return org
+    meta = pipeline.INPLACE.get(local)
+    return {'category': meta['category'], 'subpath': meta['subpath'], 'name': meta['name']} if meta else None
+
+
+@app.route('/api/schedule/projects/<pid>/selections', methods=['GET', 'POST'])
+@require_permission('schedule_plug')
+def api_schedule_project_selections(pid):
+    """GET: what was saved, with each library pick staged anew and an uploaded artwork given a fresh token.
+    POST {state, files: {field: staged name}, token, name}: save them. A library pick is kept by where it lives
+    on the share; artwork uploaded from the computer is copied into the project folder."""
+    proj = project_routes.visible_project('schedule', pid)
+    if not proj:
+        return jsonify(ok=False, error='That project no longer exists.'), 404
+    root, pdir = _sel_root(), sp.project_dir(_sel_root(), pid)
+    old = proj.get('selections') or {}
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or {}
+        state = body.get('state') if isinstance(body.get('state'), dict) else {}
+        if len(json.dumps(state)) > _SEL_STATE_MAX:
+            return jsonify(ok=False, error='Too much to keep.'), 413
+        kept = {}
+        for field, local in (body.get('files') or {}).items():
+            if field in _SEL_FIELDS and isinstance(local, str) and local.startswith('net_'):
+                org = _sel_origin(os.path.basename(local))
+                if org:
+                    kept[field] = dict(org, local=os.path.basename(local))
+        art = old.get('art') if isinstance(old.get('art'), dict) else None
+        tok = str(body.get('token') or '').strip()
+        if tok and _TOKEN.match(tok) and os.path.exists(pipeline.staged_path(tok)):
+            if not art or art.get('src') != tok:
+                ext = os.path.splitext(tok)[1].lower()
+                fname = 'artwork' + ext
+                try:
+                    shutil.copyfile(pipeline.staged_path(tok), os.path.join(pdir, fname))
+                    art = {'file': fname, 'src': tok}
+                except OSError:
+                    art = None
+            if art:
+                art['name'] = os.path.basename(str(body.get('name') or ''))[:200] or art.get('name') or 'artwork'
+        elif 'schedule_image' in kept or not tok:
+            if art:
+                try:
+                    os.remove(os.path.join(pdir, art['file']))
+                except OSError:
+                    pass
+            art = None
+        sp.set_selections(root, pid, {'state': state, 'files': kept, 'art': art, 'saved': time.time()})
+        return jsonify(ok=True)
+    files, missing = {}, []
+    for field, org in (old.get('files') or {}).items():
+        local = org.get('local') or ''
+        try:
+            if local and os.path.isfile(pipeline.staged_path(local)):
+                files[field] = {'local': local, 'name': org['name']}
+                continue
+            got = pipeline.stage_network_file(org['name'], org.get('category') or 'schedule', org.get('subpath') or '')
+            files[field] = {'local': got['local_name'], 'name': org['name']}
+        except Exception as e:
+            missing.append(f"{org.get('name')} ({e})")
+    token = name = None
+    art = old.get('art')
+    if isinstance(art, dict) and art.get('file'):
+        src = os.path.join(pdir, os.path.basename(art['file']))
+        if os.path.isfile(src):
+            ext = os.path.splitext(src)[1].lower()
+            token = f'schedule_image_{int(time.time())}_{secrets.randbelow(10 ** 6)}{ext}'
+            try:
+                shutil.copyfile(src, pipeline.staged_path(token))
+                name = art.get('name') or 'artwork'
+            except OSError:
+                token = None
+                missing.append('the artwork')
+    return jsonify(ok=True, state=old.get('state') or {}, files=files, token=token, name=name, missing=missing,
+                   saved=old.get('saved'))
 
 
 STORYBOARD_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp'}

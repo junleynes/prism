@@ -12508,7 +12508,8 @@ async function spInspect(opts){
   var ok = d.layers.some(function(l){ return l.path === SP.sel })
   if(!ok) SP.sel = (d.layers.filter(function(l){ return l.role !== 'background' && l.role !== 'hidden' && l.role !== 'group' })[0] || d.layers[0] || {}).path
   spRenderWork()
-  if(!opts.keep){ spScreen('work'); if(spBoardPicked() && !SP.board && !opts.preset) spBoardRead() }
+  spSelSchedule()
+  if(!opts.keep){ spScreen('work'); if(spBoardPicked() && !SP.board && !opts.preset && !SP.selRestoring) spBoardRead() }
 }
 
 function spInspectSoon(){
@@ -12853,6 +12854,7 @@ async function spBoardRead(){
   spBoardShow()
   spStale()
   spInspect({keep: true})
+  spSelSchedule()
 }
 function spBoardShow(){
   var d = SP.board
@@ -12905,7 +12907,7 @@ document.addEventListener('click', function(e){
     new MutationObserver(function(){
       var name = (chip.querySelector('.chip-name') || {}).textContent || ''
       var shown = chip.style.display !== 'none' && name
-      if(shown && name !== last){ last = name; SP.board = null; if(SP.info) spBoardRead() }
+      if(shown && name !== last){ last = name; if(SP.selRestoring) return; SP.board = null; if(SP.info) spBoardRead() }
       if(!shown) last = ''
     }).observe(chip, {attributes: true, childList: true, subtree: true, characterData: true})
   }
@@ -12985,6 +12987,7 @@ function spMarkStyle(){
 
 // ---- The preview clip, the scrubber and the safe areas ----
 function spStale(){
+  spSelSchedule()
   if(!SP.previewOn) return
   SP.previewStale = true
   var el = spEl('sp-stale'); el.style.display = 'block'
@@ -13583,6 +13586,76 @@ function spSwitchProject(from, to){
   if(typeof spBatchDraw === 'function') spBatchDraw()
   spScreen(back && back.info ? (back.screen === 'result' ? 'work' : back.screen) : 'art')
 }
+
+// ---- The project keeps its artwork, storyboard and choices ----
+function spSelCapture(){
+  var files = {}
+  ;['schedule_image', 'schedule_music', 'schedule_storyboard'].forEach(function(k){
+    var h = spEl(k + '_network'); if(h && h.value) files[k] = h.value })
+  var bn = spEl('sp-board-note')
+  return {state: {settings: spSettings(), ov: SP.ov, sel: SP.sel, page: SP.page, look: SP.look, durTouched: SP.durTouched,
+                  board: SP.board, boardNote: bn ? bn.value : ''},
+          files: files, token: SP.token || null, name: SP.name || ''}
+}
+function spSelHeaders(){
+  var meta = document.querySelector('meta[name="csrf-token"]')
+  var headers = {'Content-Type': 'application/json'}
+  if(meta) headers['X-CSRF-Token'] = meta.getAttribute('content')
+  return headers
+}
+function spSelSchedule(){
+  if(!SP.selReady || SP.selRestoring || !SP.formProject || SP.formProject !== scheduleProjectId()) return
+  var pid = SP.formProject
+  clearTimeout(SP.selTimer)
+  SP.selTimer = setTimeout(function(){
+    SP.selTimer = null
+    if(SP.formProject !== pid) return
+    fetch('/api/schedule/projects/' + pid + '/selections', {method: 'POST', headers: spSelHeaders(), body: JSON.stringify(spSelCapture())}).catch(function(){})
+  }, 800)
+}
+function spSelFlush(){
+  if(!SP.selTimer || !SP.selReady || !SP.formProject) return
+  clearTimeout(SP.selTimer); SP.selTimer = null
+  fetch('/api/schedule/projects/' + SP.formProject + '/selections', {method: 'POST', headers: spSelHeaders(),
+    body: JSON.stringify(spSelCapture()), keepalive: true}).catch(function(){})
+}
+async function spSelRestore(pid){
+  SP.selReady = false
+  clearTimeout(SP.selTimer); SP.selTimer = null
+  if(SP.info){ SP.selReady = true; return }               // came back from another project in this page: already as it was
+  var d = null
+  try{ d = await (await fetch('/api/schedule/projects/' + pid + '/selections')).json() }catch(e){}
+  if(SP.formProject !== pid) return
+  if(d && d.ok && !SP.info){
+    SP.selRestoring = true
+    try{
+      var st = d.state || {}
+      Object.keys(d.files || {}).forEach(function(f){
+        var h = spEl(f + '_network'); if(!h) return
+        h.value = d.files[f].local
+        if(typeof setChip === 'function') setChip(f, d.files[f].name)
+      })
+      if(d.token){ SP.token = d.token; SP.name = d.name || '' }
+      if(st.ov) SP.ov = st.ov
+      SP.look = st.look || ''; SP.sel = st.sel || null; SP.page = st.page || 0
+      if(st.settings) spApplySettings(st.settings)
+      SP.durTouched = !!st.durTouched
+      var bn = spEl('sp-board-note'); if(bn) bn.value = st.boardNote || ''
+      SP.board = st.board || null
+      if(d.token || (d.files || {}).schedule_image){
+        await spInspect({})
+        if(SP.info && SP.board){ spBoardShow() }
+      }
+      if(d.missing && d.missing.length) spNote('Some of what was chosen earlier for this project could not be found again: ' + escapeHtmlLite(d.missing.join('; ')) + '. Pick it again.', true)
+    }finally{ SP.selRestoring = false }
+  }
+  if(SP.formProject === pid) SP.selReady = true
+}
+window.spSelSchedule = spSelSchedule
+document.addEventListener('DOMContentLoaded', function(){
+  var root = document.getElementById('p-schedule')
+  if(root){ root.addEventListener('change', function(){ spSelSchedule() }); root.addEventListener('input', function(){ spSelSchedule() }) }
+})
 function scheduleProjectId(){ return (window.PRISM_PROJECT || {}).schedule || null }
 
 function scheduleProjectsInit(){
@@ -13600,8 +13673,10 @@ function scheduleProjectsInit(){
       // Another project's result, and its form, are not this one's.
       if(lastOpened !== p.project_id && spEl('sp-result')){ spEl('sp-result').innerHTML = ''; spEl('sp-result').style.display = 'none' }
       if(formProject !== p.project_id){
-        if(formProject) spSwitchProject(formProject, p.project_id)
+        if(formProject){ spSelFlush(); spSwitchProject(formProject, p.project_id) }
         formProject = p.project_id
+        SP.formProject = formProject
+        spSelRestore(formProject)
       }
       spBusyView(p.project_id)
       lastOpened = p.project_id
@@ -16411,6 +16486,7 @@ document.addEventListener('DOMContentLoaded', function(){
     chip.querySelector('.chip-name').textContent = name + (size != null ? ' (' + humanSize(size) + ')' : '')
     refreshAllAssetSummaries()
     if(/^shorts_/.test(fieldName)){ if(window.shSfxSync) setTimeout(window.shSfxSync, 0); if(window.shSelSchedule) window.shSelSchedule() }
+    if(/^schedule_/.test(fieldName) && window.spSelSchedule) window.spSelSchedule()
   }
   window.setChip = setChip
 
@@ -16452,6 +16528,7 @@ document.addEventListener('DOMContentLoaded', function(){
     }
     refreshAllAssetSummaries()
     if(/^shorts_/.test(fieldName)){ if(window.shSfxSync) setTimeout(window.shSfxSync, 0); if(window.shSelSchedule) window.shSelSchedule() }
+    if(/^schedule_/.test(fieldName) && window.spSelSchedule) window.spSelSchedule()
   }
   window.clearNetworkField = clearChip
 

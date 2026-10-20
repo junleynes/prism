@@ -831,3 +831,38 @@ def test_tuning_the_artwork_does_not_use_up_the_budget_for_generating(env, monke
         assert client.post('/api/schedule/inspect', data={'schedule_image_network': env['psd']}, headers=h).status_code == 200
     r = client.post('/api/schedule/render', headers=h, data={'schedule_image_network': env['psd'], 'duration': '99'})
     assert r.status_code == 400, 'refused for its length, not for being too frequent'
+
+
+def test_a_project_keeps_its_uploaded_artwork_storyboard_result_and_choices(env, monkeypatch, artwork):
+    monkeypatch.setattr(pipeline, 'ALLOW_LOCAL_MEDIA_UPLOAD', True)
+    client, h = _client()
+    pid = client.post('/api/schedule/projects', data={'title': 'Keep me'}, headers=h).get_json()['project']['project_id']
+    url = f'/api/schedule/projects/{pid}/selections'
+    assert client.get(url).get_json()['state'] == {}
+    with open(artwork['psd'], 'rb') as f:
+        d = client.post('/api/schedule/inspect', data={'schedule_image': (f, 'week.psd')}, headers=h,
+                        content_type='multipart/form-data').get_json()
+    state = {'settings': {'style': 'pop_pulse', 'duration': 45}, 'ov': {'layers': {'1': {'role': 'off'}}},
+             'board': {'suggestion': {'summary': 'hello'}}, 'boardNote': 'sparkle'}
+    r = client.post(url, json={'state': state, 'files': {'schedule_storyboard': env['png']}, 'token': d['token'], 'name': 'week.psd'}, headers=h)
+    assert r.get_json()['ok']
+    got = client.get(url).get_json()
+    try:
+        assert got['ok'] and got['state'] == state and got['name'] == 'week.psd'
+        assert got['token'] and got['token'] != d['token'] and re.match(r'^schedule_image_\d+_\d+\.psd$', got['token'])
+        # The kept copy is readable, as it was before the restart.
+        again = client.post('/api/schedule/inspect', data={'schedule_image_token': got['token']}, headers=h).get_json()
+        assert again['ok'] and len(again['layers']) == 5
+        # Another project has none of it.
+        other = client.post('/api/schedule/projects', data={'title': 'Other'}, headers=h).get_json()['project']['project_id']
+        assert client.get(f'/api/schedule/projects/{other}/selections').get_json()['state'] == {}
+        # Dropping the artwork forgets the file too.
+        client.post(url, json={'state': {}, 'files': {}, 'token': None}, headers=h)
+        assert client.get(url).get_json()['token'] is None
+    finally:
+        for t in (d['token'], got.get('token')):
+            if t:
+                try:
+                    os.remove(os.path.join(main.app.config['UPLOAD_FOLDER'], t))
+                except OSError:
+                    pass
