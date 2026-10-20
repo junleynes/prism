@@ -3787,7 +3787,7 @@ def fit_cues(edited, old_start, old_end, start, end, auto):
     return head + kept + tail
 
 
-def place_cues(cues, segs, fps):
+def place_cues(cues, segs, fps, split_place='join'):
     """Marks the cues that play over a split-screen shot (cue['seam'] = True)
     so write_ass centres them on the join between the two panes.
 
@@ -3796,7 +3796,8 @@ def place_cues(cues, segs, fps):
     split screen with nobody's face on it. A cue belongs to the layout its
     midpoint falls in, so one that straddles a cut isn't moved for the sake
     of a few frames."""
-    spans = [(s['a'], s['b']) for s in segs if s['layout'] == 'split']
+    # split_place 'low': the caption keeps its usual place under a split screen too.
+    spans = [(s['a'], s['b']) for s in segs if s['layout'] == 'split'] if split_place != 'low' else []
     for c in cues:
         mid = (c['start'] + c['end']) / 2.0 * fps
         c['seam'] = any(a <= mid <= b for a, b in spans)

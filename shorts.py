@@ -1445,6 +1445,16 @@ def _kept_overlay(bdir, options):
     return {'path': path, 'dur': float(ov.get('dur') or 1.0), 'audio': bool(ov.get('audio'))}
 
 
+def _is_final_short(a, item, n, total, chapter):
+    """Whether "the last short fades to black" applies to this one. A mini-drama's last short is the programme's
+    last chapter, not the last one of this render: re-rendering chapter 3 of 10 keeps its cliffhanger. Otherwise it
+    is the last of a render of several; one short alone is never "the last"."""
+    if chapter:
+        last = max((c.get('chapter') or 0) for c in a.get('candidates') or [])
+        return chapter >= last
+    return n == total and total > 1
+
+
 def _chapter_numbers(a, items):
     """{index in items: chapter number} for a mini-drama render: each item
     is the chapter of the analysis it overlaps most (the editor may have
@@ -1707,6 +1717,7 @@ def _run_render(jid, params):
                             'duration': round(P['duration'], 3)} for P in parts] if multi else None),
                 'options': {'reframe': reframe, 'subtitles': want_captions,
                             'subtitle_size': params['subtitle_size'],
+                            'split_caption': params.get('split_caption') or 'join',
                             'episode_labels': params.get('episode_labels', True),
                             'word_highlight': lit,
                             'highlight_color': params.get('highlight_color') if lit else None,
@@ -1764,7 +1775,7 @@ def _run_render(jid, params):
         fps = info['fps']
         it = _localize_item(it_global, off)
         # The last short of the render may finish on a fade to black instead of the ending chosen.
-        fades = bool(params.get('fade_last')) and n == total
+        fades = bool(params.get('fade_last')) and _is_final_short(a, it_global, n, total, chapters.get(n - 1))
         reel = it_global.get('_reel_key')
         ending_k = ending and not fades and it_global.get('_last', True)
         if ending_k and k not in unit_cache:
@@ -1808,7 +1819,7 @@ def _run_render(jid, params):
                 print(f'Vertical Shorts: short {n}/{total}: last word runs '
                       f'{audio_out - n_frames / fps:.2f}s past the out point; the sound is let finish under the hold')
         cues, edited = _item_cues(v, it, start_f / fps, end_f / fps, max_chars)
-        cues = sc.place_cues(cues, segs, fps)
+        cues = sc.place_cues(cues, segs, fps, params.get('split_caption'))
         plan = {'start_f': start_f, 'n_frames': n_frames, 'segs': segs, 'room': room,
                 'after': after, 'audio_out': audio_out, 'audio_fade': audio_fade}
 
@@ -1821,6 +1832,10 @@ def _run_render(jid, params):
             nxt = items[n] if n < len(items) else None
             contiguous = bool(nxt and chapters.get(n) == chapters[n - 1] + 1
                               and abs(float(nxt['start']) - float(it_global['end'])) < 0.5)
+            if not contiguous:
+                # Re-rendering one chapter of many: the next chapter is in the analysis, not in this render.
+                contiguous = any(c.get('chapter') == chapters[n - 1] + 1 and abs(float(c['start']) - float(it_global['end'])) < 0.5
+                                 for c in a.get('candidates') or [])
             badges = sc.chapter_badges(chapters[n - 1], chapters[n - 1] + 1 if contiguous else None,
                                        n_frames / fps, ep_text=params.get('episode_text'), next_text=params.get('next_text')) or None
         sopts = dict(opts, badges=badges, ending=ending_k, ending_hold=opts['ending_hold'] if ending_k else None,
@@ -2362,6 +2377,8 @@ def _render_options(data):
             'speaker': speaker and reframe != 'fit',
             'subtitles': data.get('subtitles', True) not in (False, 0, '0', 'false', 'off', None),
             'subtitle_size': data.get('subtitle_size') if data.get('subtitle_size') in sc.SUBTITLE_SIZES else 'm',
+            # Where a caption goes over a split screen: on the join between the panes, or low as everywhere else.
+            'split_caption': 'low' if data.get('split_caption') == 'low' else 'join',
             # The word being said is lit in this colour (needs word timings: see _run_render).
             'word_highlight': data.get('word_highlight') in (True, 1, '1', 'true', 'on', 'yes'),
             'highlight_color': sc.highlight_hex(data.get('highlight_color')),
@@ -3484,7 +3501,7 @@ def api_shorts_vpreview():
             cues, _ = _item_cues(a, item, start_f / fps, end_f / fps, sc.SUBTITLE_SIZES[opts['subtitle_size']][1])
         except ValueError as e:
             return jsonify(ok=False, error=str(e)), 400
-        cues = sc.place_cues(cues, segs, fps)
+        cues = sc.place_cues(cues, segs, fps, opts.get('split_caption'))
     key = json.dumps([a['path'], start_f, end_f, segs, cues, opts['subtitle_size']], sort_keys=True, default=str)
     out_name = 'shv_' + hashlib.sha1(key.encode()).hexdigest()[:16] + '.mp4'
     out_path = os.path.join(app.config['UPLOAD_FOLDER'], out_name)
@@ -3839,7 +3856,7 @@ def api_shorts_project(pid):
 # (in its folder, so a refresh, another browser or a restart of the server finds them again).
 # --------------------------------------------------------------------------
 
-_SEL_TEXT = ('highlight_color', 'cut_join', 'ending_look', 'ending_motion', 'mode', 'language', 'focus', 'avoid', 'leave_out', 'stt_prompt', 'vision_model', 'story_model',
+_SEL_TEXT = ('split_caption', 'highlight_color', 'cut_join', 'ending_look', 'ending_motion', 'mode', 'language', 'focus', 'avoid', 'leave_out', 'stt_prompt', 'vision_model', 'story_model',
              'reframe', 'subtitle_size', 'ending', 'format', 'loudness')
 _SEL_NUM = ('min_dur', 'max_dur', 'count', 'vision_frames', 'ending_hold', 'ending_zoom', 'ending_fade', 'ending_sfx_gain', 'ending_sfx_in', 'ending_sfx_out', 'parts_shown')
 _SEL_BOOL = ('word_highlight', 'speaker', 'subtitles', 'episode_labels', 'fade_last', 'caption_drop_sounds', 'caption_drop_speakers')
@@ -3930,7 +3947,7 @@ def _restage(kept):
 
 
 # --- Templates: the Output settings under a name, shared by everyone with Vertical Shorts -----------------
-TEMPLATE_KEYS = ('reframe', 'speaker', 'subtitles', 'subtitle_size', 'episode_labels', 'episode_text', 'next_text', 'word_highlight',
+TEMPLATE_KEYS = ('reframe', 'speaker', 'subtitles', 'subtitle_size', 'split_caption', 'episode_labels', 'episode_text', 'next_text', 'word_highlight',
                  'highlight_color', 'cut_join', 'ending', 'ending_hold', 'ending_zoom', 'ending_look', 'ending_motion',
                  'fade_last', 'ending_fade', 'ending_sfx_gain', 'ending_sfx_in', 'ending_sfx_out', 'format', 'loudness')
 TEMPLATE_NAME_MAX, TEMPLATES_MAX = 60, 100
@@ -4322,7 +4339,7 @@ def _run_recaption(jid, params):
     info, plan = src['info'], s['plan']
     _touch(src['path'])
     pipeline.job_set(jid, percent=5, step='Preparing')
-    cues = sc.place_cues([dict(c) for c in params['cues']], plan['segs'], info['fps'])
+    cues = sc.place_cues([dict(c) for c in params['cues']], plan['segs'], info['fps'], (o.get('split_caption')))
     fmt = o.get('format') if o.get('format') in SHORTS_FORMATS else 'mp4_high'
     # How THIS short ends: the last of a batch may have faded where the others held or cut.
     kind = s.get('ending') or o.get('ending') or 'none'

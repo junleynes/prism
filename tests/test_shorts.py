@@ -4130,3 +4130,12 @@ def test_workspace_has_a_reanalyse_panel():
     for needle in ('data-reana-open', 'data-reana="faces"', 'data-reana="captions"', 'data-reana="moment"',
                    '/api/shorts/reanalyse', 'function shWsReanalyse'):
         assert needle in html
+
+
+def test_re_rendering_one_chapter_keeps_its_cliffhanger_even_with_fade_last():
+    import shorts
+    a = {'candidates': [{'chapter': k} for k in range(1, 6)]}
+    assert shorts._is_final_short(a, {}, 1, 1, 3) is False        # chapter 3 of 5, rendered alone
+    assert shorts._is_final_short(a, {}, 2, 2, 5) is True         # the programme's last chapter
+    assert shorts._is_final_short({}, {}, 1, 1, None) is False    # one moment alone is not "the last"
+    assert shorts._is_final_short({}, {}, 3, 3, None) is True

@@ -2083,3 +2083,11 @@ def test_preview_render_skips_loudnorm():
 def test_chapter_badges_custom_text():
     b = sc.chapter_badges(3, 4, 90.0, ep_text='Episode {n}', next_text='Next: Episode')
     assert [x['text'] for x in b] == ['Episode 3', 'Next: Episode 4']
+
+
+def test_caption_over_split_screen_can_stay_low():
+    segs = [{'a': 0, 'b': 50, 'layout': 'split'}]
+    cues = [{'start': 0.5, 'end': 1.5, 'text': 'hi'}]
+    assert sc.place_cues([dict(c) for c in cues], segs, 25.0)[0]['seam'] is True
+    assert sc.place_cues([dict(c) for c in cues], segs, 25.0, 'join')[0]['seam'] is True
+    assert sc.place_cues([dict(c) for c in cues], segs, 25.0, 'low')[0]['seam'] is False

@@ -8434,6 +8434,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
       <input type=checkbox id=sh-captions checked> Burn in captions
     </label></div>
     <div class="sh-fld"><span class="sh-fld-l">Size</span><select id=sh-caption-size><option value=s>Small</option><option value=m selected>Medium</option><option value=l>Large</option></select></div>
+    <div class="sh-fld"><span class="sh-fld-l" title="Where the caption goes while the screen is split in two">Over split screen</span><select id=sh-split-cap><option value=join selected>On the join between the panes</option><option value=low>Low, as in other shots</option></select></div>
     <div class="sh-chk"><label title="Highlight the word being said in the caption. Needs the time of each word, so it applies to captions made by speech-to-text, not to ones read from an uploaded caption file." style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
       <input type=checkbox id=sh-word-hl onchange="shWordHlSync()"> Word highlighting
 <input type=hidden id=sh-hl-color value=yellow>
@@ -9190,6 +9191,7 @@ function shRenderOptions(){
           speaker: shEl('sh-speaker').checked && !shEl('sh-speaker').disabled,
           subtitles: shEl('sh-captions').checked,
           subtitle_size: shEl('sh-caption-size').value,
+          split_caption: shEl('sh-split-cap').value,
           episode_labels: shEl('sh-ep-labels').checked,
           episode_text: shEl('sh-ep-text').value, next_text: shEl('sh-next-text').value,
           word_highlight: shEl('sh-word-hl').checked && shEl('sh-captions').checked,
@@ -9719,7 +9721,7 @@ async function shTplSave(){
   name = name.trim()
   if(!name) return
   var cap = shSelCapture(), vals = {}
-  var keys = ['reframe','speaker','subtitles','subtitle_size','episode_labels','episode_text','next_text','word_highlight','highlight_color','cut_join','ending','ending_hold','ending_zoom','ending_look','ending_motion','fade_last','ending_fade','ending_sfx_gain','format','loudness']
+  var keys = ['reframe','speaker','subtitles','subtitle_size','split_caption','episode_labels','episode_text','next_text','word_highlight','highlight_color','cut_join','ending','ending_hold','ending_zoom','ending_look','ending_motion','fade_last','ending_fade','ending_sfx_gain','format','loudness']
   keys.forEach(function(k){ if(cap.values[k] !== undefined) vals[k] = cap.values[k] })
   var files = {}
   ;['shorts_sfx', 'shorts_overlay'].forEach(function(k){ if(cap.files[k]) files[k] = cap.files[k] })
@@ -10152,7 +10154,7 @@ function shWsLoad(delay, raw){
     shWsPost('/api/shorts/clip', {analysis_id: a.analysis_id, start: c.start - WS.lead, end: c.end + WS.tail}),
     // Cue times are relative to the start asked for, which is the start of the video shown: padded, they line up too.
     shWsPost('/api/shorts/captions', {analysis_id: a.analysis_id, start: c.start - WS.lead, end: c.end + WS.tail,
-                                      subtitle_size: shEl('sh-caption-size').value, edited: WS.lead || WS.tail ? null : (c.captions || null)})
+                                      subtitle_size: shEl('sh-caption-size').value, split_caption: shEl('sh-split-cap').value, edited: WS.lead || WS.tail ? null : (c.captions || null)})
   ]).then(function(r){
     if(tok !== WS.token) return
     WS.cues = r[1] && r[1].ok ? r[1].cues : []
@@ -10282,7 +10284,7 @@ async function shWsExact(draft, force){
   shWsMsg('Rendering a small 9:16 copy…')
   try{
     r = await shWsPost('/api/shorts/vpreview', {analysis_id: a.analysis_id, start: c.start, end: c.end, reframe: o.reframe,
-      speaker: o.speaker, subtitles: o.subtitles, subtitle_size: o.subtitle_size,
+      speaker: o.speaker, subtitles: o.subtitles, subtitle_size: o.subtitle_size, split_caption: o.split_caption,
       framing: draft !== undefined ? draft : (c.framing || null), captions: c.captions || null, force: !!force})
   }catch(err){ r = {ok: false, error: String(err)} }
   btn.disabled = false
@@ -11864,7 +11866,7 @@ function shCreateSync(){
 var SH_SEL = {
   text: {mode: 'sh-mode', count: 'sh-count', language: 'sh-language', focus: 'sh-focus', avoid: 'sh-avoid', leave_out: 'sh-leave-out',
          stt_prompt: 'sh-stt-prompt', vision_model: 'sh-vision-model', story_model: 'sh-story-model', reframe: 'sh-reframe',
-         episode_text: 'sh-ep-text', next_text: 'sh-next-text', subtitle_size: 'sh-caption-size', highlight_color: 'sh-hl-color', cut_join: 'sh-cut-join', ending_look: 'sh-ending-look', ending_motion: 'sh-ending-motion', ending: 'sh-ending', format: 'sh-format', loudness: 'sh-level'},
+         episode_text: 'sh-ep-text', next_text: 'sh-next-text', split_caption: 'sh-split-cap', subtitle_size: 'sh-caption-size', highlight_color: 'sh-hl-color', cut_join: 'sh-cut-join', ending_look: 'sh-ending-look', ending_motion: 'sh-ending-motion', ending: 'sh-ending', format: 'sh-format', loudness: 'sh-level'},
   num: {min_dur: 'sh-min', max_dur: 'sh-max', vision_frames: 'sh-frames', ending_hold: 'sh-ending-hold', ending_zoom: 'sh-ending-zoom',
         ending_fade: 'sh-ending-fade', ending_sfx_gain: 'sh-ending-sfx-gain', ending_sfx_in: 'sh-sfx-in', ending_sfx_out: 'sh-sfx-out'},
   bool: {word_highlight: 'sh-word-hl', speaker: 'sh-speaker', subtitles: 'sh-captions', episode_labels: 'sh-ep-labels', fade_last: 'sh-fade-last',
