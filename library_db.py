@@ -702,9 +702,16 @@ NETWORK_FOLDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 NETWORK_CATEGORY_KEYS = ['hires', 'shorts', 'captions', 'schedule', 'tcard', 'endcard', 'transitions', 'music', 'vo', 'sfx', 'script']
 _NETWORK_FOLDER_FIELDS = ('path', 'username', 'password')
 
+def split_network_source(category):
+    """'shorts@a1b2c3' -> ('shorts', 'a1b2c3'); a plain category -> (category, ''). A category can have
+    several named sources besides its main folder; a source is addressed by suffixing its id."""
+    base, _, sid = (category or '').partition('@')
+    return base, sid
+
 def load_network_folders():
-    """{category: {path, username, password}} for every configured folder.
-    A category absent from this dict simply hasn't been set up yet --
+    """{category: {path, username, password, name, sources}} for every configured folder.
+    `sources` are the extra named folders of that category ([{id, name, path, username,
+    password}]). A category absent from this dict simply hasn't been set up yet --
     callers should treat that the same as one present with every field
     blank (not reachable until configured), there is no fallback source to
     pull from."""
@@ -718,6 +725,17 @@ def load_network_folders():
         for cat in out:
             if data[cat].get('in_place'):
                 out[cat]['in_place'] = True
+            out[cat]['name'] = str(data[cat].get('name') or '')
+            srcs = []
+            for x in data[cat].get('sources') or []:
+                if not isinstance(x, dict) or not x.get('id'):
+                    continue
+                if x.get('password') and not secretbox.is_encrypted(x['password']):
+                    plain = True
+                srcs.append({'id': str(x['id']), 'name': str(x.get('name') or ''), 'path': x.get('path', ''),
+                             'username': x.get('username', ''),
+                             'password': secretbox.decrypt_or_blank(x.get('password'))})
+            out[cat]['sources'] = srcs
             out[cat]['password'] = secretbox.decrypt_or_blank(out[cat].get('password'))
         if plain:
             _write_network_folders(out)           # saved before encryption at rest: re-save encrypted
@@ -740,6 +758,8 @@ def save_network_folder(category, fields):
     for k in _NETWORK_FOLDER_FIELDS:
         if k in fields:
             row[k] = fields[k] or ''
+    if 'name' in fields:
+        row['name'] = (fields['name'] or '').strip()[:60]
     if 'in_place' in fields:
         # "Read the files where they are" rather than copy them to this server first.
         row['in_place'] = bool(fields['in_place'])
@@ -747,6 +767,38 @@ def save_network_folder(category, fields):
     _write_network_folders(current)
     return True, None
 
+def save_network_source(category, source_id, fields):
+    """Adds (source_id 'new') or edits one extra named source of `category`. Same rules as
+    save_network_folder: a field not in `fields` is kept, an empty one clears it. -> (ok, error, id)."""
+    if category not in NETWORK_CATEGORY_KEYS:
+        return False, f'Unknown category "{category}".', None
+    current = load_network_folders()
+    row = current.setdefault(category, {k: '' for k in _NETWORK_FOLDER_FIELDS})
+    srcs = row.setdefault('sources', [])
+    if source_id == 'new':
+        src = {'id': uuid.uuid4().hex[:8], 'name': '', 'path': '', 'username': '', 'password': ''}
+        srcs.append(src)
+    else:
+        src = next((x for x in srcs if x['id'] == source_id), None)
+        if not src:
+            return False, 'That source no longer exists.', None
+    for k in ('name', 'path', 'username', 'password'):
+        if k in fields:
+            src[k] = ((fields[k] or '').strip()[:60] if k == 'name' else (fields[k] or ''))
+    _write_network_folders(current)
+    return True, None, src['id']
+
+def delete_network_source(category, source_id):
+    current = load_network_folders()
+    row = current.get(category)
+    if not row:
+        return False
+    before = len(row.get('sources') or [])
+    row['sources'] = [x for x in row.get('sources') or [] if x['id'] != source_id]
+    if len(row['sources']) == before:
+        return False
+    _write_network_folders(current)
+    return True
 
 def _write_network_folders(folders):
     """Writes {category: row} with every password encrypted (secretbox)."""
@@ -756,6 +808,13 @@ def _write_network_folders(folders):
         row['password'] = secretbox.encrypt(row.get('password') or '')
         if not row.get('in_place'):
             row.pop('in_place', None)             # kept in the file only where it is on
+        if not row.get('name'):
+            row.pop('name', None)
+        srcs = [dict(x, password=secretbox.encrypt(x.get('password') or '')) for x in row.get('sources') or []]
+        if srcs:
+            row['sources'] = srcs
+        else:
+            row.pop('sources', None)
         out[cat] = row
     settings_store.save(NETWORK_FOLDERS_FILE, out)
 

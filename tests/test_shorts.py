@@ -4151,3 +4151,37 @@ def test_tiktok_delivery_format():
     cmd = pipeline.build_export_cmd('in.mp4', 'out.mp4', 'tiktok')
     assert '1080:1920' in ' '.join(cmd) and 'fps=30' in ' '.join(cmd)
     assert pipeline.EXPORT_FORMATS['tiktok']['ext'] == 'mp4'
+
+
+def test_network_sources_per_category(tmp_path, monkeypatch):
+    import library_db as ldb, pipeline
+    monkeypatch.setattr(ldb, 'NETWORK_FOLDERS_FILE', str(tmp_path / 'nf.json'))
+    ok, err = ldb.save_network_folder('shorts', {'path': r'\\srv\main', 'name': 'Main'})
+    assert ok
+    ok, err, a = ldb.save_network_source('shorts', 'new', {'name': 'Drama', 'path': r'\\srv\drama', 'password': 'pw'})
+    assert ok
+    rows = ldb.load_network_folders()['shorts']
+    assert rows['sources'][0]['password'] == 'pw' and rows['name'] == 'Main'
+    assert 'pw' not in open(str(tmp_path / 'nf.json')).read()
+    assert pipeline._network_folder_row(f'shorts@{a}')['path'] == r'\\srv\drama'
+    assert pipeline._network_folder_row('shorts')['path'] == r'\\srv\main'
+    assert pipeline._network_folder_row('shorts@nope') .get('path', '') == ''
+    assert pipeline._network_category(f'shorts@{a}') == pipeline._network_category('shorts')
+    assert ldb.delete_network_source('shorts', a) and not ldb.load_network_folders()['shorts']['sources']
+
+
+def test_network_sources_routes(tmp_path, monkeypatch):
+    import library_db as ldb
+    monkeypatch.setattr(ldb, 'NETWORK_FOLDERS_FILE', str(tmp_path / 'nf.json'))
+    c, h = _client()
+    post = lambda **b: c.post('/api/network/shares', json=b, headers=h).get_json()
+    assert post(category='shorts', path=r'\\srv\main', name='Main')['ok']
+    assert c.get('/api/network/sources?category=shorts').get_json()['sources'] == []   # one folder: no dropdown
+    r = post(category='shorts', source='new', name='Drama', path=r'\\srv\drama')
+    assert r['ok']
+    srcs = c.get('/api/network/sources?category=shorts').get_json()['sources']
+    assert [x['name'] for x in srcs] == ['Main', 'Drama'] and srcs[1]['key'] == f"shorts@{r['source']}"
+    shares = c.get('/api/network/shares').get_json()['categories']['shorts']
+    assert shares['sources'][0]['name'] == 'Drama' and 'password' not in shares['sources'][0]
+    assert post(category='shorts', source=r['source'], delete=True)['ok']
+    assert c.get('/api/network/sources?category=shorts').get_json()['sources'] == []

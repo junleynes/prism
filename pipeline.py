@@ -42,6 +42,7 @@ from library_db import (LIBRARY_DIR, library_add, library_list, library_stats, l
     clear_branding_logo, clear_branding_favicon, clear_branding_color, BRANDING_DIR,
     load_disabled_services, set_service_disabled, save_branding_theme, THEME_PRESETS,
     load_network_folders, save_network_folder, NETWORK_CATEGORY_KEYS,
+    split_network_source, save_network_source, delete_network_source,
     network_destinations_list, network_destination_get, network_destination_add,
     network_destination_update, network_destination_remove, library_set_project, library_project_counts)
 from auth import require_permission, MEDIA_PERMISSIONS
@@ -467,7 +468,7 @@ def _network_categories():
 def _network_category(category):
     """Validates/normalizes a category key, falling back to 'hires'."""
     cats = _network_categories()
-    return cats.get(category, cats[DEFAULT_NETWORK_CATEGORY])
+    return cats.get(split_network_source(category)[0], cats[DEFAULT_NETWORK_CATEGORY])
 
 def _sanitize_subpath(subpath):
     """Validates a subfolder path (relative to a category's configured root)
@@ -493,6 +494,11 @@ def _network_folder_row(category):
     Resolved here and nowhere else, so listing, searching, fetching and the
     SMB session can never disagree about which folder a category means."""
     folders = load_network_folders()
+    base, sid = split_network_source(category)
+    if sid:
+        # An extra named source of the category: its own folder and login, never a fallback.
+        src = next((x for x in folders.get(base, {}).get('sources') or [] if x['id'] == sid), None)
+        return dict(src or {}, in_place=bool(folders.get(base, {}).get('in_place')))
     row = folders.get(category, {})
     seen = {category}
     while not (row.get('path') or '').strip():
@@ -709,13 +715,14 @@ INPLACE_ORIGINS = {}    # path on the share -> {'category', 'subpath', 'name'}
 
 def network_in_place(category):
     """Whether picks from `category` are read where they are."""
+    full, category = category, split_network_source(category)[0]
     if category not in INPLACE_CATEGORIES:
         return False
     # The box on the folder's own row counts even while its path is blank and it is
     # borrowing another folder (Vertical Shorts reading the HIRES one) -- that is where
     # the person ticked it.
     return bool(load_network_folders().get(category, {}).get('in_place')
-                or _network_folder_row(category).get('in_place'))
+                or _network_folder_row(full).get('in_place'))
 
 
 def _readable_in_place(path):
@@ -830,7 +837,7 @@ def stage_network_file(name, category=DEFAULT_NETWORK_CATEGORY, subpath=''):
                 size = os.path.getsize(remote_path)
             except OSError:
                 size = None
-            if size is not None and category in VIDEO_SOURCE_CATEGORIES:
+            if size is not None and split_network_source(category)[0] in VIDEO_SOURCE_CATEGORIES:
                 ok, err = check_video_size(size, label=name)
                 if not ok:
                     raise ValueError(err)
@@ -884,7 +891,7 @@ def fetch_network_file(name, category=DEFAULT_NETWORK_CATEGORY, subpath=''):
     # video categories (HIRES, and the Vertical Shorts folder), which this
     # limit is actually about; the others (music, SFX, cards) were never in
     # scope for a "max video size" setting.
-    if category in VIDEO_SOURCE_CATEGORIES:
+    if split_network_source(category)[0] in VIDEO_SOURCE_CATEGORIES:
         try:
             size = smbclient.stat(remote_path).st_size
         except Exception:
@@ -9887,6 +9894,23 @@ def api_network_list():
     except Exception as e:
         return jsonify(ok=False, error=f'Could not reach network folder: {e}'), 500
 
+@app.route('/api/network/sources')
+@require_permission(*MEDIA_PERMISSIONS)
+def api_network_sources():
+    """The folders Browse library can open for ?category=: its main folder plus any extra named
+    sources, as [{key, name}] -- `key` is what the other /api/network routes take as the category.
+    Empty when there is nothing to choose between (the picker then shows no dropdown)."""
+    base = split_network_source(request.args.get('category', DEFAULT_NETWORK_CATEGORY))[0]
+    if base not in _network_categories():
+        return jsonify(ok=True, sources=[])
+    row = load_network_folders().get(base, {})
+    extra = [x for x in row.get('sources') or [] if (x.get('path') or '').strip()]
+    out = []
+    if extra and _network_share_root(base):
+        out.append({'key': base, 'name': row.get('name') or 'Default'})
+    out += [{'key': f"{base}@{x['id']}", 'name': x.get('name') or x['path']} for x in extra]
+    return jsonify(ok=True, sources=out if len(out) > 1 else [])
+
 @app.route('/api/network/favorites')
 @require_permission(*MEDIA_PERMISSIONS)
 def api_network_favorites_list():
@@ -9905,7 +9929,7 @@ def api_network_favorites_add():
     category = (data.get('category') or '').strip()
     path = (data.get('path') or '').strip()
     label = (data.get('label') or '').strip()
-    if category not in _network_categories():
+    if split_network_source(category)[0] not in _network_categories():
         return jsonify(ok=False, error='Unknown category.'), 400
     if not label:
         # Falls back to the last path segment, or a readable placeholder for
@@ -10277,6 +10301,10 @@ def api_network_shares_get():
             'can_in_place': cat in INPLACE_CATEGORIES,
             # Which category this one reads while its own path is blank, if any.
             'fallback': _network_categories().get(cat, {}).get('fallback'),
+            'name': row.get('name', ''),
+            'sources': [{'id': x['id'], 'name': x.get('name', ''), 'path': x.get('path', ''),
+                         'username': x.get('username', ''), 'has_password': bool(x.get('password'))}
+                        for x in row.get('sources') or []],
         }
     return jsonify(ok=True, categories=out)
 
@@ -10297,7 +10325,24 @@ def api_network_shares_post():
     category = (data.get('category') or '').strip()
     if category not in NETWORK_CATEGORY_KEYS:
         return jsonify(ok=False, error=f'Unknown category "{category}".'), 400
-    fields = {k: data[k] for k in ('path', 'username', 'password') if k in data}
+    source = str(data.get('source') or '').strip()
+    if source:
+        # One of the category's extra named sources: 'new' adds one, an id edits it, delete removes it.
+        if data.get('delete'):
+            if not delete_network_source(category, source):
+                return jsonify(ok=False, error='That source no longer exists.'), 404
+            audit_log('network_folder_change', target=f'{category}@{source}', detail='source removed',
+                      user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+            return jsonify(ok=True, category=category)
+        sf = {k: data[k] for k in ('name', 'path', 'username', 'password') if k in data}
+        ok, err, sid = save_network_source(category, source, sf)
+        if not ok:
+            return jsonify(ok=False, error=err), 400
+        audit_log('network_folder_change', target=f'{category}@{sid}',
+                  detail=f"path={sf['path']}" if 'path' in sf else None,
+                  user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
+        return jsonify(ok=True, category=category, source=sid)
+    fields = {k: data[k] for k in ('name', 'path', 'username', 'password') if k in data}
     if 'in_place' in data and category in INPLACE_CATEGORIES:
         fields['in_place'] = bool(data['in_place'])
     ok, err = save_network_folder(category, fields)
