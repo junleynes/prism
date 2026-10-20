@@ -10498,8 +10498,16 @@ function shortsPreview(i){
     .catch(function(e){ p.status.style.color = 'var(--amber)'; p.status.textContent = 'Request failed: ' + e })
 }
 
-function shortsPlay(url, title){
+function shortsPlay(url, title, fallbackUrl){
   var p = shOpenPlayer(title || 'Short', '')
+  var tried = false, fail = p.video.onerror
+  // The light preview copy is a convenience: if it will not play (missing, or not made), play the full file.
+  p.video.onerror = function(){
+    if(fallbackUrl && !tried && fallbackUrl !== url){
+      tried = true; p.video.src = fallbackUrl; p.video.load(); p.video.play().catch(function(){}); return
+    }
+    fail()
+  }
   p.video.src = url; p.video.load(); p.video.play().catch(function(){})
 }
 
@@ -11496,7 +11504,7 @@ function shBatchCard(b, fresh){
     (fresh ? '<p class="sh-note">Saved in this project' + (b.project_name ? ', <b>' + escapeHtmlLite(b.project_name) + '</b>' : '') + ': see <b>Shorts in this project</b>. Render again with a different reframe or other moments at any time while this cut is open.</p>' : '')
   card.addEventListener('click', function(e){
     var p = e.target.closest('[data-play]')
-    if(p){ var s = b.shorts[parseInt(p.getAttribute('data-play'), 10)]; shortsPlay(s.preview_url || s.url, s.title); return }
+    if(p){ var s = b.shorts[parseInt(p.getAttribute('data-play'), 10)]; shortsPlay(s.preview_url || s.url, s.title, s.url); return }
     var dt = e.target.closest('[data-details]')
     if(dt){
       var pn = card.querySelector('[data-details-panel]'), open = pn.style.display === 'none'
