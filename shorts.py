@@ -1666,12 +1666,12 @@ def _run_render(jid, params):
     lit = bool(params.get('word_highlight')) and bool(params.get('subtitles', True))
     if lit and not any(P['words'] for P in parts):
         if any(P['segments'] for P in parts):
-            warnings.append('"Light the word being said": this episode only has the time of each caption line (its '
+            warnings.append('"Word highlighting": this episode only has the time of each caption line (its '
                             'captions came from a file), so each word\'s time is worked out from its line, by length. '
                             'It follows the speech closely but not exactly.')
         else:
             lit = False
-            warnings.append('"Light the word being said" needs the time of each word, and this episode has no '
+            warnings.append('"Word highlighting" needs the time of each word, and this episode has no '
                             'transcript, so the captions are plain.')
 
     bid = f'{int(time.time())}_{secrets.token_hex(3)}'

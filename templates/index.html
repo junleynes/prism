@@ -8434,8 +8434,8 @@ document.getElementById('vf').addEventListener('submit', async function(e){
       <input type=checkbox id=sh-captions checked> Burn in captions
     </label></div>
     <div class="sh-fld"><span class="sh-fld-l">Size</span><select id=sh-caption-size><option value=s>Small</option><option value=m selected>Medium</option><option value=l>Large</option></select></div>
-    <div class="sh-chk"><label title="Light the word being said in the caption. Needs the time of each word, so it applies to captions made by speech-to-text, not to ones read from an uploaded caption file." style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
-      <input type=checkbox id=sh-word-hl onchange="shWordHlSync()"> Light the word being said
+    <div class="sh-chk"><label title="Highlight the word being said in the caption. Needs the time of each word, so it applies to captions made by speech-to-text, not to ones read from an uploaded caption file." style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
+      <input type=checkbox id=sh-word-hl onchange="shWordHlSync()"> Word highlighting
 <input type=hidden id=sh-hl-color value=yellow>
       <span id=sh-hl-pal style="display:none;align-items:center;gap:4px" title="The colour of the word being said"><button type=button class=sh-sw data-c=yellow title="Yellow" style="background:#FFD400" onclick="shHlPick('yellow')"></button><button type=button class=sh-sw data-c=green title="Green" style="background:#39E75F" onclick="shHlPick('green')"></button><button type=button class=sh-sw data-c=cyan title="Cyan" style="background:#2EDFFF" onclick="shHlPick('cyan')"></button><button type=button class=sh-sw data-c=orange title="Orange" style="background:#FF8A1F" onclick="shHlPick('orange')"></button><button type=button class=sh-sw data-c=pink title="Pink" style="background:#FF4FA3" onclick="shHlPick('pink')"></button><button type=button class=sh-sw data-c=red title="Red" style="background:#FF3B3B" onclick="shHlPick('red')"></button><button type=button class=sh-sw data-c=purple title="Purple" style="background:#B07CFF" onclick="shHlPick('purple')"></button><button type=button class=sh-sw data-c=white title="White" style="background:#FFFFFF" onclick="shHlPick('white')"></button><input type=color id=sh-hl-custom value="#ffd400" title="Pick any colour" oninput="shHlPick(this.value)" style="width:26px;height:22px;padding:0;border:1px solid var(--line);background:none;cursor:pointer"></span>
     </label></div>
@@ -11383,7 +11383,7 @@ function shBatchDetails(b){
   cards.push(card('Captions', [
     row('Burned in', o.subtitles ? 'yes' : 'no'),
     o.subtitles ? row('Size', {s: 'Small', m: 'Medium', l: 'Large'}[o.subtitle_size] || E(o.subtitle_size || '')) : '',
-    o.subtitles ? row('Light the word being said', o.word_highlight ? 'on <span style="display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px;background:#' + E(/^[0-9a-fA-F]{6}$/.test(o.highlight_color || '') ? o.highlight_color : 'FFD400') + '"></span>' : 'off') : '',
+    o.subtitles ? row('Word highlighting', o.word_highlight ? 'on <span style="display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px;background:#' + E(/^[0-9a-fA-F]{6}$/.test(o.highlight_color || '') ? o.highlight_color : 'FFD400') + '"></span>' : 'off') : '',
     row('EP labels', o.episode_labels === false ? 'off' : E((o.episode_text || 'EP {n}') + ' / ' + (o.next_text || 'NEXT: EP {n} >>')))]))
   var end = o.ending === 'cliffhanger'
   cards.push(card('Ending', [
