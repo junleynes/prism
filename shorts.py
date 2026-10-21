@@ -53,6 +53,7 @@ from core import app, _job_submit_limiter, _client_ip, _RateLimiter
 from library_db import LIBRARY_DIR, audit_log, network_destination_get
 from auth import require_permission, group_membership
 import captionfile
+import moments_csv
 import pipeline
 import shorts_core as sc
 import shorts_projects as sp
@@ -742,6 +743,63 @@ def _part_index(parts, t):
     return len(parts) - 1
 
 
+def _listed_candidates(rows, parts, segments, fps, warnings):
+    """Candidates from the editor's own list (moments_csv rows) instead of
+    the AI's picks: times in the part's own clock when the row names a part,
+    otherwise on the joined timeline. The points are taken as given (only put
+    on whole frames); a moment cannot run across the break between parts.
+    (candidates, 0)."""
+    out, bad = [], []
+    for r in rows:
+        label = r.get('title') or f"row {r['line']}"
+        try:
+            if r.get('part'):
+                if not 1 <= r['part'] <= len(parts):
+                    bad.append(f'"{label}": there is no part {r["part"]}')
+                    continue
+                P = parts[r['part'] - 1]
+                a = P['offset'] + moments_csv.to_seconds(r['in'], P['fps'])
+                b = P['offset'] + moments_csv.to_seconds(r['out'], P['fps'])
+            else:
+                P = parts[_part_index(parts, moments_csv.to_seconds(r['in'], parts[0]['fps']))]
+                a = moments_csv.to_seconds(r['in'], P['fps'])
+                b = moments_csv.to_seconds(r['out'], P['fps'])
+        except ValueError:
+            bad.append(f'"{label}": time not understood')
+            continue
+        lo, hi = P['offset'], P['offset'] + P['duration']
+        if a >= hi - 0.05:
+            bad.append(f'"{label}": starts after the end of the video ({hi - lo:.0f} s)')
+            continue
+        if b > hi + 0.01:
+            warnings.append(f'"{label}": out point is past the end of '
+                            f'{"the video" if len(parts) == 1 else "its part"}, so it was cut there.')
+        b = min(b, hi)
+        f = P['fps']
+        a, b = round(a * f) / f, round(b * f) / f
+        if not b > a:
+            bad.append(f'"{label}": out must be after in')
+            continue
+        if b - a > SHORTS_MAX_CLIP:
+            bad.append(f'"{label}": {b - a:.0f} s is longer than the {SHORTS_MAX_CLIP:.0f}-second limit')
+            continue
+        lines = [s for s in segments if s['start'] < b and s['end'] > a]
+        text = ' '.join(s['text'] for s in lines)
+        out.append({
+            'start': round(a, 3), 'end': round(b, 3), 'duration': round(b - a, 2),
+            'title': r.get('title') or ' '.join(text.split()[:7]) or f'Moment {len(out) + 1}',
+            'hook': lines[-1]['text'] if lines else '', 'why': r.get('note') or 'From your list.',
+            'source': 'list', 'flags': [], 'story_score': None, 'visual_score': None, 'pace': None,
+            'sound_score': None, 'score': None, 'text': text[:2400], 'lines': len(lines),
+        })
+    if bad:
+        warnings.append(f'{len(bad)} row{"" if len(bad) == 1 else "s"} of your list could not be used: '
+                        + '; '.join(bad[:6]) + ('...' if len(bad) > 6 else '') + '.')
+    warnings.append(f'Moments are from your list ({len(out)} used). Nothing was rated or ranked by AI, '
+                    'so scores are blank.')
+    return out, 0
+
+
 def _run_analysis(jid, params):
     """Finds the candidate moments. Returns the analysis id, or None when it
     ended with an error (already reported).
@@ -776,7 +834,8 @@ def _run_analysis(jid, params):
     # -- rather than quietly producing candidates picked on half the
     # evidence that look like the real thing.
     down = []
-    chk = pipeline._check_service('ollama', pipeline.OLLAMA_URL, '/api/tags')
+    listed = bool(params.get('moments'))
+    chk = {'status': 'up'} if listed else pipeline._check_service('ollama', pipeline.OLLAMA_URL, '/api/tags')
     if chk['status'] != 'up':
         down.append(f"AI Vision / story model (Ollama at {pipeline.OLLAMA_URL}): {chk.get('error', 'unreachable')}")
     caps = params.get('captions') or [None] * n_parts
@@ -809,7 +868,7 @@ def _run_analysis(jid, params):
         offset += float(info['duration'])
     duration = offset
     fps = parts[0]['fps']
-    if duration < min_dur + 5:
+    if duration < (5 if listed else min_dur + 5):
         report(error=f'This video is only {duration:.0f}s long -- too short to cut '
                          f'{int(min_dur)}-{int(max_dur)}s shorts from. Lower the minimum length or use a longer source.'
                      if n_parts == 1 else
@@ -834,10 +893,14 @@ def _run_analysis(jid, params):
     cuts = sorted(set(cuts))
 
     # ---- Layer 1: how dramatic does it look ----
-    times = sc.vision_sample_times(shots, duration, budget=params['vision_frames'])
-    # The opening and close of every part are looked at closely, so a billboard of ten seconds is not stepped over.
-    times = sorted(set(times) | set(sc.edge_sample_times([(P['offset'], P['duration']) for P in parts], shots, taken=times)))
-    report(percent=20, step=f'Rating {len(times)} frames (AI vision)')
+    if listed:
+        # The editor's own list: nothing is rated or ranked.
+        times = []
+    else:
+        times = sc.vision_sample_times(shots, duration, budget=params['vision_frames'])
+        # The opening and close of every part are looked at closely, so a billboard of ten seconds is not stepped over.
+        times = sorted(set(times) | set(sc.edge_sample_times([(P['offset'], P['duration']) for P in parts], shots, taken=times)))
+        report(percent=20, step=f'Rating {len(times)} frames (AI vision)')
     items = [(t, b) for t, b in _grab_by_part(parts, times) if b]
     visual, errors = [], []
     progress = {'done': 0}
@@ -862,13 +925,13 @@ def _run_analysis(jid, params):
         with ThreadPoolExecutor(max_workers=max(1, min(pipeline.AI_SCORE_WORKERS, len(items)))) as ex:
             list(ex.map(_rate, items))
     visual.sort(key=lambda v: v['t'])
-    if not visual:
+    if not visual and not listed:
         why = (errors[0] if errors else 'its replies could not be read as a rating')
         report(error=f'The AI Vision model "{vision_model}" did not rate a single frame ({why}). '
                          'Check that the model is pulled on the Ollama server and is a vision model, '
                          'or pick another one under Advanced.')
         return
-    if prod.get('unload_vision_after_scoring', True):
+    if prod.get('unload_vision_after_scoring', True) and not listed:
         # Same hand-off as the promo pipeline: free the GPU before whisper
         # loads, since the two commonly share one card.
         pipeline.unload_ollama_model(vision_model)
@@ -966,7 +1029,7 @@ def _run_analysis(jid, params):
     walls = [P['offset'] for P in parts[1:]]
     wall_ranges = [(w - 0.001, w + 0.001, ['part break']) for w in walls]
     beats, chunks, skips = [], [], []
-    if segments:
+    if segments and not listed:
         chunks = sc.chunk_segments(segments, SHORTS_STORY_CHUNK_SEC, SHORTS_STORY_OVERLAP_SEC)
         # How many to ask each stretch for: enough, over them all, to fill
         # the count half as much again -- but never more than a stretch can
@@ -1008,7 +1071,7 @@ def _run_analysis(jid, params):
                             're-time them.')
         if prod.get('unload_vision_after_scoring', True):
             pipeline.unload_ollama_model(story_model)
-    else:
+    elif not listed:
         beats = sc.visual_windows(visual, min_dur, max_dur, duration, count)
         warnings.append(f"No dialogue was transcribed ({heard_why or 'nothing was heard'}), so these "
                         'were picked on visual intensity alone -- they are not checked for making sense as a '
@@ -1034,13 +1097,15 @@ def _run_analysis(jid, params):
                       for k, a, b in params['leave_out_parts'] if a < parts[k]['duration']]
     else:
         editor_out = [(a, min(b, duration)) for a, b in params.get('leave_out') or [] if a < duration]
-    blocked = sc.not_story_ranges(skips, segments, visual, shots, editor_out, kinds=params.get('exclude_kinds'))
+    blocked = [] if listed else sc.not_story_ranges(skips, segments, visual, shots, editor_out, kinds=params.get('exclude_kinds'))
     lengths = {}
     # Half as many again as wanted are built, so that a closer look -- at
     # their own frames and their sound -- can change which make the list.
     pool = min(SHORTS_MAX_ITEMS * 2, int(math.ceil(limit * 1.5)) + 2)
-    minidrama = params.get('mode') == 'minidrama'
-    if minidrama:
+    minidrama = params.get('mode') == 'minidrama' and not listed
+    if listed:
+        cands, edges_moved = _listed_candidates(params['moments'], parts, segments, fps, warnings)
+    elif minidrama:
         # The whole drama as consecutive chapters: nothing to rank or refine.
         cands = sc.plan_chapters(duration, blocked, segments, cuts, visual, words, min_dur, max_dur,
                                  fps=fps, walls=walls, limit=SHORTS_MAX_ITEMS)
@@ -1073,13 +1138,15 @@ def _run_analysis(jid, params):
     # A few frames inside each moment, rated like the first sample.
     # A mini-drama is the whole programme, so a title card or an interview the first sparse sample (one frame in
     # every few tens of seconds) never landed on would stay in it: each chapter is looked into much more closely.
-    if minidrama:
+    if listed:
+        inner = {}
+    elif minidrama:
         inner = sc.inner_sample_times(cands, [v['t'] for v in visual], SHORTS_CHAPTER_FRAMES,
                                       per_moment=max(SHORTS_MOMENT_FRAMES_EACH, int(math.ceil(max_dur / 6.0))), min_gap=3.0)
     else:
         inner = sc.inner_sample_times(cands, [v['t'] for v in visual], SHORTS_MOMENT_FRAMES,
                                       per_moment=SHORTS_MOMENT_FRAMES_EACH)
-    more = sorted({t for ts in inner.values() for t in ts})
+    more = [] if listed else sorted({t for ts in inner.values() for t in ts})
     inner_rated = 0
     if more:
         report(percent=89, step=f'Rating {len(more)} frames inside the moments (AI vision)')
@@ -1125,11 +1192,11 @@ def _run_analysis(jid, params):
                         'If something was left out by mistake, add it back with "Add your own moment".')
     dbs = [P['db'] for P in parts if P.get('db') is not None and len(P['db'])]
     ref = sc.sound_reference(np.concatenate(dbs)) if dbs else None
-    for c in cands:
+    for c in ([] if listed else cands):
         P = parts[_part_index(parts, c['start'])]
         o = P['offset']
         sc.rescore(c, visual, words, segments, sound=sc.sound_score(P.get('db'), c['start'] - o, c['end'] - o, ref))
-    cands = cands[:SHORTS_MAX_ITEMS] if minidrama else sc.dedupe_windows(cands)[:max(1, int(limit))]
+    cands = cands if listed else cands[:SHORTS_MAX_ITEMS] if minidrama else sc.dedupe_windows(cands)[:max(1, int(limit))]
     for n, c in enumerate(cands, 1):
         c['id'] = f'c{n}'
     if lengths.get('too_short'):
@@ -1173,11 +1240,11 @@ def _run_analysis(jid, params):
                     'focus': params.get('focus'), 'avoid': params.get('avoid'),
                     'exclude_kinds': sorted(params.get('exclude_kinds') or []), 'mode': params.get('mode') or 'moments',
                     'language': params.get('language'), 'stt_prompt': params.get('stt_prompt'),
-                    'leave_out': editor_out},
+                    'leave_out': editor_out, 'moments_list': listed},
         'stats': {'shots': len(shots), 'frames_rated': len(visual), 'transcript_lines': len(segments),
                   'lines_aligned': aligned, 'words_aligned': words_aligned, 'edges_moved': edges_moved, 'frames_inside': inner_rated,
                   'story_parts': len(chunks), 'vision_model': vision_model, 'story_model': story_model,
-                  'parts': n_parts, 'processed_seconds': round(time.time() - _t_start, 1)},
+                  'parts': n_parts, 'listed': listed, 'processed_seconds': round(time.time() - _t_start, 1)},
     }
     if n_parts == 1:
         P = parts[0]
@@ -2591,6 +2658,14 @@ def api_shorts_analyze():
     if bad:
         return jsonify(error='Leave out: ' + bad), 400
     path = srcs[0]['path']
+    moments = None
+    mf = request.files.get('moments_file')
+    mtext = request.form.get('moments_text') or ''
+    if (mf is not None and mf.filename) or mtext.strip():
+        raw = mf.read(moments_csv.MAX_BYTES + 1) if (mf is not None and mf.filename) else mtext[:moments_csv.MAX_BYTES]
+        moments, merr = moments_csv.parse(raw)
+        if merr:
+            return jsonify(error='Moments list: ' + merr), 400
     prod = pipeline.load_production_defaults()
     vision_model = (request.form.get('vision_model') or '').strip() or prod.get('vision_model') or 'qwen3-vl:8b'
     params = {
@@ -2612,6 +2687,7 @@ def api_shorts_analyze():
         'leave_out': leave_out, 'leave_out_parts': leave_parts,
         'parts': srcs if len(srcs) > 1 else None,
         'captions': [x.get('captions') for x in srcs], 'caption_names': [x.get('captions_name') for x in srcs],
+        'moments': moments,
         'vision_model': vision_model,
         # One model for both layers unless told otherwise: a vision model
         # reads text perfectly well, and keeping a single model loaded

@@ -4202,3 +4202,56 @@ def test_reference_docs_for_assistant():
     hit = pipeline.reference_docs_for([{'role': 'user', 'content': 'How do I reframe a short?'}])
     assert 'Framing' in hit and 'Sign in' in hit
     assert pipeline.reference_docs_for([{'role': 'user', 'content': 'hello there'}]) == ''
+
+
+# --------------------------------------------------------------------------
+# The editor's own list of moments (CSV)
+# --------------------------------------------------------------------------
+
+def test_moments_csv_reads_headers_formats_and_delimiters():
+    import moments_csv as mc
+    rows, err = mc.parse(b'Title,In,Out,Note\nA,0:01:23.5,00:01:53:15,hi\nB,90,150,\n')
+    assert not err and [r['title'] for r in rows] == ['A', 'B'] and rows[0]['note'] == 'hi'
+    assert abs(mc.to_seconds('0:01:23.5') - 83.5) < 1e-6
+    assert abs(mc.to_seconds('00:01:53:15', 30) - (113 + 0.5)) < 1e-6
+    assert mc.to_seconds('1:30') == 90 and mc.to_seconds('45') == 45
+    rows, err = mc.parse(b'10;20\n30;50')
+    assert not err and [(r['in'], r['out']) for r in rows] == [('10', '20'), ('30', '50')]
+    rows, err = mc.parse(b'name\tstart\tend\tpart\nX\t1:00\t2:00\t2\n')
+    assert not err and rows[0]['part'] == 2
+    assert mc.parse(b'title,in,out\nA,soon,later')[1].startswith('Row 1')
+    assert mc.parse(b'title,from,to\nA,1,2')[1].startswith('The first row')
+    assert mc.parse(b'')[1]
+
+
+def test_a_moments_list_replaces_the_ai_picks(env, monkeypatch):
+    svc = Services(monkeypatch)
+    client, headers = _client()
+    csv_ = 'title,in,out,note\nOne,2,9,my note\nTwo,0:00:12,0:00:20,\nBad,500,520,\n'
+    job = _analyze(client, headers, env, moments_text=csv_)
+    a = _analysis(client, job)
+    assert not svc.vision_calls and not svc.story_prompts, 'nothing is rated or ranked by AI'
+    c = a['candidates']
+    assert [x['title'] for x in c] == ['One', 'Two']
+    assert abs(c[0]['start'] - 2) < 0.1 and abs(c[0]['end'] - 9) < 0.1
+    assert c[0]['score'] is None and c[0]['source'] == 'list' and c[0]['why'] == 'my note'
+    assert any('could not be used' in w for w in a.get('warnings', []))
+    assert svc.stt, 'captions still come from speech-to-text'
+
+
+def test_a_bad_moments_list_is_refused(env, monkeypatch):
+    Services(monkeypatch)
+    client, headers = _client()
+    r = client.post('/api/shorts/analyze', headers=headers, data={
+        'shorts_file_network': env['staged'], 'project_id': env['project'], 'moments_text': 'title,in,out\nA,x,y'})
+    assert r.status_code == 400 and r.get_json()['error'].startswith('Moments list:')
+
+
+def test_a_moments_list_names_the_part(two_parts, monkeypatch):
+    Services(monkeypatch)
+    client, headers = _client()
+    a = _analysis(client, _analyze(client, headers, two_parts, shorts_file2_network=two_parts['second'],
+                                   moments_text='title,in,out,part\nP2,3,9,2\n'))
+    off = a['parts'][1]['offset']
+    c = a['candidates'][0]
+    assert abs(c['start'] - (off + 3)) < 0.1 and abs(c['end'] - (off + 9)) < 0.1

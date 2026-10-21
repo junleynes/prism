@@ -8461,6 +8461,10 @@ document.getElementById('vf').addEventListener('submit', async function(e){
 <input type=text id=sh-leave-out class=input-box maxlength=600 placeholder="e.g. 0:00-1:45, 22:10-23:30, 44:05-end  (several parts: part 2 0:00-1:45)">
 <p class="sh-note" style="margin-top:6px">No moment will include any of it. The kinds ticked above are found and left out without this; use it for anything they miss.</p>
 
+<label for=sh-moments style="margin-top:12px">Use my list of moments (optional CSV)</label>
+<input type=file id=sh-moments class=input-box accept=".csv,.txt,.tsv">
+<p class="sh-note" style="margin-top:6px">Columns: <code>title, in, out</code> (optionally <code>part, note</code>), with a header row. Times: <code>83.5</code>, <code>1:23.5</code>, <code>0:01:23.5</code> or <code>00:01:23:15</code> (frames). With a list, the AI does not pick, rate or rank moments: yours become the moments on the next screen (scores blank), and trim, framing, captions, labels and render work as usual. Several parts: add a <code>part</code> column and give times in that part; without it, times are on the joined timeline.</p>
+
 <details style="margin-top:10px">
   <summary style="cursor:pointer;font-size:12px;opacity:.75">Advanced</summary>
   <div class="sh-row" style="margin-top:4px">
@@ -9350,6 +9354,7 @@ async function shortsAnalyze(auto){
   fd.append('focus', shEl('sh-focus').value)
   fd.append('avoid', shEl('sh-avoid').value)
   fd.append('leave_out', shEl('sh-leave-out').value)
+  var mf0 = shEl('sh-moments'); if(mf0 && mf0.files && mf0.files[0]) fd.append('moments_file', mf0.files[0])
   var exKinds = Array.prototype.filter.call(document.querySelectorAll('#sh-exclude-kinds input[data-kind]'), function(c){ return c.checked }).map(function(c){ return c.getAttribute('data-kind') })
   fd.append('exclude_kinds', exKinds.length ? exKinds.join(',') : 'none')
   fd.append('language', shEl('sh-language').value)

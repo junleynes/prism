@@ -161,3 +161,13 @@ Press Vertical Shorts, then New project. Only the Programme title is required.
 - For a target of 90 s, set the length range around it (for example 80 to 100), not one number. Mini-drama chapters can come out shorter than the minimum because the leftover at the end of a stretch is not padded.
 - "Fade the last short to black" is ticked by default and fades the final short of the render, which removes a cliffhanger on that short; untick it unless it is the last episode of a series.
 - Browse library can offer several source folders per category: add them under Config > Network > More sources, then pick from the Source dropdown.
+
+## Using your own list of moments (CSV)
+
+On the Source screen, "Use my list of moments (optional CSV)" lets the editor decide the moments instead of the AI.
+
+- File: CSV (comma, semicolon or tab). First row names the columns: `title`, `in`, `out`, and optionally `part` and `note`. Without a header row the columns are `title,in,out` (or just `in,out`). Up to 60 rows.
+- Times: seconds (`83.5`), `1:23.5`, `0:01:23.5`, or frames `00:01:23:15` (at the video's frame rate).
+- Several parts: put the part number in a `part` column and give times in that part's own clock. Without a `part` column, times are on the joined timeline. A moment past the end of its video or part is cut there.
+- What happens: vision rating and the story model are skipped (so no Ollama needed); the rows become the moments on the Moments screen, with scores blank. In and out are used as given (put on whole frames). Captions still come from the supplied caption files or from speech-to-text. Trim, framing, captions, EP labels, cliffhanger, output settings and render work as normal.
+- Rows that cannot be used (bad time, out before in, longer than the 300-second limit, no such part) are skipped and listed in the warnings.
