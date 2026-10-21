@@ -6602,12 +6602,12 @@ async function runRetime(){
       return '<div style="display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--line);color:' + (col[x.status] || 'inherit') + '">' +
         '<span style="min-width:30px;opacity:.6">P' + x.part + '</span>' +
         '<span style="min-width:150px;font-family:monospace;font-size:11px">' + tcFmt(x.old) + ' \u2192 ' + (x.new === null ? '\u2014' : tcFmt(x.new)) + '</span>' +
-        '<span style="min-width:70px;font-size:11px">' + label[x.status] + '</span><span>' + escapeHtmlLite(x.text) + '</span></div>'
+        '<span style="min-width:70px;font-size:11px">' + (x.unsure ? 'unsure, dropped' : label[x.status]) + '</span><span>' + escapeHtmlLite(x.text) + '</span></div>'
     }).join('')
     var cuts = (s.cuts || []).map(function(c){ return c.seconds + ' s' }).join(', ')
     out.innerHTML = '<div style="font-size:12px;margin-bottom:8px">' + s.captions + ' captions \u00b7 ' + s.matched + ' matched \u00b7 ' +
       s.placed + ' placed from their neighbours \u00b7 <b style="color:var(--amber)">' + s.check + ' to check</b> \u00b7 ' + s.dropped +
-      ' in cuts (dropped)' + (cuts ? ' \u00b7 cuts found: ' + cuts : ' \u00b7 no cuts found') + '</div>' +
+      ' in cuts (dropped)' + (s.unsure_dropped ? ' \u00b7 <b style="color:var(--amber)">' + s.unsure_dropped + ' unsure (dropped)</b>' : '') + (cuts ? ' \u00b7 cuts found: ' + cuts : ' \u00b7 no cuts found') + '</div>' +
       '<div style="max-height:340px;overflow-y:auto;font-size:12px;line-height:1.6">' + rows + '</div>' +
       '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">' +
       '<button type=button class=btn style="padding:6px 12px;font-size:12px" onclick="rtDownload(\'srt\')">Download .srt</button>' +

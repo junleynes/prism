@@ -393,6 +393,7 @@ def align(parts, words, segments, labels=True, descriptors=True, drop_unsure=Fal
             # Only inside a file that has anchors: a file with none is all 'check', and dropping it would lose it whole.
             c['drop'] = True
             c['status'] = 'dropped'
+            c['unsure'] = True
             continue
         c['new_start'] = max(0.0, c['start'] + c['offset'])
         c['new_end'] = max(c['new_start'] + 0.2, c['end'] + c['offset'])
@@ -525,7 +526,7 @@ def report(result):
     for c in result['cues']:
         rows.append({'part': c['part'] + 1, 'text': c['cue']['text'], 'old': round(c['start'], 2),
                      'new': None if c['drop'] or c.get('new_start') is None else round(c['new_start'], 2),
-                     'status': c['status'] or 'placed', 'score': None if c['score'] is None else round(c['score'], 2)})
+                     'status': c['status'] or 'placed', 'unsure': bool(c.get('unsure')), 'score': None if c['score'] is None else round(c['score'], 2)})
     return rows
 
 
@@ -533,5 +534,6 @@ def summary(result):
     cs = result['cues']
     count = lambda s: sum(1 for c in cs if c['status'] == s)
     return {'captions': len(cs), 'matched': count('matched'), 'placed': count('placed'),
-            'check': count('check'), 'dropped': count('dropped'), 'cuts': result['cuts'],
+            'check': count('check'), 'dropped': count('dropped') - sum(1 for c in cs if c.get('unsure')),
+            'unsure_dropped': sum(1 for c in cs if c.get('unsure')), 'cuts': result['cuts'],
             'anchors': result['anchors']}
