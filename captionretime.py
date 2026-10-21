@@ -62,7 +62,14 @@ def norm(text):
     """Lowercase letters and digits only, accents folded -- what two spellings are compared on."""
     t = unicodedata.normalize('NFKD', text.lower())
     t = ''.join(c for c in t if not unicodedata.combining(c))
-    return ' '.join(re.sub(r'[^a-z0-9 ]+', ' ', t).split())
+    t = re.sub(r"(?<=[a-z])['\u2019`](?=[a-z])", '', t)        # s'ya, 'yung -> sya: one word, as it is often spelt
+    t = re.sub(r'[^a-z0-9 ]+', ' ', t)
+    # Filipino spelling swaps o/u and e/i freely (ito/eto, mo/mu, sige/sigi): compare them as one letter.
+    t = t.translate(_TAGALOG_FOLD)
+    return ' '.join(t.split())
+
+
+_TAGALOG_FOLD = str.maketrans('oe', 'ui')
 
 
 def _words(text):
@@ -365,7 +372,7 @@ def align(parts, words, segments, labels=True, descriptors=True, drop_unsure=Fal
                 for k in range(lo, hi + 1):
                     f = ((cues[k]['start'] - cues[a['k']]['start']) /
                          max(1e-6, cues[b['k']]['start'] - cues[a['k']]['start']))
-                    cues[k].update(offset=a['d'] + (b['d'] - a['d']) * f, status='placed')
+                    cues[k].update(offset=a['d'] + (b['d'] - a['d']) * f, status='placed', bracketed=True)
                 continue
             cuts.append({'part': pi, 'after_cue': a['k'], 'before_cue': b['k'], 'seconds': round(a['d'] - b['d'], 2)})
             if hi < lo:
@@ -387,7 +394,9 @@ def align(parts, words, segments, labels=True, descriptors=True, drop_unsure=Fal
             continue
         if c['status'] == 'placed' and c['spoken']:
             c['score'] = tr.similarity_near(c['spoken'], c['start'] + c['offset'], c['end'] + c['offset'])
-            if c['score'] < CHECK_BELOW:
+            if c['score'] < CHECK_BELOW and not c.get('bracketed'):
+                # Between two matched captions that agree on the offset there is no cut, so the caption is
+                # in this stretch whether or not Whisper heard it (music, sound tags, a mumbled line).
                 c['status'] = 'check'
         if drop_unsure and c['status'] == 'check' and by_part.get(c['part']):
             # Only inside a file that has anchors: a file with none is all 'check', and dropping it would lose it whole.

@@ -59,7 +59,8 @@ def test_clean_text_for_matching():
     assert rt.strip_labels('>> MYLA: Hindi ko alam') == 'Hindi ko alam'
     assert rt.strip_labels('JUN: Ano? >> MYLA: Wala.') == 'Ano? Wala.'
     assert rt.strip_descriptors('Sige [LAUGHS] na ♪ music ♪ (door slams)') == 'Sige na music'
-    assert rt.norm('Hindi, Ko álam!') == 'hindi ko alam'
+    assert rt.norm('Hindi, Ko álam!') == 'hindi ku alam'
+    assert rt.norm("Eto s'ya") == rt.norm('ito sya')
 
 
 def test_cuts_are_found_and_cut_captions_dropped():
@@ -148,11 +149,20 @@ def test_route_retimes_several_scc_files_onto_a_cut_video(monkeypatch):
 def test_unsure_captions_can_be_dropped_instead_of_kept():
     S, cut, vt, p1, p2, words = _case()
     p1 = [dict(c) for c in p1]
-    p1[3]['text'] = 'zzzz qqqq xxxx vvvv'          # nothing like what was said
+    p1[0]['text'] = 'zzzz qqqq xxxx vvvv'          # nothing like what was said, and before the first match
     kept = rt.align([p1, p2], words, [])
     gone = rt.align([p1, p2], words, [], drop_unsure=True)
-    k = next(c for c in kept['cues'] if c['part'] == 0 and c['idx'] == 3)
-    g = next(c for c in gone['cues'] if c['part'] == 0 and c['idx'] == 3)
-    assert k['status'] == 'check' and not k['drop'] and abs(k['new_start'] - vt[3]) < 1.5
+    k = next(c for c in kept['cues'] if c['part'] == 0 and c['idx'] == 0)
+    g = next(c for c in gone['cues'] if c['part'] == 0 and c['idx'] == 0)
+    assert k['status'] == 'check' and not k['drop'] and abs(k['new_start'] - vt[0]) < 1.5
     assert g['drop'] and g['status'] == 'dropped'
     assert 'zzzz' in rt.write_srt(kept) and 'zzzz' not in rt.write_srt(gone)
+
+
+def test_a_caption_between_two_agreeing_matches_is_kept_even_if_whisper_missed_it():
+    S, cut, vt, p1, p2, words = _case()
+    p1 = [dict(c) for c in p1]
+    p1[3]['text'] = '(MUSIC) zzzz qqqq xxxx vvvv'   # a line Whisper never heard, inside an uncut stretch
+    gone = rt.align([p1, p2], words, [], drop_unsure=True)
+    g = next(c for c in gone['cues'] if c['part'] == 0 and c['idx'] == 3)
+    assert not g['drop'] and g['status'] == 'placed' and abs(g['new_start'] - vt[3]) < 1.5
