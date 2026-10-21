@@ -15,3 +15,7 @@ The result lists every caption as matched, placed (from its neighbours), check t
 - Matching treats Filipino spelling variants as the same: o/u, e/i, and apostrophe contractions (s'ya = sya).
 - The summary counts "unsure (dropped)" separately from "in cuts".
 - Still dropped/flagged when it matters: captions in a detected cut, and captions Whisper cannot support before the first or after the last match. If many are still flagged, set the language to Tagalog (helps Whisper) and keep "Keep it next to its neighbours" to review them.
+
+## Picking caption files with Browse library
+
+The Caption files row has Browse library: tick every part's caption file in the folder (they are listed in the order ticked; the job still sorts them by file name), then use the selection. Files picked this way and files uploaded are used together. The folder is the "Vertical Shorts captions" folder (Config > Network), including its extra named sources. Clear empties the list.

@@ -10715,21 +10715,35 @@ def api_stt_retime():
     """Retimes caption files (SCC / SRT / VTT, one per part, each starting at zero and uncut) onto a combined
     video that has had parts cut out. See captionretime.py for how the captions are found in the speech."""
     import captionfile, captionretime
-    files = [f for f in request.files.getlist('captions') if f and f.filename]
+    # Uploaded, or picked with Browse library (staged names this server made itself, never a path).
+    files = [(f.filename, f) for f in request.files.getlist('captions') if f and f.filename]
+    for n in request.form.getlist('captions_network'):
+        n = os.path.basename((n or '').strip())
+        ext = os.path.splitext(n)[1].lower().lstrip('.')
+        if not n:
+            continue
+        path = restage(n)[0] if n.startswith('net_') and ext in CAPTION_EXTENSIONS else None
+        if not path:
+            return jsonify(ok=False, error=f'{re.sub(r"^net_[0-9]+_", "", n)} is no longer available -- pick it again.'), 400
+        files.append((re.sub(r'^net_\d+_', '', n), path))
     if not files:
         return jsonify(ok=False, error='Add the caption files (.scc, .srt or .vtt), one per part.'), 400
     if len(files) > 40:
         return jsonify(ok=False, error='That is more caption files than a programme has parts (40 at most).'), 400
     if request.form.get('order', 'name') == 'name':
-        files.sort(key=lambda f: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', f.filename)])
+        files.sort(key=lambda f: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', f[0])])
     parts, texts = [], []
-    for f in files:
-        raw = f.read(captionfile.MAX_BYTES + 1)
-        cues, err = captionfile.parse_captions(raw, f.filename)
+    for fname, f in files:
+        if isinstance(f, str):
+            with open(f, 'rb') as fh:
+                raw = fh.read(captionfile.MAX_BYTES + 1)
+        else:
+            raw = f.read(captionfile.MAX_BYTES + 1)
+        cues, err = captionfile.parse_captions(raw, fname)
         if err:
             return jsonify(ok=False, error=err), 400
         parts.append(cues)
-        texts.append(captionfile.decode_bytes(raw) if f.filename.lower().endswith('.scc') else None)
+        texts.append(captionfile.decode_bytes(raw) if fname.lower().endswith('.scc') else None)
     src = _resolve_upload('rt_video', ALLOWED_EXTENSIONS | AUDIO_EXTENSIONS)
     if not src:
         return jsonify(ok=False, error='Pick the combined video (or audio) the captions are for.'), 400
@@ -10753,7 +10767,7 @@ def api_stt_retime():
     scc = captionretime.write_scc(texts, parts, result)
     return jsonify(ok=True, srt=captionretime.write_srt(result, labels=labels, descriptors=descs), scc=scc,
                    summary=captionretime.summary(result), rows=captionretime.report(result),
-                   files=[f.filename for f in files], model=WHISPER_MODEL)
+                   files=[n for n, _f in files], model=WHISPER_MODEL)
 
 @app.route('/api/voices/tags')
 def api_voice_tags():

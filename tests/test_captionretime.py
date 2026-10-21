@@ -166,3 +166,29 @@ def test_a_caption_between_two_agreeing_matches_is_kept_even_if_whisper_missed_i
     gone = rt.align([p1, p2], words, [], drop_unsure=True)
     g = next(c for c in gone['cues'] if c['part'] == 0 and c['idx'] == 3)
     assert not g['drop'] and g['status'] == 'placed' and abs(g['new_start'] - vt[3]) < 1.5
+
+
+def test_route_takes_caption_files_picked_with_browse_library(monkeypatch):
+    import io
+    import os
+    import time
+    import main
+    import pipeline
+    S, cut, vt, p1, p2, words = _case()
+    monkeypatch.setattr(pipeline, 'transcribe_video_detailed', lambda path, language=None, prompt=None: (words, [], {'ok': True}))
+    monkeypatch.setattr(pipeline, 'ALLOW_LOCAL_MEDIA_UPLOAD', True)
+    staged = f'net_{int(time.time())}_part2.scc'
+    with open(os.path.join(main.app.config['UPLOAD_FOLDER'], staged), 'w') as f:
+        f.write(_scc(p2))
+    client = main.app.test_client()
+    with client.session_transaction() as s:
+        s.update(authed=True, user_id=1, username='admin', role='admin', csrf_token='t')
+    data = {'rt_video': (io.BytesIO(b'x'), 'episode.mp4'), 'captions': [(io.BytesIO(_scc(p1).encode()), 'part1.scc')],
+            'captions_network': [staged]}
+    r = client.post('/api/stt/retime', data=data, headers={'X-CSRF-Token': 't'}, content_type='multipart/form-data')
+    d = r.get_json()
+    assert r.status_code == 200 and d['ok'], d
+    assert d['files'] == ['part1.scc', 'part2.scc']
+    r = client.post('/api/stt/retime', data={'rt_video': (io.BytesIO(b'x'), 'e.mp4'), 'captions_network': ['../../etc/passwd']},
+                    headers={'X-CSRF-Token': 't'}, content_type='multipart/form-data')
+    assert r.status_code == 400

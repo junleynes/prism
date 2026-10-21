@@ -6567,24 +6567,38 @@ async function runTranscribe(){
 function rtNatural(a, b){
   return a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'})
 }
+var RT_NET_CAPS = []     // [{filename (staged), name}] picked with Browse library
+window.rtAddNetCaps = function(list){
+  list.forEach(function(x){ if(!RT_NET_CAPS.some(function(y){ return y.name === x.name })) RT_NET_CAPS.push(x) })
+  rtShowFiles()
+}
+function rtClearCaps(){
+  RT_NET_CAPS = []
+  var f = document.getElementById('rt-caps'); if(f) f.value = ''
+  rtShowFiles()
+}
+window.rtClearCaps = rtClearCaps
+function rtLocalCaps(){ var f = document.getElementById('rt-caps'); return f && f.files ? Array.prototype.slice.call(f.files) : [] }
 function rtShowFiles(){
-  var f = document.getElementById('rt-caps').files, box = document.getElementById('rt-files')
-  var list = Array.prototype.slice.call(f).sort(rtNatural)
+  var box = document.getElementById('rt-files')
+  var list = rtLocalCaps().map(function(x){ return {name: x.name} }).concat(RT_NET_CAPS.map(function(x){ return {name: x.name} })).sort(rtNatural)
+  var clr = document.getElementById('rt-caps-clear'); if(clr) clr.style.display = list.length ? '' : 'none'
   box.innerHTML = list.length ? 'Parts, in this order: ' + list.map(function(x, i){ return (i + 1) + '. ' + escapeHtmlLite(x.name) }).join(' &nbsp; ') : ''
 }
 async function runRetime(){
   var btn = document.getElementById('rt-btn'), note = document.getElementById('rt-note'), out = document.getElementById('rt-result')
   var v = document.getElementById('rt-video'), net = document.getElementById('rt_video_network').value
-  var caps = Array.prototype.slice.call(document.getElementById('rt-caps').files).sort(rtNatural)
+  var caps = rtLocalCaps().sort(rtNatural)
   var hasLocal = v && v.files && v.files[0]
   function warn(t){ note.style.display = 'block'; note.innerHTML = '<span style="color:var(--amber)">' + escapeHtmlLite(t) + '</span>' }
   if(!hasLocal && !net){ warn('Pick the combined video first, or use Browse library.'); return }
-  if(!caps.length){ warn('Add the caption files, one per part.'); return }
+  if(!caps.length && !RT_NET_CAPS.length){ warn('Add the caption files, one per part.'); return }
   btn.disabled = true; out.style.display = 'none'
   note.style.display = 'block'; note.textContent = 'Listening to the video and matching the captions\u2026 a full episode takes a few minutes.'
   var fd = new FormData()
   if(hasLocal) fd.append('rt_video', v.files[0]); else fd.append('rt_video_network', net)
   caps.forEach(function(c){ fd.append('captions', c, c.name) })
+  RT_NET_CAPS.forEach(function(c){ fd.append('captions_network', c.filename) })
   fd.append('order', 'name')
   fd.append('language', document.getElementById('rt-lang').value)
   fd.append('unsure', document.getElementById('rt-unsure').value)
@@ -14180,7 +14194,12 @@ document.addEventListener('DOMContentLoaded', function(){
   <button type=button class="browse-btn" onclick="openNetworkBrowser('rt_video','hires','Video (HIRES)')">Browse library</button>
 </div>
 <label>Caption files (all the parts, .scc / .srt / .vtt):</label>
-<input type=file id=rt-caps multiple accept=".scc,.srt,.vtt" onchange="rtShowFiles()">
+<div class="browse-row" style="gap:8px">
+  {% if allow_local_upload %}<input type=file id=rt-caps multiple accept=".scc,.srt,.vtt" onchange="rtShowFiles()">{% endif %}
+  <button type=button class="browse-btn" onclick="openNetworkBrowser('rt_caps','captions','captions')">Browse library</button>
+  <button type=button class="browse-btn" id=rt-caps-clear onclick="rtClearCaps()" style="display:none">&#10005; Clear</button>
+</div>
+<p style="font-size:12px;opacity:.65;margin:4px 0 0">Browse library: tick every part's caption file, then use the selection. Files added from both places are used together.</p>
 <div id=rt-files style="font-size:12px;opacity:.8;margin:6px 0 10px"></div>
 <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">
   <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;cursor:pointer;margin:0"><input type=checkbox id=rt-strip-labels> Remove speaker labels</label>
@@ -16790,6 +16809,23 @@ document.addEventListener('DOMContentLoaded', function(){
   }
   function useMultiSelection(){
     if(!active || !active.multi || !multiSel.length) return
+    if(active.fieldName === 'rt_caps'){
+      // Caption files for Retime captions: all of them, fetched one by one and handed to that card.
+      var cp = multiSel.slice(0, 40), ccat = active.category, got = [], ci = 0
+      var cnote = function(x, bad){ listEl.innerHTML = '<div class="net-modal-empty"' + (bad ? ' style="color:var(--tally)"' : '') + '>' + x + '</div>' }
+      var cnext = function(){
+        if(ci >= cp.length){ multiSel = []; closeModal(); if(window.rtAddNetCaps) window.rtAddNetCaps(got); return }
+        var pk = cp[ci]
+        cnote('Getting ' + (ci + 1) + ' of ' + cp.length + ': ' + escapeHtmlLite(pk.name) + '&hellip;')
+        fetch('/api/network/fetch', {method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: pk.name, category: ccat, subpath: pk.subpath})
+        }).then(function(r){ return r.json() }).then(function(d){
+          if(!d.ok){ cnote(escapeHtmlLite(pk.name + ': ' + d.error), true); return }
+          got.push({filename: d.filename, name: d.orig_name || pk.name}); ci++; cnext()
+        }).catch(function(e){ cnote(escapeHtmlLite(String(e)), true) })
+      }
+      cnext(); return
+    }
     var picks = multiSel.slice(0, 10), category = active.category, inPlace = !!active.inPlace
     var fields = picks.map(function(_, i){ return 'shorts_file' + (i ? i + 1 : '') })
     var done = 0
@@ -17143,7 +17179,7 @@ document.addEventListener('DOMContentLoaded', function(){
   }
 
   function openNetworkBrowser(fieldName, category, label){
-    active = {fieldName: fieldName, category: category, subpath: '', multi: fieldName === 'shorts_file' && category === 'shorts'}
+    active = {fieldName: fieldName, category: category, subpath: '', multi: (fieldName === 'shorts_file' && category === 'shorts') || fieldName === 'rt_caps'}
     multiSel = []
     updateMultiBar()
     titleEl.textContent = 'Browse ' + label + ' folder'
