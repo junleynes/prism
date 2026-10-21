@@ -184,3 +184,7 @@ The Word procedure (PRISM_Vertical_Shorts_Procedure.docx) is written for the Min
 ## Sending to a network destination in a date folder
 
 When sending shorts to a video destination (Send all, or Send on one short), tick "date folder" (or "in a new folder named with today's date") and PRISM creates a folder named MMDDYY under the destination (for example 102126 for 21 October 2026) and puts the files, and their .srt, inside. The folder is created if missing and reused if it is already there; nothing else in the destination is touched or deleted. The date is the server's date. The tick is remembered in the browser.
+
+## "The ending sound effect is no longer available -- pick it again"
+
+The sound effect (or transition overlay) chosen with Browse library is copied to a temporary staging folder on the server. That folder is cleared by age and on every restart, so a render started later, or after a restart, no longer finds the copy. PRISM now remembers where each staged file came from (kept on disk) and fetches it again from the share automatically. If the message still appears, the file was moved or removed on the share, or the origin was recorded before this fix: pick the sound effect again once.

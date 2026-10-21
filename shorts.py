@@ -2455,6 +2455,9 @@ def _resolve_ending_sfx(opts):
         return None, None
     path = pipeline.staged_path(name)
     ext = os.path.splitext(name)[1].lower().lstrip('.')
+    if name.startswith('net_') and ext in pipeline.AUDIO_EXTENSIONS and not os.path.isfile(path):
+        # Staged copies are cleared by age and on a restart: fetched again from the share it was picked from.
+        path = pipeline.restage(name)[0] or path
     if not name.startswith('net_') or ext not in pipeline.AUDIO_EXTENSIONS or not os.path.isfile(path):
         return None, 'The ending sound effect is no longer available -- pick it again.'
     a, b = opts.get('ending_sfx_in'), opts.get('ending_sfx_out')
@@ -2482,6 +2485,8 @@ def _resolve_ending_overlay(opts):
         return None, None
     path = pipeline.staged_path(name)
     ext = os.path.splitext(name)[1].lower().lstrip('.')
+    if name.startswith('net_') and ext in _OVERLAY_EXTS and not os.path.isfile(path):
+        path = pipeline.restage(name)[0] or path
     if not name.startswith('net_') or ext not in _OVERLAY_EXTS or not os.path.isfile(path):
         return None, 'The transition overlay is no longer available -- pick it again.'
     return dict(_overlay_facts(path), path=path, name=re.sub(r'^net_\d+_', '', name)), None

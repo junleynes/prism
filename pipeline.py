@@ -693,11 +693,55 @@ def _safe_exception_text(e):
 # Vertical Shorts analysis kept for review) records this, and fetches the
 # file again from the same place when it is next needed.
 STAGED_ORIGINS = {}
+_ORIGINS_FILE = os.path.join(LIBRARY_DIR, 'staged_origins.json')
+
+
+def _load_staged_origins():
+    """Origins are kept on disk too, so they outlive a restart along with the settings that name a staged file
+    (an ending sound effect or overlay chosen for a project): the file is fetched again from where it came from."""
+    try:
+        with open(_ORIGINS_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, dict) and v.get('name') and v.get('category'):
+                    STAGED_ORIGINS.setdefault(k, {'category': v['category'], 'subpath': v.get('subpath') or '', 'name': v['name']})
+    except (OSError, ValueError):
+        pass
+
+
+def _save_staged_origins():
+    try:
+        tmp = _ORIGINS_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(STAGED_ORIGINS, f)
+        os.replace(tmp, _ORIGINS_FILE)
+    except OSError:
+        pass
+
+
+_load_staged_origins()
 
 
 def staged_origin(local_name):
     """Where a staged copy (net_<ts>_<name>) was fetched from, or None."""
     return dict(STAGED_ORIGINS[local_name]) if local_name in STAGED_ORIGINS else None
+
+
+def restage(local_name):
+    """The path of a staged copy that is gone (the folder is cleared by age and on restart), fetched again from
+    where it came from. (path, None), or (None, why) when its origin is not known or the share cannot be read."""
+    path = staged_path(local_name)
+    if os.path.isfile(path):
+        return path, None
+    origin = staged_origin(local_name)
+    if not origin:
+        return None, 'its origin is not known'
+    try:
+        got = stage_network_file(origin['name'], origin['category'], origin['subpath'])
+    except Exception as e:
+        return None, str(e)
+    return got['path'], None
 
 
 # ---- Reading a network file where it is, instead of copying it here ----
@@ -922,6 +966,7 @@ def fetch_network_file(name, category=DEFAULT_NETWORK_CATEGORY, subpath=''):
                 for k in list(STAGED_ORIGINS)[:1000]:
                     STAGED_ORIGINS.pop(k, None)
             STAGED_ORIGINS[local_name] = {'category': category, 'subpath': sub, 'name': name}
+            _save_staged_origins()
             return local_name
         except Exception as e:
             if not _is_sharing_violation(e):

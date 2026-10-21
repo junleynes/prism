@@ -4276,3 +4276,17 @@ def test_captions_marked_voice_over_are_left_out():
     got = sc.not_story_ranges([], segs, [], [], None, kinds={'narration'}, fixed=fixed)
     assert [(round(a), round(b)) for a, b, _k in got] == [(1, 7)]
     assert sc.not_story_ranges([], segs, [], [], None, kinds={'host'}, fixed=fixed) == []
+
+
+def test_a_staged_sound_effect_that_is_gone_is_fetched_again_from_where_it_came_from(env, monkeypatch, tmp_path):
+    name = f'net_{int(time.time())}_sting.wav'
+    pipeline.STAGED_ORIGINS[name] = {'category': 'sfx', 'subpath': 'Stings', 'name': 'sting.wav'}
+    fresh = tmp_path / 'fresh.wav'
+    fresh.write_bytes(b'RIFF')
+    monkeypatch.setattr(pipeline, 'stage_network_file',
+                        lambda n, c, s: {'path': str(fresh), 'local_name': 'net_1_sting.wav'} if (n, c, s) == ('sting.wav', 'sfx', 'Stings') else 1 / 0)
+    got, err = shorts._resolve_ending_sfx({'ending': 'cliffhanger', 'ending_sfx_name': name})
+    assert err is None and got['path'] == str(fresh) and got['name'] == 'sting.wav'
+    pipeline.STAGED_ORIGINS.pop(name, None)
+    got, err = shorts._resolve_ending_sfx({'ending': 'cliffhanger', 'ending_sfx_name': name})
+    assert got is None and 'no longer available' in err
