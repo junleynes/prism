@@ -471,7 +471,9 @@ def build_story_prompt(segments, lo, hi, visual, min_dur, max_dur, max_moments=3
                       '"hatid sa inyo ng", sponsor and product mentions;\n'),
         ('sponsor', '- sponsor: an advertisement or a sponsor read inside the programme;\n'),
         ('credits', '- credits: opening titles, theme song over titles, end credits;\n'),
-        ('narration', '- narration: a narrator or voice-over telling the story rather than a character in a scene;\n'),
+        ('narration', '- narration: a narrator or voice-over telling the story rather than a character in a scene -- including a '
+                      'voice heard over footage, a montage or a flashback (often third person or past tense, e.g. "Noong '
+                      '2010, si Ramon ay..."), with no character speaking on screen;\n'),
         ('host', '- host: a host or presenter speaking to the audience (introducing the episode, a studio '
                  'segment, a closing message);\n'),
         ('recap', '- recap: "previously" / "sa nakaraang" summaries of earlier episodes;\n'),
@@ -701,7 +703,7 @@ def parse_exclude_kinds(raw):
     return {k for k in got if k in EXCLUDE_KINDS}
 
 
-def not_story_ranges(skips, segments, visual, shots, editor=None, kinds=None):
+def not_story_ranges(skips, segments, visual, shots, editor=None, kinds=None, fixed=None):
     """Everything a short must not contain, as merged (start, end, kinds):
     the lines the story model said are not the drama, the shots the vision
     model saw as credits, a billboard, a host or black, and the ranges the
@@ -744,6 +746,10 @@ def not_story_ranges(skips, segments, visual, shots, editor=None, kinds=None):
             a = min(a, prev[1])
         rng.append((a, b, kind))
         prev = (t, b)
+    for a, b, kind in fixed or []:
+        # Ranges the captions themselves mark (voice-over), judged by the ticked kinds like any other.
+        if kinds is None or kind in kinds:
+            rng.append((float(a), float(b), kind))
     for a, b in editor or []:
         rng.append((float(a), float(b), 'editor'))
     return merge_ranges(rng)

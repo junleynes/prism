@@ -219,6 +219,27 @@ _SPEAKER = re.compile(r"(?:(?<=^)|(?<=[.!?\]\u266a)]\s))\s*(?:>>+\s*)?[A-Z][A-Z0
 _TURN = re.compile(r'^\s*(?:>>+|-+)\s+|(?<=[.!?])\s+-\s+(?=\S)')
 
 
+_VO = re.compile(r"(?:\b(?:NARRATOR|NARRATION|VOICE[\s-]?OVER|TAGAPAGSALAYSAY|SALAYSAY)\b\s*[:)\]]"
+                 r"|[(\[]\s*(?:V\.?\s?O\.?|VOICE[\s-]?OVER|NARRATOR|NARRATION)\s*[)\]]"
+                 r"|\bV\.O\.)", re.I)
+
+
+def voiceover_ranges(cues, gap=6.0):
+    """[(start, end)] of the captions the file itself marks as narration or voice-over ("NARRATOR:", "(V.O.)",
+    "[VO]", "(VOICE-OVER)"), runs less than `gap` seconds apart joined: they are not the drama. Read on the
+    captions as supplied, before the labels are cleaned off."""
+    out = []
+    for c in cues or []:
+        if not _VO.search(c.get('text') or ''):
+            continue
+        a, b = float(c['start']), float(c['end'])
+        if out and a - out[-1][1] <= gap:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
 def clean_cues(cues, sounds=True, speakers=True):
     """(cues, stats): captions without the sound descriptors ("[GRUNTS]", "(laughs)", the music notes and what
     they enclose) and/or the speaker labels ("MYLA:", ">>", a leading "-"). A caption left with nothing is

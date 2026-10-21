@@ -951,6 +951,7 @@ def _run_analysis(jid, params):
         if caps[k]:
             # Captions the editor supplied are the transcript: no speech-to-text, and their timing is kept.
             cues, shift = captionfile.fit_to_video(caps[k], P['duration'])
+            P['vo'] = captionfile.voiceover_ranges(cues)
             cues, cleaned = captionfile.clean_cues(cues, sounds=bool(params.get('caption_drop_sounds')),
                                                    speakers=bool(params.get('caption_drop_speakers')))
             w, sg = sc.normalize_transcript([], [dict(c) for c in cues])
@@ -1097,7 +1098,11 @@ def _run_analysis(jid, params):
                       for k, a, b in params['leave_out_parts'] if a < parts[k]['duration']]
     else:
         editor_out = [(a, min(b, duration)) for a, b in params.get('leave_out') or [] if a < duration]
-    blocked = [] if listed else sc.not_story_ranges(skips, segments, visual, shots, editor_out, kinds=params.get('exclude_kinds'))
+    vo_fixed = [(P['offset'] + a, P['offset'] + b, 'narration') for P in parts for a, b in P.get('vo') or []]
+    if vo_fixed and not listed and (params.get('exclude_kinds') is None or 'narration' in params['exclude_kinds']):
+        warnings.append(f'{len(vo_fixed)} stretch{"" if len(vo_fixed) == 1 else "es"} the captions mark as narration / '
+                        'voice-over (NARRATOR:, (V.O.)) were left out of the moments.')
+    blocked = [] if listed else sc.not_story_ranges(skips, segments, visual, shots, editor_out, kinds=params.get('exclude_kinds'), fixed=vo_fixed)
     lengths = {}
     # Half as many again as wanted are built, so that a closer look -- at
     # their own frames and their sound -- can change which make the list.
@@ -1176,7 +1181,7 @@ def _run_analysis(jid, params):
         if prod.get('unload_vision_after_scoring', True):
             pipeline.unload_ollama_model(vision_model)
         # A frame inside a moment may show it reaching into credits or a billboard.
-        blocked = sc.not_story_ranges(skips, segments, visual, shots, editor_out, kinds=params.get('exclude_kinds'))
+        blocked = sc.not_story_ranges(skips, segments, visual, shots, editor_out, kinds=params.get('exclude_kinds'), fixed=vo_fixed)
         if minidrama:
             # What the closer look found is out of the programme: the chapters are cut again around it.
             cands = sc.plan_chapters(duration, blocked, segments, cuts, visual, words, min_dur, max_dur,
@@ -4315,6 +4320,8 @@ def api_shorts_batch_send(bid):
         rename, bad = pipeline.destination_filename(data.get('filename'), _delivery_name(shorts[0]))
         if bad:
             return jsonify(ok=False, error=bad), 400
+    # "Put them in a new folder named with today's date": MMDDYY, like 102126.
+    folder = time.strftime('%m%d%y') if data.get('dated_folder') else None
     bdir, sent = _batch_dir(bid), []
     for s in shorts:
         # The delivery file: the MP4, or the ProRes made from it.
@@ -4324,7 +4331,7 @@ def api_shorts_batch_send(bid):
             # A renamed short's captions go with it under the same name.
             name = (os.path.splitext(rename)[0] + os.path.splitext(local)[1]) if rename else local
             try:
-                pipeline.send_file_to_network_destination(os.path.join(bdir, local), name, dest)
+                pipeline.send_file_to_network_destination(os.path.join(bdir, local), name, dest, **({'subfolder': folder} if folder else {}))
             except ValueError as e:
                 return jsonify(ok=False, error=str(e), sent=sent), 502
             sent.append(name)
@@ -4332,7 +4339,7 @@ def api_shorts_batch_send(bid):
               + (f' ({_delivery_name(shorts[0])} as {rename})'
                  if rename and rename != _delivery_name(shorts[0]) else ''),
               user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
-    return jsonify(ok=True, sent=sent, destination=dest['name'])
+    return jsonify(ok=True, sent=sent, destination=dest['name'], **({'folder': folder} if folder else {}))
 
 
 # --------------------------------------------------------------------------

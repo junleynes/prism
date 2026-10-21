@@ -175,3 +175,12 @@ On the Source screen, "Use my list of moments (optional CSV)" lets the editor de
 ## Standard procedure uses Mini-drama
 
 The Word procedure (PRISM_Vertical_Shorts_Procedure.docx) is written for the Mini-drama selection ("What to make" = Mini-drama): the whole episode is cut into consecutive chapters (Ep 1, Ep 2 ...), none skipped, with EP opening and NEXT closing labels. Moments to find, Feature and Avoid do not apply to it. Best moments (AI picks) and Highlight reel are the other selections. A CSV moments list overrides the selection.
+
+## Narration / voice-over
+
+- With caption files supplied, captions the file marks as narration or voice-over (NARRATOR:, (V.O.), [VO], (VOICE-OVER), TAGAPAGSALAYSAY:) are left out of every moment, as long as "Narration / voice-over" is ticked. This is exact and does not depend on AI.
+- Without such labels (or with Whisper only), narration is judged by the story model from the words alone; it is told to treat a voice over footage, a montage or a flashback as narration. If one still slips through, add its time range under "Leave out these parts".
+
+## Sending to a network destination in a date folder
+
+When sending shorts to a video destination (Send all, or Send on one short), tick "date folder" (or "in a new folder named with today's date") and PRISM creates a folder named MMDDYY under the destination (for example 102126 for 21 October 2026) and puts the files, and their .srt, inside. The folder is created if missing and reused if it is already there; nothing else in the destination is touched or deleted. The date is the server's date. The tick is remembered in the browser.

@@ -1540,6 +1540,14 @@ def test_a_short_can_be_delivered_as_prores_and_that_is_the_file_handed_over(env
     assert r.status_code == 200, r.get_json()
     assert sent == [(s['delivery'], 'TADHANA_EP101_teaser.mov'), (s['srt'], 'TADHANA_EP101_teaser.srt')], \
         'renamed, but still a .mov: the name cannot change what the file is'
+    # "In a new folder named with today's date": MMDDYY, like 102126.
+    dated = []
+    monkeypatch.setattr(pipeline, 'send_file_to_network_destination',
+                        lambda local, name, dest, subfolder=None: dated.append((name, subfolder)))
+    r = client.post(f"/api/shorts/batches/{batch['batch_id']}/send", headers=headers,
+                    json={'destination_id': 1, 'files': [s['file']], 'dated_folder': True})
+    assert r.status_code == 200 and r.get_json().get('folder') == time.strftime('%m%d%y')
+    assert dated and all(f == time.strftime('%m%d%y') and len(f) == 6 for _n, f in dated)
 
     # MP4 is one file, and anything unknown -- or AVC-Intra, which is a landscape format -- is MP4.
     crfs.clear()
@@ -4255,3 +4263,16 @@ def test_a_moments_list_names_the_part(two_parts, monkeypatch):
     off = a['parts'][1]['offset']
     c = a['candidates'][0]
     assert abs(c['start'] - (off + 3)) < 0.1 and abs(c['end'] - (off + 9)) < 0.1
+
+
+def test_captions_marked_voice_over_are_left_out():
+    import captionfile
+    cues = [{'start': 1, 'end': 3, 'text': 'NARRATOR: Noong 2010...'}, {'start': 5, 'end': 7, 'text': '(V.O.) At doon nagsimula'},
+            {'start': 30, 'end': 32, 'text': 'MYLA: Ayoko'}]
+    vo = captionfile.voiceover_ranges(cues)
+    assert vo == [(1.0, 7.0)]
+    segs = [{'start': 0, 'end': 40, 'text': 'x'}]
+    fixed = [(a, b, 'narration') for a, b in vo]
+    got = sc.not_story_ranges([], segs, [], [], None, kinds={'narration'}, fixed=fixed)
+    assert [(round(a), round(b)) for a, b, _k in got] == [(1, 7)]
+    assert sc.not_story_ranges([], segs, [], [], None, kinds={'host'}, fixed=fixed) == []

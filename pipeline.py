@@ -9489,7 +9489,7 @@ def destination_filename(custom, original):
     return stem + ext, None
 
 
-def send_file_to_network_destination(local_path, remote_filename, destination):
+def send_file_to_network_destination(local_path, remote_filename, destination, subfolder=None):
     """Copies an already-exported local file to `destination` (a
     network_destinations row) -- the write-side counterpart to
     fetch_network_file()'s read. Registers its own SMB session directly
@@ -9509,7 +9509,14 @@ def send_file_to_network_destination(local_path, remote_filename, destination):
     try:
         smbclient.register_session(host, username=destination.get('username') or '',
                                     password=destination.get('password') or '', connection_timeout=10)
-        remote_path = root + '\\' + remote_filename
+        folder = root
+        if subfolder:
+            # A new folder under the destination (made if it is not there yet); never anything else in it touched.
+            if not re.match(r'^[A-Za-z0-9_-]{1,40}$', subfolder):
+                raise ValueError('Invalid folder name')
+            folder = root + '\\' + subfolder
+            smbclient.makedirs(folder, exist_ok=True)
+        remote_path = folder + '\\' + remote_filename
         with open(local_path, 'rb') as lf, smbclient.open_file(remote_path, mode='wb') as rf:
             shutil.copyfileobj(lf, rf)
     except Exception as e:
