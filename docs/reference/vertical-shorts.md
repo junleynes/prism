@@ -171,3 +171,7 @@ On the Source screen, "Use my list of moments (optional CSV)" lets the editor de
 - Several parts: put the part number in a `part` column and give times in that part's own clock. Without a `part` column, times are on the joined timeline. A moment past the end of its video or part is cut there.
 - What happens: vision rating and the story model are skipped (so no Ollama needed); the rows become the moments on the Moments screen, with scores blank. In and out are used as given (put on whole frames). Captions still come from the supplied caption files or from speech-to-text. Trim, framing, captions, EP labels, cliffhanger, output settings and render work as normal.
 - Rows that cannot be used (bad time, out before in, longer than the 300-second limit, no such part) are skipped and listed in the warnings.
+
+## Standard procedure uses Mini-drama
+
+The Word procedure (PRISM_Vertical_Shorts_Procedure.docx) is written for the Mini-drama selection ("What to make" = Mini-drama): the whole episode is cut into consecutive chapters (Ep 1, Ep 2 ...), none skipped, with EP opening and NEXT closing labels. Moments to find, Feature and Avoid do not apply to it. Best moments (AI picks) and Highlight reel are the other selections. A CSV moments list overrides the selection.
