@@ -19,3 +19,12 @@ The result lists every caption as matched, placed (from its neighbours), check t
 ## Picking caption files with Browse library
 
 The Caption files row has Browse library: tick every part's caption file in the folder (they are listed in the order ticked; the job still sorts them by file name), then use the selection. Files picked this way and files uploaded are used together. The folder is the "Vertical Shorts captions" folder (Config > Network), including its extra named sources. Clear empties the list.
+
+## Best: matching by sound with the uncut part videos
+
+Add the uncut part videos ("Uncut part videos", upload or Browse library, one per caption file, sorted by file name like the captions). PRISM then compares the sound of the cut video with the parts (a spectral fingerprint, 100 frames a second) instead of using Whisper:
+- exact to about a frame; cuts of any length are found (a 1-second cut too);
+- any language, music and silence included; speaker labels and sound descriptors make no difference;
+- a caption wholly inside a cut is dropped; one that runs into a cut is kept and trimmed at the cut ("trimmed at a cut");
+- a 45-minute episode takes well under a minute after the files are read.
+The number of part videos must equal the number of caption files. Without part videos, the Whisper matching is used as before.

@@ -6567,6 +6567,19 @@ async function runTranscribe(){
 function rtNatural(a, b){
   return a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'})
 }
+var RT_NET_PARTS = []    // uncut part videos picked with Browse library
+window.rtAddNetParts = function(list){
+  list.forEach(function(x){ if(!RT_NET_PARTS.some(function(y){ return y.name === x.name })) RT_NET_PARTS.push(x) })
+  rtShowParts()
+}
+function rtLocalParts(){ var f = document.getElementById('rt-parts'); return f && f.files ? Array.prototype.slice.call(f.files) : [] }
+function rtShowParts(){
+  var list = rtLocalParts().map(function(x){ return {name: x.name} }).concat(RT_NET_PARTS.map(function(x){ return {name: x.name} })).sort(rtNatural)
+  var clr = document.getElementById('rt-parts-clear'); if(clr) clr.style.display = list.length ? '' : 'none'
+  document.getElementById('rt-parts-list').innerHTML = list.length ? 'Part videos, in this order: ' + list.map(function(x, i){ return (i + 1) + '. ' + escapeHtmlLite(x.name) }).join(' &nbsp; ') : ''
+}
+function rtClearParts(){ RT_NET_PARTS = []; var f = document.getElementById('rt-parts'); if(f) f.value = ''; rtShowParts() }
+window.rtShowParts = rtShowParts; window.rtClearParts = rtClearParts
 var RT_NET_CAPS = []     // [{filename (staged), name}] picked with Browse library
 window.rtAddNetCaps = function(list){
   list.forEach(function(x){ if(!RT_NET_CAPS.some(function(y){ return y.name === x.name })) RT_NET_CAPS.push(x) })
@@ -6594,11 +6607,14 @@ async function runRetime(){
   if(!hasLocal && !net){ warn('Pick the combined video first, or use Browse library.'); return }
   if(!caps.length && !RT_NET_CAPS.length){ warn('Add the caption files, one per part.'); return }
   btn.disabled = true; out.style.display = 'none'
-  note.style.display = 'block'; note.textContent = 'Listening to the video and matching the captions\u2026 a full episode takes a few minutes.'
+  note.style.display = 'block'; note.textContent = (rtLocalParts().length + RT_NET_PARTS.length ? 'Matching the sound of the cut video against the parts\u2026 a full episode takes a minute or two.' : 'Listening to the video and matching the captions\u2026 a full episode takes a few minutes.')
   var fd = new FormData()
   if(hasLocal) fd.append('rt_video', v.files[0]); else fd.append('rt_video_network', net)
   caps.forEach(function(c){ fd.append('captions', c, c.name) })
   RT_NET_CAPS.forEach(function(c){ fd.append('captions_network', c.filename) })
+  rtLocalParts().forEach(function(c){ fd.append('rt_parts', c, c.name) })
+  RT_NET_PARTS.forEach(function(c){ fd.append('rt_parts_network', c.filename) })
+  var byAudio = rtLocalParts().length + RT_NET_PARTS.length > 0
   fd.append('order', 'name')
   fd.append('language', document.getElementById('rt-lang').value)
   fd.append('unsure', document.getElementById('rt-unsure').value)
@@ -6610,7 +6626,7 @@ async function runRetime(){
     if(!d.ok){ warn(d.error || 'Retiming failed.'); return }
     note.style.display = 'none'
     var s = d.summary
-    var label = {matched: 'matched', placed: 'placed', check: 'check this', dropped: 'in a cut'}
+    var label = d.by === 'audio' ? {matched: 'moved', placed: 'trimmed at a cut', check: 'check this', dropped: 'in a cut'} : {matched: 'matched', placed: 'placed', check: 'check this', dropped: 'in a cut'}
     var col = {matched: 'var(--phosphor)', placed: 'inherit', check: 'var(--amber)', dropped: 'var(--ink-dim)'}
     var rows = d.rows.map(function(x){
       return '<div style="display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--line);color:' + (col[x.status] || 'inherit') + '">' +
@@ -6619,9 +6635,12 @@ async function runRetime(){
         '<span style="min-width:70px;font-size:11px">' + (x.unsure ? 'unsure, dropped' : label[x.status]) + '</span><span>' + escapeHtmlLite(x.text) + '</span></div>'
     }).join('')
     var cuts = (s.cuts || []).map(function(c){ return c.seconds + ' s' }).join(', ')
-    out.innerHTML = '<div style="font-size:12px;margin-bottom:8px">' + s.captions + ' captions \u00b7 ' + s.matched + ' matched \u00b7 ' +
+    var head = d.by === 'audio'
+      ? s.captions + ' captions \u00b7 matched by sound to ' + (d.part_videos || []).length + ' part videos \u00b7 ' + s.matched + ' moved \u00b7 ' + s.placed + ' trimmed at a cut \u00b7 ' + s.dropped + ' in cuts (dropped)' + (cuts ? ' \u00b7 cuts found: ' + cuts : ' \u00b7 no cuts found')
+      : null
+    out.innerHTML = '<div style="font-size:12px;margin-bottom:8px">' + (head ? head : s.captions + ' captions \u00b7 ' + s.matched + ' matched \u00b7 ' +
       s.placed + ' placed from their neighbours \u00b7 <b style="color:var(--amber)">' + s.check + ' to check</b> \u00b7 ' + s.dropped +
-      ' in cuts (dropped)' + (s.unsure_dropped ? ' \u00b7 <b style="color:var(--amber)">' + s.unsure_dropped + ' unsure (dropped)</b>' : '') + (cuts ? ' \u00b7 cuts found: ' + cuts : ' \u00b7 no cuts found') + '</div>' +
+      ' in cuts (dropped)' + (s.unsure_dropped ? ' \u00b7 <b style="color:var(--amber)">' + s.unsure_dropped + ' unsure (dropped)</b>' : '') + (cuts ? ' \u00b7 cuts found: ' + cuts : ' \u00b7 no cuts found')) + '</div>' +
       '<div style="max-height:340px;overflow-y:auto;font-size:12px;line-height:1.6">' + rows + '</div>' +
       '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">' +
       '<button type=button class=btn style="padding:6px 12px;font-size:12px" onclick="rtDownload(\'srt\')">Download .srt</button>' +
@@ -14193,6 +14212,14 @@ document.addEventListener('DOMContentLoaded', function(){
   <span class="net-file-chip" id=rt_video_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('rt_video')">&#10005;</span></span>
   <button type=button class="browse-btn" onclick="openNetworkBrowser('rt_video','hires','Video (HIRES)')">Browse library</button>
 </div>
+<label>Uncut part videos (recommended, one per caption file):</label>
+<div class="browse-row" style="gap:8px">
+  {% if allow_local_upload %}<input type=file id=rt-parts multiple accept="video/*,audio/*" onchange="rtShowParts()">{% endif %}
+  <button type=button class="browse-btn" onclick="openNetworkBrowser('rt_parts','hires','Video (HIRES)')">Browse library</button>
+  <button type=button class="browse-btn" id=rt-parts-clear onclick="rtClearParts()" style="display:none">&#10005; Clear</button>
+</div>
+<p style="font-size:12px;opacity:.65;margin:4px 0 0">With the uncut parts, the cuts are found by matching the <b>sound</b> of the cut video against them: exact to a frame, any cut length, any language, no speech-to-text. Without them, the captions are matched against what Whisper hears.</p>
+<div id=rt-parts-list style="font-size:12px;opacity:.8;margin:6px 0 10px"></div>
 <label>Caption files (all the parts, .scc / .srt / .vtt):</label>
 <div class="browse-row" style="gap:8px">
   {% if allow_local_upload %}<input type=file id=rt-caps multiple accept=".scc,.srt,.vtt" onchange="rtShowFiles()">{% endif %}
@@ -16809,12 +16836,13 @@ document.addEventListener('DOMContentLoaded', function(){
   }
   function useMultiSelection(){
     if(!active || !active.multi || !multiSel.length) return
-    if(active.fieldName === 'rt_caps'){
+    if(active.fieldName === 'rt_caps' || active.fieldName === 'rt_parts'){
+      var rtField = active.fieldName
       // Caption files for Retime captions: all of them, fetched one by one and handed to that card.
       var cp = multiSel.slice(0, 40), ccat = active.category, got = [], ci = 0
       var cnote = function(x, bad){ listEl.innerHTML = '<div class="net-modal-empty"' + (bad ? ' style="color:var(--tally)"' : '') + '>' + x + '</div>' }
       var cnext = function(){
-        if(ci >= cp.length){ multiSel = []; closeModal(); if(window.rtAddNetCaps) window.rtAddNetCaps(got); return }
+        if(ci >= cp.length){ multiSel = []; closeModal(); if(rtField === 'rt_parts'){ if(window.rtAddNetParts) window.rtAddNetParts(got) } else if(window.rtAddNetCaps) window.rtAddNetCaps(got); return }
         var pk = cp[ci]
         cnote('Getting ' + (ci + 1) + ' of ' + cp.length + ': ' + escapeHtmlLite(pk.name) + '&hellip;')
         fetch('/api/network/fetch', {method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -17179,7 +17207,7 @@ document.addEventListener('DOMContentLoaded', function(){
   }
 
   function openNetworkBrowser(fieldName, category, label){
-    active = {fieldName: fieldName, category: category, subpath: '', multi: (fieldName === 'shorts_file' && category === 'shorts') || fieldName === 'rt_caps'}
+    active = {fieldName: fieldName, category: category, subpath: '', multi: (fieldName === 'shorts_file' && category === 'shorts') || fieldName === 'rt_caps' || fieldName === 'rt_parts'}
     multiSel = []
     updateMultiBar()
     titleEl.textContent = 'Browse ' + label + ' folder'

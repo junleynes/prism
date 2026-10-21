@@ -10744,9 +10744,64 @@ def api_stt_retime():
             return jsonify(ok=False, error=err), 400
         parts.append(cues)
         texts.append(captionfile.decode_bytes(raw) if fname.lower().endswith('.scc') else None)
+    # The uncut part videos, when given: the cuts are then found by matching the sound, with no speech-to-text.
+    pvids = []
+    for f in request.files.getlist('rt_parts'):
+        if f and f.filename:
+            ext = os.path.splitext(f.filename)[1].lower().lstrip('.')
+            if ext not in ALLOWED_EXTENSIONS | AUDIO_EXTENSIONS:
+                return jsonify(ok=False, error=f'{f.filename} is not a video or audio file.'), 400
+            dst = os.path.join(app.config['UPLOAD_FOLDER'], f'rtpart_{uuid.uuid4().hex}.{ext}')
+            f.save(dst)
+            pvids.append((f.filename, dst, True))
+    for n in request.form.getlist('rt_parts_network'):
+        n = os.path.basename((n or '').strip())
+        ext = os.path.splitext(n)[1].lower().lstrip('.')
+        if not n:
+            continue
+        path = restage(n)[0] if n.startswith('net_') and ext in ALLOWED_EXTENSIONS | AUDIO_EXTENSIONS else None
+        if not path:
+            return jsonify(ok=False, error=f'{re.sub(r"^net_[0-9]+_", "", n)} is no longer available -- pick it again.'), 400
+        pvids.append((re.sub(r'^net_\d+_', '', n), path, False))
+    if pvids:
+        pvids.sort(key=lambda f: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', f[0])])
+        if len(pvids) != len(parts):
+            for _n, pth, mine in pvids:
+                if mine and os.path.exists(pth):
+                    os.remove(pth)
+            return jsonify(ok=False, error=f'{len(parts)} caption files but {len(pvids)} uncut part videos: give one '
+                                           'part video per caption file, or none.'), 400
     src = _resolve_upload('rt_video', ALLOWED_EXTENSIONS | AUDIO_EXTENSIONS)
     if not src:
         return jsonify(ok=False, error='Pick the combined video (or audio) the captions are for.'), 400
+    if pvids:
+        import audioalign
+        try:
+            m = audioalign.align_files(FFMPEG, src, [pth for _n, pth, _m in pvids])
+        except Exception as e:
+            return jsonify(ok=False, error=f'The sound could not be read: {e}'), 422
+        finally:
+            for _n, pth, mine in pvids:
+                if mine and os.path.exists(pth):
+                    try:
+                        os.remove(pth)
+                    except OSError:
+                        pass
+            if os.path.exists(src) and inside_uploads(src) and not os.path.basename(src).startswith('net_'):
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
+        if not m['stretches']:
+            return jsonify(ok=False, error='The cut video\'s sound was not found in the part videos. Check that they '
+                                           'are the same programme and that the parts are the uncut ones.'), 422
+        result = captionretime.align_audio(parts, m['stretches'], m['part_offsets'], m['part_durations'])
+        labels = request.form.get('strip_labels') in ('1', 'true', 'on')
+        descs = request.form.get('strip_descriptors') in ('1', 'true', 'on')
+        return jsonify(ok=True, srt=captionretime.write_srt(result, labels=labels, descriptors=descs),
+                       scc=captionretime.write_scc(texts, parts, result), summary=captionretime.summary(result),
+                       rows=captionretime.report(result), files=[n for n, _f in files], by='audio',
+                       part_videos=[n for n, _p, _m in pvids], model='sound match')
     sample = ' '.join(captionretime.clean_text(c['text']) for c in parts[0][:12])[:400]
     try:
         words, segments, outcome = transcribe_video_detailed(src, language=(request.form.get('language') or None),

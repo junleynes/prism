@@ -415,6 +415,60 @@ def align(parts, words, segments, labels=True, descriptors=True, drop_unsure=Fal
     return {'cues': cues, 'cuts': cuts, 'anchors': len(chain), 'transcript_words': len(tr.tw)}
 
 
+
+def align_audio(parts, stretches, part_offsets, part_durations, labels=True, descriptors=True):
+    """The same result as align(), from where the sound says each stretch of the cut video comes from
+    (audioalign.align_files): every caption is moved by the stretch it falls in; a caption that runs into a
+    cut keeps the part that is still in the video; one wholly inside a cut is dropped."""
+    cues = _flatten(parts, labels, descriptors)
+    shifts = []
+    for pi, part in enumerate(parts):
+        _c, shift = captionfile.fit_to_video([dict(x) for x in part], part_durations[pi] if pi < len(part_durations) else 0)
+        shifts.append(shift or 0.0)
+
+    def where(src):
+        for k, (v0, v1, s0) in enumerate(stretches):
+            if s0 - 1e-6 <= src < s0 + (v1 - v0) + 1e-6:
+                return k, v0 + (src - s0)
+        return None, None
+
+    for c in cues:
+        pi = c['part']
+        if pi >= len(part_offsets):
+            c.update(drop=True, status='dropped')
+            continue
+        base = part_offsets[pi] - shifts[pi]
+        a, b = base + c['start'], base + c['end']
+        ka, va = where(a)
+        kb, vb = where(b - 0.01)
+        if ka is None and kb is None:
+            c.update(drop=True, status='dropped')
+            continue
+        status = 'matched'
+        if ka is None:
+            va, status = stretches[kb][0], 'placed'          # starts in a cut: the part after it
+        if kb is None:
+            vb, status = stretches[ka][1], 'placed'          # ends in a cut: the part before it
+        elif ka is not None and kb != ka and stretches[kb][0] - stretches[ka][1] > 0.05:
+            vb, status = stretches[ka][1], 'placed'
+        if vb - va < 0.3:
+            c.update(drop=True, status='dropped')
+            continue
+        c.update(offset=va - c['start'], status=status, score=1.0, new_start=va, new_end=vb)
+    kept = [c for c in cues if not c['drop'] and c.get('new_start') is not None]
+    kept.sort(key=lambda c: (c['new_start'], c['part'], c['idx']))
+    for x, y in zip(kept, kept[1:]):
+        if x['new_end'] > y['new_start']:
+            x['new_end'] = max(x['new_start'] + 0.2, y['new_start'])
+    cuts = []
+    for (v0, v1, s0), (w0, w1, t0) in zip(stretches, stretches[1:]):
+        gone = t0 - (s0 + (v1 - v0))
+        if gone > 0.04:
+            pi = max(k for k, o in enumerate(part_offsets) if o <= s0 + (v1 - v0) + 1e-6)
+            cuts.append({'part': pi, 'at_video': round(v1, 2), 'seconds': round(gone, 2)})
+    return {'cues': cues, 'cuts': cuts, 'anchors': len(stretches), 'transcript_words': 0, 'by': 'audio'}
+
+
 # ---- writing ----
 
 def _srt_time(t):
