@@ -2460,6 +2460,7 @@ def _resolve_ending_sfx(opts):
         path = pipeline.restage(name)[0] or path
     if not name.startswith('net_') or ext not in pipeline.AUDIO_EXTENSIONS or not os.path.isfile(path):
         return None, 'The ending sound effect is no longer available -- pick it again.'
+    _touch(path)
     a, b = opts.get('ending_sfx_in'), opts.get('ending_sfx_out')
     if a is not None and b is not None and b <= a:
         a = b = None
@@ -2489,6 +2490,7 @@ def _resolve_ending_overlay(opts):
         path = pipeline.restage(name)[0] or path
     if not name.startswith('net_') or ext not in _OVERLAY_EXTS or not os.path.isfile(path):
         return None, 'The transition overlay is no longer available -- pick it again.'
+    _touch(path)
     return dict(_overlay_facts(path), path=path, name=re.sub(r'^net_\d+_', '', name)), None
 
 
