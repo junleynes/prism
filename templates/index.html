@@ -656,7 +656,7 @@ input[type=file]::-webkit-file-upload-button:hover{
   padding:3px 10px;border-radius:6px;font-size:12px;cursor:pointer;
 }
 #tr-close:hover{border-color:var(--tally);color:var(--tally)}
-input[type=url],input[type=number],input[type=text],select{width:100%;padding:10px 12px;background:var(--elevated);border:1px solid var(--line);border-radius:7px;margin:6px 0;font-size:14px;color:var(--ink);font-family:'IBM Plex Sans',sans-serif}
+input[type=url],input[type=number],input[type=text],input[type=password],select{width:100%;padding:10px 12px;background:var(--elevated);border:1px solid var(--line);border-radius:7px;margin:6px 0;font-size:14px;color:var(--ink);font-family:'IBM Plex Sans',sans-serif}
 select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--ink-dim) 50%),linear-gradient(135deg,var(--ink-dim) 50%,transparent 50%);background-position:calc(100% - 18px) center,calc(100% - 13px) center;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 
 .card{background:var(--elevated);border:1px solid var(--line);border-radius:8px;padding:16px;margin:12px 0}
@@ -1197,20 +1197,27 @@ input.sh-num[type=number]{width:92px}
 var IS_ADMIN = {{ 'true' if current_role == 'admin' else 'false' }}
 var CURRENT_USERNAME = {{ current_username|tojson }}
 </script>
-<dialog id=pw-dialog style="border:1px solid var(--line);border-radius:12px;background:var(--panel, #fff);color:var(--ink);padding:20px;max-width:380px;width:92vw">
-  <h3 style="margin:0 0 4px">Change your password</h3>
-  <p style="margin:0 0 12px;font-size:12px;opacity:.7">Your other sessions are signed out; this one stays signed in.</p>
-  <div style="display:flex;flex-direction:column;gap:8px">
-    <input type=password id=pwd-current placeholder="Current password" autocomplete="current-password" style="margin:0">
-    <input type=password id=pwd-new placeholder="New password (12+ characters)" autocomplete="new-password" style="margin:0">
-    <input type=password id=pwd-new2 placeholder="New password again" autocomplete="new-password" style="margin:0">
+<div class="net-modal-overlay" id=pw-dialog role="dialog" aria-modal="true" aria-labelledby="pw-dialog-title" onclick="if(event.target===this)closePasswordDialog()">
+  <div class="net-modal-box" style="max-width:400px">
+    <div class="net-modal-head">
+      <div><strong id=pw-dialog-title>Change your password</strong><small>Your other sessions are signed out; this one stays signed in.</small></div>
+      <span class="net-modal-close" onclick="closePasswordDialog()" role="button" aria-label="Close">&#10005;</span>
+    </div>
+    <form onsubmit="changeOwnPassword('pwd');return false" style="padding:16px 18px 18px" autocomplete="off">
+      <label style="display:block;font-size:11px;opacity:.7;margin:0">Current password</label>
+      <input type=password id=pwd-current autocomplete="current-password">
+      <label style="display:block;font-size:11px;opacity:.7;margin:10px 0 0">New password <span style="opacity:.8">(12 characters or more)</span></label>
+      <input type=password id=pwd-new autocomplete="new-password">
+      <label style="display:block;font-size:11px;opacity:.7;margin:10px 0 0">New password again</label>
+      <input type=password id=pwd-new2 autocomplete="new-password">
+      <div id=pwd-status style="font-size:12px;min-height:18px;margin-top:10px"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
+        <button type=button class=btn-sm onclick="closePasswordDialog()">Cancel</button>
+        <button type=submit class=btn>Change password</button>
+      </div>
+    </form>
   </div>
-  <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-    <button type=button class=btn onclick="changeOwnPassword('pwd')">Change password</button>
-    <button type=button class=btn-sm onclick="document.getElementById('pw-dialog').close()">Close</button>
-    <span id=pwd-status style="font-size:12px"></span>
-  </div>
-</dialog>
+</div>
 <nav class="rail">
   <div class="rail-brand">
     <a class="rail-brand-link" href="/" title="{{ brand_name }}">
@@ -1272,10 +1279,7 @@ var CURRENT_USERNAME = {{ current_username|tojson }}
       <span class="rail-user-label">Signed in</span>
       <strong class="rail-user-name">{{ current_username }}</strong>
     </div>
-    <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch">
-      <button type=button class="rail-signout" onclick="openPasswordDialog()" title="Change your own password">Password</button>
-      <form method=post action="/logout" style="margin:0"><input type=hidden name=_csrf value="{{ csrf_token }}"><button type=submit class="rail-signout" style="width:100%">Sign out</button></form>
-    </div>
+    <form method=post action="/logout" style="margin:0"><input type=hidden name=_csrf value="{{ csrf_token }}"><button type=submit class="rail-signout">Sign out</button></form>
   </div>
   {% if brand_footer %}
   <div class="rail-footer">{{ brand_footer }}</div>
@@ -1636,6 +1640,10 @@ document.addEventListener("DOMContentLoaded", function(){
       <strong style="font-size:13px">Security</strong>
       <div id=dash-security style="margin-top:10px;font-size:13px">
         <p style="opacity:.6;margin:0">Checking…</p>
+      </div>
+      <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px">
+        <span style="opacity:.85">Password</span>
+        <button type=button class=btn-sm onclick="openPasswordDialog()">Change password</button>
       </div>
     </div>
 
@@ -15325,12 +15333,13 @@ async function saveConfigTab(){
 window.saveConfigTab = saveConfigTab
 
 function openPasswordDialog(){
-  var dlg = document.getElementById('pw-dialog')
   ;['pwd-current', 'pwd-new', 'pwd-new2'].forEach(function(i){ document.getElementById(i).value = '' })
   document.getElementById('pwd-status').textContent = ''
-  if(dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', '')
+  document.getElementById('pw-dialog').classList.add('open')
   document.getElementById('pwd-current').focus()
 }
+function closePasswordDialog(){ document.getElementById('pw-dialog').classList.remove('open') }
+document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closePasswordDialog() })
 function changeOwnPassword(pre){
   pre = pre || 'pw'
   var f = function(n){ return document.getElementById(pre === 'pw' ? 'pw-' + n : pre + '-' + n) }
