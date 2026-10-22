@@ -935,6 +935,37 @@ def test_editing_proxy_covers_the_whole_part_and_is_made_once_in_the_background(
     assert client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).status_code == 410
 
 
+def test_editing_proxy_waits_for_other_jobs_runs_at_low_priority_and_can_be_switched_off(env, monkeypatch):
+    Services(monkeypatch)
+    shorts._PROXY_JOBS.clear()
+    client, headers = _client()
+    aid = _analyze(client, headers, env)['result']['analysis_id']
+    # Busy server: nothing is started, and it is said to be waiting.
+    monkeypatch.setattr(shorts, '_server_busy', lambda: True)
+    d = client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).get_json()
+    assert d['state'] == 'building' and d['waiting'] and not shorts._PROXY_JOBS
+    # Free: it starts, with few threads and the lowest priority.
+    monkeypatch.setattr(shorts, '_server_busy', lambda: False)
+    seen = {}
+    real = subprocess.run
+
+    def spy(cmd, **kw):
+        if 'shproxy' in ' '.join(map(str, cmd)) or '-sc_threshold' in cmd:
+            seen['cmd'], seen['kw'] = cmd, kw
+        return real(cmd, **kw)
+    monkeypatch.setattr(shorts.subprocess, 'run', spy)
+    d = client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).get_json()
+    for _ in range(300):
+        if shorts._PROXY_JOBS and all(j['state'] != 'building' for j in shorts._PROXY_JOBS.values()):
+            break
+        time.sleep(0.1)
+    assert seen and '-threads' in seen['cmd'] and int(seen['cmd'][seen['cmd'].index('-threads') + 1]) <= max(1, (os.cpu_count() or 4) // 4)
+    assert seen['kw'].get('preexec_fn') is not None or seen['kw'].get('creationflags')
+    # Switched off: the editor is told and keeps the clip-per-edit behaviour.
+    monkeypatch.setattr(shorts, 'SHORTS_PROXY', False)
+    assert client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).get_json()['state'] == 'off'
+
+
 def test_review_screen_plays_the_proxy_live_instead_of_rendering_per_edit():
     html = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'templates', 'index.html'),
                 encoding='utf-8').read()

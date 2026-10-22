@@ -47,12 +47,13 @@ def _login(name):
 
 # ---- 1. Stored XSS: show template names on the Dashboard ----
 
-def test_the_dashboard_escapes_show_template_names(accounts):
+def test_the_dashboard_escapes_what_it_shows_about_who_is_signed_in(accounts):
     c, _h = _login('admin1')
     html = c.get('/').get_data(as_text=True)
-    start = html.index('No saved shows yet')
-    block = html[start:start + 1500]
-    assert "escapeHtmlLite(t.name)" in block and "' + t.name + '" not in block
+    start = html.index('function _dashLoadPresence')
+    block = html[start:start + 3500]
+    assert "escapeHtmlLite(u.username)" in block and "escapeHtmlLite(s.device)" in block and "escapeHtmlLite(s.ip)" in block
+    assert "' + u.username + '" not in block and "' + s.device + '" not in block
 
 
 # ---- 2. Stored XSS via a self-registered username on the old admin page ----

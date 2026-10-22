@@ -63,7 +63,7 @@ def test_blank_reads_the_hires_folder_with_the_hires_login(folders):
     reg.assert_called_once_with('fileserver', username='promo', password='p1', connection_timeout=10)
     # A login typed in without a path is not a folder of its own yet.
     library_db.save_network_folder('shorts', {'username': 'someone', 'password': 'x'})
-    assert pipeline._network_folder_row('shorts') == HIRES
+    assert {k: pipeline._network_folder_row('shorts')[k] for k in HIRES} == HIRES
 
 
 def test_its_own_path_and_login_once_set_and_hires_is_untouched(folders):
@@ -122,7 +122,7 @@ def test_config_api_shows_saves_and_validates_it(folders):
     client, headers = _admin()
     cats = client.get('/api/network/shares').get_json()['categories']
     assert cats['shorts'] == {'path': '', 'username': '', 'has_password': False, 'fallback': 'hires',
-                              'in_place': False, 'can_in_place': True}
+                              'in_place': False, 'can_in_place': True, 'name': '', 'sources': []}
     assert cats['hires']['can_in_place'] is True and cats['music']['can_in_place'] is False
     assert cats['hires']['fallback'] is None and cats['hires']['path'] == HIRES['path']
     r = client.post('/api/network/shares', json=dict(SHORTS, category='shorts'), headers=headers)
@@ -132,7 +132,7 @@ def test_config_api_shows_saves_and_validates_it(folders):
     assert 'password' not in cats['shorts'], 'a saved password is never sent back'
     saved = json.loads(folders.read_text())['hires']
     assert saved['password'].startswith('enc:v1:'), 'kept encrypted at rest'
-    assert pipeline.load_network_folders()['hires'] == HIRES, 'the other folder is left as it was'
+    assert {k: pipeline.load_network_folders()['hires'][k] for k in HIRES} == HIRES, 'the other folder is left as it was'
 
 
 def test_the_shorts_tab_browses_its_own_category():

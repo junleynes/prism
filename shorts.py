@@ -2916,6 +2916,24 @@ SHORTS_PROXY_HEIGHT = 480
 _PROXY_JOBS = {}            # out_name -> {'state': 'building'|'ready'|'failed', 'error': str}
 _PROXY_LOCK = threading.Lock()
 _PROXY_MAX_RUNNING = 1      # one encode at a time: it must not starve renders
+SHORTS_PROXY = os.environ.get('SHORTS_PROXY', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+# The copy is a convenience, so it never competes with real work: it runs at the lowest priority, on a quarter of
+# the cores, and does not start while any job is running.
+_PROXY_THREADS = max(1, (os.cpu_count() or 4) // 4)
+
+
+def _low_priority():
+    """(preexec_fn, creationflags) that start a child at the lowest priority on this system."""
+    if os.name == 'nt':
+        return None, getattr(subprocess, 'IDLE_PRIORITY_CLASS', 0x40)
+    return (lambda: os.nice(19)), 0
+
+
+def _server_busy():
+    try:
+        return any(not j.get('done') for j in pipeline.job_list_all().values())
+    except Exception:      # noqa: BLE001 -- unknown: do not hold the copy back for ever
+        return False
 
 
 def _proxy_name(path):
@@ -2936,11 +2954,14 @@ def _proxy_build(src, out_path, take, name):
     try:
         sound = (['-filter_complex', sc.take_to_stereo(take) + '[a]', '-map', '0:v:0', '-map', '[a]']
                  if take else ['-map', '0:v:0', '-map', '0:a:0?'])
-        r = pipeline.run_ffmpeg([pipeline.FFMPEG, '-y', '-i', src] + sound +
-                                ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-g', '25', '-keyint_min', '25',
-                                 '-sc_threshold', '0', '-vf', f"scale=-2:'min({SHORTS_PROXY_HEIGHT},ih)'", '-pix_fmt', 'yuv420p',
-                                 '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-movflags', '+faststart', part],
-                                timeout=max(pipeline.FFMPEG_TIMEOUT, 7200), label='shorts editing proxy')
+        pre, flags = _low_priority()
+        r = subprocess.run([pipeline.FFMPEG, '-y', '-threads', str(_PROXY_THREADS), '-i', src] + sound +
+                           ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-g', '25', '-keyint_min', '25',
+                            '-threads', str(_PROXY_THREADS), '-sc_threshold', '0',
+                            '-vf', f"scale=-2:'min({SHORTS_PROXY_HEIGHT},ih)'", '-pix_fmt', 'yuv420p',
+                            '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-movflags', '+faststart', part],
+                           capture_output=True, text=True, timeout=max(pipeline.FFMPEG_TIMEOUT, 7200),
+                           preexec_fn=pre, creationflags=flags)
         if os.path.exists(part) and os.path.getsize(part) > 0:
             os.replace(part, out_path)
         else:
@@ -2964,6 +2985,8 @@ def api_shorts_proxy():
     it the editor plays any in/out/cut straight from the browser -- no clip to wait for after each change.
     Asking again while it builds just reports the state."""
     data = request.get_json(silent=True) or {}
+    if not SHORTS_PROXY:
+        return jsonify(ok=True, state='off')
     a, err = _analysis_or_error((data.get('analysis_id') or '').strip())
     if err:
         return err
@@ -2991,8 +3014,8 @@ def api_shorts_proxy():
             return jsonify(ok=True, state='failed', error=job.get('error', ''))
         running = sum(1 for j in _PROXY_JOBS.values() if j['state'] == 'building')
         if not job or job['state'] != 'building':
-            if running >= _PROXY_MAX_RUNNING:
-                return jsonify(ok=True, state='building', queued=True)
+            if running >= _PROXY_MAX_RUNNING or _server_busy():
+                return jsonify(ok=True, state='building', waiting=True)
             _PROXY_JOBS[name] = {'state': 'building', 'error': ''}
             threading.Thread(target=_proxy_build, args=(v['path'], out_path, v['info'].get('audio_take'), name),
                              daemon=True).start()

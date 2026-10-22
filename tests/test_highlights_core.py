@@ -127,7 +127,8 @@ def test_pin_and_swap_buttons_work_in_the_review_grid():
     page_html = ('<div id=card><input type=checkbox class=tr-preview-pick data-scene=1 checked></div>'
                  '<input type=checkbox class=tr-alt-pick data-scene=1><input type=checkbox class=tr-alt-pick data-scene=2>'
                  '<input id=tr-file-input><input id=tr-network-file value="x.mxf"><input id=tr-materials-network>')
-    stub = ('function altPicks(){return Array.prototype.slice.call(document.querySelectorAll(".tr-alt-pick"))};'
+    stub = ('window.tcFmt=function(t){return String(t)};window.escapeHtmlLite=function(s){return String(s).replace(/[&<>"]/g,"_")};'
+            'function altPicks(){return Array.prototype.slice.call(document.querySelectorAll(".tr-alt-pick"))};'
             'window.kept=0;function updatePreviewKept(){window.kept++};')
     with sync.sync_playwright() as p:
         b = p.chromium.launch()

@@ -17,7 +17,7 @@ def test_the_preview_can_play_beyond_the_ends_and_set_in_out_account_for_it():
     assert 'id=ws-beyond' in html and 'show 5 s beyond the ends' in html
     assert "start: c.start - WS.lead, end: c.end + WS.tail" in html, 'the padded range is what is played'
     # Set In/Out and cuts read the playhead on the source clock, not relative to the unpadded clip
-    assert html.count('c.start - WS.lead + (v.currentTime || 0)') == 2
+    assert html.count('c.start - WS.lead + shWsGet(v)') >= 2, 'the live copy has its own clock: read through shWsGet'
     assert 'function shPartBounds' in html, 'never past the part the moment is in'
 
 

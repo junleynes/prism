@@ -10282,7 +10282,7 @@ function shWsProxyEnsure(k, retry){
     shWsPost('/api/shorts/proxy', {analysis_id: aid, part: k, retry: !!retry}).then(function(r){
       if(!SH.analysis || SH.analysis.analysis_id !== aid) return
       if(!r.ok){ WS.proxy[k] = {state: 'failed'}; shWsProxyNote(); return }
-      if(r.state === 'building'){ WS.proxy[k] = {state: 'building', polling: true}; shWsProxyNote(); setTimeout(poll, 4000); return }
+      if(r.state === 'building'){ WS.proxy[k] = {state: 'building', polling: true, waiting: !!r.waiting}; shWsProxyNote(); setTimeout(poll, r.waiting ? 15000 : 4000); return }
       WS.proxy[k] = r.state === 'ready' ? {state: 'ready', url: r.url, offset: r.offset || 0} : {state: 'failed'}
       shWsProxyNote()
       if(r.state === 'ready' && WS.selC && WS.screen === 'moments' && !WS.wantExact) shWsLoad(0)
@@ -10294,7 +10294,7 @@ function shWsProxyNote(){
   var el = shEl('ws-live-note'); if(!el) return
   var c = WS.selC, px = c && WS.proxy[shWsPartOf(c)], t = ''
   if(px && px.state === 'ready') t = WS.live ? 'Live: in, out, cuts and framing show as you change them. Captions are approximate; <b>Exact render</b> shows the finished look.' : ''
-  else if(px && px.state === 'building') t = 'Preparing a fast editing copy of this episode (once). Until it is ready, a change shows after a short wait.'
+  else if(px && px.state === 'building') t = (px.waiting ? 'A fast editing copy of this episode will be made once the server is free of other jobs.' : 'Preparing a fast editing copy of this episode (once, at low priority).') + ' Until it is ready, a change shows after a short wait.'
   el.innerHTML = t
   shWsExactBtn()
 }
