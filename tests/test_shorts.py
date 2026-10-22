@@ -4308,3 +4308,26 @@ def test_any_staged_pick_is_fetched_again_when_it_has_been_cleared(monkeypatch, 
     assert pipeline.staged_path_or_fetch(name) == str(fresh)
     pipeline.STAGED_ORIGINS.pop(name, None)
     assert pipeline.staged_path_or_fetch(name) == pipeline.staged_path(name)
+
+
+def test_a_saved_review_keeps_the_parts_cut_out_of_a_moment(env, monkeypatch):
+    Services(monkeypatch)
+    client, headers = _client()
+    a = _analysis(client, _analyze(client, headers, env))
+    aid = a['analysis_id']
+    item = {'id': 'm1', 'keep': True, 'title': 'With a cut', 'start': 1.0, 'end': 20.0, 'cuts': [[6.0, 9.0]]}
+    r = client.post(f'/api/shorts/analysis/{aid}/review', json={'items': [item]}, headers=headers)
+    assert r.status_code == 200 and r.get_json()['ok'], r.get_json()
+    got = client.get(f'/api/shorts/analysis/{aid}').get_json()
+    assert got['review'][0]['cuts'] == [[6.0, 9.0]]
+    bad = dict(item, cuts=[[1.2, 19.5]])        # leaves under a second at the ends
+    r = client.post(f'/api/shorts/analysis/{aid}/review', json={'items': [bad]}, headers=headers)
+    assert r.status_code == 400
+
+
+def test_the_render_request_the_page_sends_carries_the_cuts_and_the_replace():
+    """The page builds the render request itself: a moment's cuts and the short it replaces must be in it."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'templates', 'index.html'),
+               encoding='utf-8').read()
+    body = src[src.index('async function shortsRenderSelected()'):src.index('async function shRunRender')]
+    assert 'it.cuts = shCutsClean(c)' in body and 'it.replaces = c.rendered' in body

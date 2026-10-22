@@ -2858,6 +2858,11 @@ def api_shorts_review(aid):
             row['captions'] = captions
         if framing:
             row['framing'] = framing
+        cuts, bad = _parse_cuts(it.get('cuts'), start, end, label)
+        if bad:
+            return jsonify(ok=False, error=bad), 400
+        if cuts:
+            row['cuts'] = cuts          # parts cut out of the middle: kept, so a reopened cut still leaves them out
         out.append(row)
     a['review'] = out
     a['reviewed_at'] = time.time()

@@ -10633,6 +10633,10 @@ async function shortsRenderSelected(){
     var it = {start: c.start, end: c.end, title: c.title}
     if(c.captions) it.captions = c.captions
     if(c.framing) it.framing = c.framing
+    // Parts cut out of the middle ("Cut from here") must reach the render, or they are in the short.
+    if(shCutsClean(c).length) it.cuts = shCutsClean(c)
+    // "Replace the earlier render of a moment" ticked: that short is replaced, not added beside.
+    if(c.rendered && shEl('sh-replace') && shEl('sh-replace').checked) it.replaces = c.rendered
     return it
   })
   if(!items.length) return

@@ -184,3 +184,7 @@ The Word procedure (PRISM_Vertical_Shorts_Procedure.docx) is written for the Min
 ## Sending to a network destination in a project folder
 
 When sending shorts to a video destination (Send all, or Send on one short), tick "project folder" (or "in a folder named Program Title - Episode") and PRISM creates a folder named after the project, Program Title - Episode (for example Magpakailanman - 383), under the destination and puts the files, and their .srt, inside. Characters Windows does not allow in a folder name (\ / : * ? " < > |) are removed. The folder is created if missing and reused if already there; nothing else in the destination is touched or deleted. A batch not filed under a project cannot use it. The tick is remembered in the browser.
+
+## Parts cut out of a moment ("Cut from here")
+
+A part cut out of the middle of a moment (Cut from here / C key, shown as chips under the moment) is left out of the rendered short, and the rest is joined (crossfade set by "Where pieces join"). Earlier versions did not send these cuts to the render and did not keep them when the review was saved, so the cut part (for example an interview) stayed in the output. Fixed: cuts now go with every render and are saved with the review. A short rendered before the fix must be rendered again. If a part is still in the output, check that the cut shows as a chip under the moment before rendering; trimming In / Out is the alternative for the ends.
