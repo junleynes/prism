@@ -133,5 +133,5 @@ def test_every_user_not_only_admins_can_reach_the_password_change():
     with c.session_transaction() as s:
         s.update(authed=True, user_id=2, username='ana', role='user', csrf_token='t')
     html = c.get('/').get_data(as_text=True)
-    assert 'openPasswordDialog()' in html and 'id=pw-dialog' in html and 'class="rail-signout" onclick="openPasswordDialog' not in html and "changeOwnPassword('pwd')" in html
+    assert 'openPasswordDialog()' in html and 'id=pw-dialog' in html and 'class="rail-pw" onclick="openPasswordDialog()"' in html and "changeOwnPassword('pwd')" in html
     assert "onclick=\"switchTab('p-config',this)\"" not in html and 'id="p-config-backup"' not in html, 'Config and Backup stay admin-only'

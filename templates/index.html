@@ -941,6 +941,8 @@ input.sh-num[type=number]{width:92px}
 .ws-tools .btn-sm.on{background:var(--accent,#4f8cff);color:#fff;border-color:transparent}
 .sp-lname{font-size:13px;font-weight:600;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sp-lsub{display:flex;gap:6px;align-items:center;margin-top:3px;font-size:11px;color:var(--ink-dim);flex-wrap:wrap}
+.rail-pw{background:none;border:0;padding:0;margin-top:2px;font:inherit;font-size:11px;color:var(--ink-dim);text-decoration:underline;text-underline-offset:2px;cursor:pointer;text-align:left}
+.rail-pw:hover{color:var(--accent,var(--ink))}
 .sp-role{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;padding:1px 7px;border-radius:9px;border:1px solid var(--line)}
 .sp-role.r-background,.sp-role.r-picture{color:var(--ink-dim)}
 .sp-role.r-content{color:var(--phosphor);border-color:var(--phosphor)}
@@ -1278,6 +1280,7 @@ var CURRENT_USERNAME = {{ current_username|tojson }}
     <div class="rail-user-meta">
       <span class="rail-user-label">Signed in</span>
       <strong class="rail-user-name">{{ current_username }}</strong>
+      <button type=button class="rail-pw" onclick="openPasswordDialog()" title="Change your password">Password</button>
     </div>
     <form method=post action="/logout" style="margin:0"><input type=hidden name=_csrf value="{{ csrf_token }}"><button type=submit class="rail-signout">Sign out</button></form>
   </div>
@@ -1643,7 +1646,7 @@ document.addEventListener("DOMContentLoaded", function(){
       </div>
       <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px">
         <span style="opacity:.85">Password</span>
-        <button type=button class=btn-sm onclick="openPasswordDialog()">Change password</button>
+        <button type=button class=btn-sm onclick="openPasswordDialog()" title="Change your password">Password</button>
       </div>
     </div>
 
