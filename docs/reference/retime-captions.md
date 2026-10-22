@@ -28,3 +28,6 @@ Add the uncut part videos ("Uncut part videos", upload or Browse library, one pe
 - a caption wholly inside a cut is dropped; one that runs into a cut is kept and trimmed at the cut ("trimmed at a cut");
 - a 45-minute episode takes well under a minute after the files are read.
 The number of part videos must equal the number of caption files. Without part videos, the Whisper matching is used as before.
+
+## Lines unheard next to a cut are no longer dropped with it
+A cut removes a known length (the shift between the two matched captions on either side). Captions dropped for a cut now may not add up to much more than that length: lines Whisper simply did not hear (music, a mumble, a name) beside the cut used to be dropped along with it. Where the sound gives no evidence either way for the lines right at the cut's edge, text matching can still pick the wrong ones; **audio matching** (give the uncut part videos) places the cut to the hundredth of a second and has no such guesswork.

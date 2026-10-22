@@ -315,6 +315,7 @@ def _resolve_gap(cues, lo, hi, d_prev, d_next, tr, a_end0, b_start0):
     for i in range(n - 1, -1, -1):
         right[i] = right[i + 1] + (0.5 if sn[i] is None else 1 - sn[i])
     DROP = 0.55
+    EXCESS, EXCESS_SLACK = 0.35, 4.0
     best = None
     for i in range(n + 1):               # cues before i are kept before the cut
         for j in range(i, n + 1):        # cues from j on are kept after it; i..j-1 are dropped
@@ -324,6 +325,9 @@ def _resolve_gap(cues, lo, hi, d_prev, d_next, tr, a_end0, b_start0):
             if gap < cut - 1.5:
                 continue
             cost = left[i] + right[j] + DROP * (j - i)
+            # The cut removes exactly `cut` seconds. Dropped captions spanning far more than that took out
+            # captions Whisper simply did not hear (music, a mumble, a name): each second over is a cost.
+            cost += EXCESS * max(0.0, gap - cut - EXCESS_SLACK)
             if best is None or cost < best[0]:
                 best = (cost, i, j)
     if best is None:

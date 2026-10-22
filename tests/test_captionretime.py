@@ -192,3 +192,13 @@ def test_route_takes_caption_files_picked_with_browse_library(monkeypatch):
     r = client.post('/api/stt/retime', data={'rt_video': (io.BytesIO(b'x'), 'e.mp4'), 'captions_network': ['../../etc/passwd']},
                     headers={'X-CSRF-Token': 't'}, content_type='multipart/form-data')
     assert r.status_code == 400
+
+
+def test_captions_whisper_missed_beside_a_cut_do_not_all_go_with_it():
+    """Whisper not hearing a line is no reason to drop it: a cut removes 16 s, so no more than about that much
+    caption time may be dropped, however many lines beside it went unheard."""
+    S, cut, vt, p1, p2, words = _case()
+    for missing in ([6, 7], [5, 6, 7, 12, 13, 14]):
+        w = [x for x in words if not any(vt[i] - 0.01 <= x['start'] < vt[i] + 3 for i in missing if i in vt)]
+        res = rt.align([p1, p2], w, [])
+        assert rt.summary(res)['dropped'] == 4, (missing, rt.summary(res))
