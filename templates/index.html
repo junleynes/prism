@@ -15138,6 +15138,7 @@ function switchDocs(btn){
 <span id="storage-status" style="font-size:12px"></span>
 </div>
 
+{% if current_role == 'admin' %}
 <div id="p-config-backup" class="sub-panel">
 <h3 style="margin-top:0">Backup and restore</h3>
 <p style="margin-top:6px;color:var(--ink-dim)">The database holds accounts, the library index, the audit log, jobs and show templates. Files (library, renders) are not in it. Database: <code id=bk-db>…</code></p>
@@ -15163,6 +15164,7 @@ function switchDocs(btn){
 </div>
 </div>
 
+{% endif %}
 <div id="p-config-audit" class="sub-panel">
 <p style="margin-top:6px;color:var(--ink-dim)">Who did what — the last 200 admin actions, renders, and deletions. Newest first.</p>
 <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">

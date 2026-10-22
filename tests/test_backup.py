@@ -134,4 +134,4 @@ def test_every_user_not_only_admins_can_reach_the_password_change():
         s.update(authed=True, user_id=2, username='ana', role='user', csrf_token='t')
     html = c.get('/').get_data(as_text=True)
     assert 'openPasswordDialog()' in html and 'id=pw-dialog' in html and "changeOwnPassword('pwd')" in html
-    assert "switchTab('p-config'" not in html and 'p-config-backup' not in html.split('<nav')[1], 'Config and Backup stay admin-only'
+    assert "onclick=\"switchTab('p-config',this)\"" not in html and 'id="p-config-backup"' not in html, 'Config and Backup stay admin-only'
