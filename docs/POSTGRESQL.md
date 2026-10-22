@@ -245,3 +245,9 @@ Also copy `LIBRARY_DIR`, `TEMPLATES_DIR`, `.env`, `.secret_key`, `.data_key` and
 | `permission denied for schema public` | The role does not own the database, or `DB_AUTO_SCHEMA=0` is needed (section 4). |
 | `No free PostgreSQL connection after 30s` | Pool exhausted or the server stopped answering. Check the server first; raise `DB_POOL_MAX` only if it is healthy. |
 | `FATAL: too many connections` | Several apps share the server. Lower `DB_POOL_MAX` or raise `max_connections`. |
+
+
+## 8. Backup and restore from Config
+Admins have **Config > Backup**: *Back up the database now* runs `pg_dump -Fc` into `BACKUP_DIR` (default `backups` inside the library folder) and lists the files for download; *Restore* takes a backup file (or one in the list) and replaces the whole database with it, after typing `RESTORE`. A copy of the current database is taken first (`before-restore-*.dump`), and the schema is applied again afterwards so an older backup works with a newer PRISM. It needs `pg_dump` and `pg_restore` on the PATH, or `PG_BIN_DIR` in `.env`. *Export configuration* downloads a zip of `.env`, the keys, the AI services file and the library's settings files, with a README on putting them back; it contains secrets.
+
+Every user can change their own password in **Config > Security**. The dashboard's **Signed in now** card lists who has been active in the last five minutes (admins also see address and device); it is kept in memory only.

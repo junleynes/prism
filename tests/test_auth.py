@@ -137,3 +137,52 @@ class TestAccountLockout:
         fresh = auth.user_get(user['id'])
         assert fresh['failed_logins'] == 0
         assert fresh['locked_until'] is None
+
+
+class TestPresence:
+    """Who is signed in now: kept in memory, from each request's session."""
+
+    def _reset(self):
+        with auth._PRESENCE_LOCK:
+            auth._PRESENCE.clear()
+
+    def _touch(self, uid, name, role, sid, ip='10.0.0.5', ua='Mozilla/5.0 (Windows NT 10.0) Chrome/120 Safari/537'):
+        with auth.app.test_request_context('/api/library', headers={'User-Agent': ua}, environ_base={'REMOTE_ADDR': ip}):
+            from flask import session
+            session['sid'] = sid
+            auth._touch_presence(uid, name, role)
+
+    def test_only_recent_sessions_count_and_an_admin_sees_the_address(self):
+        self._reset()
+        self._touch(1, 'jun', 'admin', 'a1')
+        self._touch(1, 'jun', 'admin', 'a2', ip='10.0.0.9')
+        self._touch(2, 'ana', 'user', 'b1')
+        with auth._PRESENCE_LOCK:
+            auth._PRESENCE[(3, 'c1')] = {'since': 0, 'seen': 0, 'username': 'old', 'role': 'user', 'ip': 'x', 'device': 'y'}
+        snap = auth.presence_snapshot(True, (1, 'a1'))
+        assert snap['sessions'] == 3 and sorted(u['username'] for u in snap['users']) == ['ana', 'jun']
+        jun = next(u for u in snap['users'] if u['username'] == 'jun')
+        assert len(jun['sessions']) == 2 and any(s['you'] for s in jun['sessions'])
+        assert {s['ip'] for s in jun['sessions']} == {'10.0.0.5', '10.0.0.9'}
+        assert jun['sessions'][0]['device'] == 'Chrome on Windows'
+        assert 'old' not in [u['username'] for u in snap['users']]
+        plain = auth.presence_snapshot(False, (2, 'b1'))
+        assert all('ip' not in s and 'device' not in s for u in plain['users'] for s in u['sessions']), 'only an admin sees these'
+
+    def test_the_dashboards_own_polling_is_not_activity(self):
+        self._reset()
+        with auth.app.test_request_context('/api/dashboard/presence'):
+            from flask import session
+            session['sid'] = 'p1'
+            auth._touch_presence(1, 'jun', 'admin')
+        assert auth.presence_snapshot(True)['sessions'] == 0
+
+    def test_route_lists_who_is_here(self):
+        self._reset()
+        self._touch(2, 'ana', 'user', 'b1')
+        c = auth.app.test_client()
+        with c.session_transaction() as s:
+            s.update(authed=True, user_id=1, username='jun', role='admin', csrf_token='t', sid='a1')
+        d = c.get('/api/dashboard/presence').get_json()
+        assert d['ok'] and [u['username'] for u in d['users']] == ['ana'] and d['window_minutes'] == 5
+        assert auth.app.test_client().get('/api/dashboard/presence').status_code in (401, 403)

@@ -77,7 +77,75 @@ def _revalidate_session():
         return redirect('/')
     session['role'] = row['role']
     session['username'] = row['username']
+    _touch_presence(uid, row['username'], row['role'])
     return None
+
+# ---- Who is signed in now ----
+# A Flask session is a signed cookie, so the server keeps no list of sessions. Presence is therefore kept in
+# memory: each signed-in browser gets a random id in its cookie, and every request notes when it was last
+# heard from. It is for the dashboard only, so it is not stored: a restart empties it and it fills again
+# as people click. The dashboard's own polling does not count as activity.
+PRESENCE_WINDOW = 300          # seconds: signed in "now" means heard from within this
+_PRESENCE = {}                 # (user id, session id) -> {...}
+_PRESENCE_LOCK = __import__('threading').Lock()
+_PRESENCE_QUIET = ('/static/', '/api/dashboard/presence')
+
+
+def _device_label(ua):
+    ua = ua or ''
+    browser = next((n for k, n in (('Edg/', 'Edge'), ('OPR/', 'Opera'), ('Firefox/', 'Firefox'), ('Chrome/', 'Chrome'),
+                                   ('Safari/', 'Safari')) if k in ua), 'Browser')
+    system = next((n for k, n in (('Windows', 'Windows'), ('Android', 'Android'), ('iPhone', 'iPhone'), ('iPad', 'iPad'),
+                                  ('Mac OS', 'macOS'), ('Linux', 'Linux')) if k in ua), '')
+    return f'{browser} on {system}' if system else browser
+
+
+def _touch_presence(uid, username, role):
+    if request.path.startswith(_PRESENCE_QUIET):
+        return
+    sid = session.get('sid')
+    if not sid:
+        sid = session['sid'] = secrets.token_hex(8)
+    now = time.time()
+    with _PRESENCE_LOCK:
+        row = _PRESENCE.get((uid, sid))
+        if row is None:
+            row = _PRESENCE[(uid, sid)] = {'since': now, 'seen': now}
+            for k in [k for k, v in _PRESENCE.items() if now - v['seen'] > 86400]:
+                del _PRESENCE[k]
+        row.update(seen=now, username=username, role=role, ip=_client_ip(),
+                   device=_device_label(request.headers.get('User-Agent', '')))
+
+
+def presence_snapshot(viewer_is_admin, my_key=None):
+    """-> {'users': [...], 'sessions': n}: people heard from within PRESENCE_WINDOW. Everyone sees who is
+    here and how recently; only an admin also sees each session's address and device."""
+    now = time.time()
+    with _PRESENCE_LOCK:
+        live = [(k, dict(v)) for k, v in _PRESENCE.items() if now - v['seen'] <= PRESENCE_WINDOW]
+    users = {}
+    for (uid, sid), v in live:
+        u = users.setdefault(uid, {'username': v['username'], 'role': v['role'], 'sessions': [], 'last_seen': 0.0})
+        u['last_seen'] = max(u['last_seen'], v['seen'])
+        sess = {'seconds_ago': int(now - v['seen']), 'since_minutes': int((now - v['since']) // 60), 'you': (uid, sid) == my_key}
+        if viewer_is_admin:
+            sess.update(ip=v['ip'], device=v['device'])
+        u['sessions'].append(sess)
+    out = []
+    for u in sorted(users.values(), key=lambda x: -x['last_seen']):
+        u['seconds_ago'] = int(now - u.pop('last_seen'))
+        u['sessions'].sort(key=lambda x: x['seconds_ago'])
+        out.append(u)
+    return {'users': out, 'sessions': sum(len(u['sessions']) for u in out), 'window_minutes': PRESENCE_WINDOW // 60}
+
+
+@app.route('/api/dashboard/presence')
+def api_dashboard_presence():
+    if not session.get('authed'):
+        return jsonify(ok=False, error='Not signed in.'), 403
+    key = (session.get('user_id'), session.get('sid'))
+    return jsonify(ok=True, **presence_snapshot(session.get('role') == 'admin', key))
+
 
 # Before core.py's CSRF and access checks, which trust session['role'].
 app.before_request_funcs.setdefault(None, []).insert(0, _revalidate_session)
@@ -318,6 +386,33 @@ def api_2fa_disable():
     # Other sessions end (see user_totp_disable); this one, which just proved the code, carries on.
     session['sv'] = (user_get(session['user_id']) or {}).get('session_version') or 0
     return jsonify(ok=True)
+
+
+@app.route('/api/account/password', methods=['POST'])
+def api_account_password():
+    """Any signed-in user changes their own password: the current one is asked for (a left-open browser must not
+    be enough to take the account over), the new one has to pass the same policy as any other. Their other
+    sessions end; this one carries on."""
+    if not session.get('authed') or session.get('user_id') is None:
+        return jsonify(ok=False, error='Not signed in.'), 403
+    if not _login_limiter.allow(_client_ip()):
+        return jsonify(ok=False, error='Too many attempts. Wait a few minutes and try again.'), 429
+    d = request.get_json(silent=True) or {}
+    user = user_get(session['user_id'])
+    if not user:
+        return jsonify(ok=False, error='Account not found.'), 404
+    if not check_password_hash(user['password_hash'] or '', str(d.get('current') or '')):
+        return jsonify(ok=False, error='The current password is not right.'), 400
+    new = str(d.get('password') or '')
+    if new == str(d.get('current') or ''):
+        return jsonify(ok=False, error='Choose a password different from the current one.'), 400
+    ok, why = user_set_password(user['id'], new)
+    if not ok:
+        return jsonify(ok=False, error=why), 400
+    session['sv'] = (user_get(user['id']) or {}).get('session_version') or 0
+    audit_log('password_change', target=user['username'], detail='own password', user_id=user['id'],
+              username=user['username'], ip=_client_ip())
+    return jsonify(ok=True, notice='Password changed. Your other sessions have been signed out.')
 
 
 # ---- User accounts (PostgreSQL) ----

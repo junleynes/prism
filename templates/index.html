@@ -1638,14 +1638,12 @@ document.addEventListener("DOMContentLoaded", function(){
     </div>
     {% endif %}
 
-    {% if current_role == 'admin' or 'promo_generation' in current_permissions %}
     <div class=card>
-      <strong style="font-size:13px">Your shows</strong>
-      <div id=dash-shows style="margin-top:10px;font-size:13px">
+      <strong style="font-size:13px">Signed in now</strong>
+      <div id=dash-presence style="margin-top:10px;font-size:13px">
         <p style="opacity:.6;margin:0">Loading…</p>
       </div>
     </div>
-    {% endif %}
 
     <div class=card style="grid-column:span 2">
       <strong style="font-size:13px">Recent renders</strong>
@@ -14941,6 +14939,7 @@ function switchDocs(btn){
   <div class="sub-tab" onclick="switchSubTab('p-config-users',this)" role="button" tabindex="0">Users</div>
   <div class="sub-tab" onclick="switchSubTab('p-config-storage',this); if(typeof loadStorageTab==='function') loadStorageTab()" role="button" tabindex="0">Storage</div>
   <div class="sub-tab" onclick="switchSubTab('p-config-audit',this); if(typeof loadAuditLog==='function') loadAuditLog()" role="button" tabindex="0">Audit Log</div>
+  {% if current_role == 'admin' %}<div class="sub-tab" onclick="switchSubTab('p-config-backup',this); if(typeof loadBackupTab==='function') loadBackupTab()" role="button" tabindex="0">Backup</div>{% endif %}
 </div>
 
 <div id="p-config-services" class="sub-panel active">
@@ -15074,6 +15073,15 @@ function switchDocs(btn){
 </div>
 
 <div id="p-config-security" class="sub-panel">
+<h3 style="margin-top:0">Change your password</h3>
+<p style="margin-top:6px;color:var(--ink-dim)">For <strong>your own account</strong>. Your other sessions are signed out; this one stays signed in.</p>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;max-width:720px;margin-top:10px">
+  <input type=password id=pw-current placeholder="Current password" autocomplete="current-password" style="margin:0">
+  <input type=password id=pw-new placeholder="New password (12+ characters)" autocomplete="new-password" style="margin:0">
+  <input type=password id=pw-new2 placeholder="New password again" autocomplete="new-password" style="margin:0">
+</div>
+<div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button type=button class=btn onclick="changeOwnPassword()">Change password</button><span id=pw-status style="font-size:12px"></span></div>
+<hr style="border:0;border-top:1px solid var(--line);margin:24px 0">
 <h3 style="margin-top:0">Two-factor authentication</h3>
 <p style="margin-top:6px;color:var(--ink-dim)">Adds a 6-digit code from your phone on top of your password. Works with Google Authenticator, Authy, 1Password, or any TOTP app. This applies to <strong>your own account only</strong> — every user sets up their own.</p>
 <div id=twofa-status style="margin-top:14px"><p style="opacity:.7">Loading&hellip;</p></div>
@@ -15111,6 +15119,31 @@ function switchDocs(btn){
 <p style="margin-top:6px;color:var(--ink-dim)">What is using the drive, how long finished work is kept, and the free-space floor below which a render is refused. Admin only.</p>
 <div id="storage-body"><p style="opacity:.7">Loading&hellip;</p></div>
 <span id="storage-status" style="font-size:12px"></span>
+</div>
+
+<div id="p-config-backup" class="sub-panel">
+<h3 style="margin-top:0">Backup and restore</h3>
+<p style="margin-top:6px;color:var(--ink-dim)">The database holds accounts, the library index, the audit log, jobs and show templates. Files (library, renders) are not in it. Database: <code id=bk-db>…</code></p>
+<div id=bk-warn class="sh-warn" style="display:none"></div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+  <button type=button class=btn onclick="backupCreate()">Back up the database now</button>
+  <a class=btn href="/admin/api/backup/config" style="text-decoration:none" onclick="return confirm('This file contains secrets (passwords, keys). Keep it somewhere only administrators can read. Download?')">Export configuration (zip)</a>
+  <a class=btn href="/admin/api/backup/config?keys=0" style="text-decoration:none" title="Without the encryption and session keys">Export configuration without keys</a>
+</div>
+<p style="font-size:12px;opacity:.7;margin-top:8px">The configuration export holds <code>.env</code>, the keys (<code>.data_key</code> encrypts saved passwords and 2FA secrets), the AI services file and the library's settings files, with a README on putting them back.</p>
+<span id=bk-status style="font-size:12px;display:inline-block;margin-top:6px"></span>
+<h4 style="margin:20px 0 6px">Backups on this server <span style="opacity:.6;font-weight:400;font-size:12px" id=bk-folder></span></h4>
+<div id=bk-list style="font-size:13px"><p style="opacity:.6;margin:0">Loading…</p></div>
+<h4 style="margin:22px 0 6px">Restore</h4>
+<div style="border:1px solid var(--amber);border-radius:10px;padding:14px;max-width:720px">
+  <p style="margin:0 0 8px;font-size:13px"><strong>Restoring replaces the whole database</strong> with the backup: accounts, library index, audit log, everything. A copy of the database as it is now is taken first and kept in the list above. Everyone may have to sign in again.</p>
+  <input type=file id=bk-file accept=".dump" style="margin:0 0 8px"> <span style="font-size:12px;opacity:.7">or use <b>Restore</b> on a backup in the list</span>
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
+    <input type=text id=bk-confirm placeholder="Type RESTORE" style="width:150px;margin:0">
+    <button type=button class=btn onclick="backupRestore(null)">Restore from the file</button>
+  </div>
+  <span id=bk-restore-status style="font-size:12px;display:inline-block;margin-top:8px"></span>
+</div>
 </div>
 
 <div id="p-config-audit" class="sub-panel">
@@ -15271,6 +15304,84 @@ async function saveConfigTab(){
   }
 }
 window.saveConfigTab = saveConfigTab
+
+function changeOwnPassword(){
+  var st = document.getElementById('pw-status')
+  var cur = document.getElementById('pw-current').value, n1 = document.getElementById('pw-new').value, n2 = document.getElementById('pw-new2').value
+  var say = function(t, bad){ st.textContent = t; st.style.color = bad ? 'var(--red, #c0392b)' : 'var(--green, #1e8e5a)' }
+  if(!cur || !n1){ say('Fill in the current and the new password.', true); return }
+  if(n1 !== n2){ say('The two new passwords are not the same.', true); return }
+  fetch('/api/account/password', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({current: cur, password: n1})})
+    .then(function(r){ return r.json() }).then(function(d){
+      if(d.ok){ ['pw-current', 'pw-new', 'pw-new2'].forEach(function(i){ document.getElementById(i).value = '' }); say(d.notice || 'Password changed.') }
+      else say(d.error || 'Could not change the password.', true)
+    }).catch(function(e){ say('Could not change the password: ' + e, true) })
+}
+
+var _bkPoll = null
+function _bkSize(n){ return n > 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB' }
+function loadBackupTab(){
+  fetch('/admin/api/backup/status').then(function(r){ return r.json() }).then(function(d){
+    if(!d.ok) return
+    document.getElementById('bk-db').textContent = d.database
+    document.getElementById('bk-folder').textContent = '(' + d.folder + ')'
+    var w = document.getElementById('bk-warn')
+    w.style.display = d.pg_dump && d.pg_restore ? 'none' : 'block'
+    w.textContent = (!d.pg_dump ? 'pg_dump was not found on this server. ' : '') + (!d.pg_restore ? 'pg_restore was not found on this server. ' : '') +
+      'Install the PostgreSQL client tools, or set PG_BIN_DIR in .env to their folder.'
+    _bkList(d.backups)
+    _bkRestoreState(d.restore)
+  })
+}
+function _bkList(items){
+  var el = document.getElementById('bk-list')
+  if(!items || !items.length){ el.innerHTML = '<p style="opacity:.6;margin:0">None yet.</p>'; return }
+  el.innerHTML = items.map(function(b){
+    var q = encodeURIComponent(b.name)
+    return '<div style="display:flex;gap:10px;align-items:center;justify-content:space-between;padding:6px 4px;border-bottom:1px solid var(--line);flex-wrap:wrap">' +
+      '<span><code>' + escapeHtmlLite(b.name) + '</code> <span style="opacity:.6;font-size:12px">' + _bkSize(b.size) + ' &middot; ' + new Date(b.time * 1000).toLocaleString() + '</span></span>' +
+      '<span style="display:flex;gap:6px"><a class="btn-sm" href="/admin/api/backup/db/' + q + '" style="text-decoration:none">Download</a>' +
+      '<button type=button class="btn-sm" onclick="backupRestore(\'' + b.name.replace(/'/g, '') + '\')">Restore</button>' +
+      '<button type=button class="btn-sm" onclick="backupDelete(\'' + b.name.replace(/'/g, '') + '\')">Delete</button></span></div>'
+  }).join('')
+}
+function backupCreate(){
+  var st = document.getElementById('bk-status'); st.textContent = 'Backing up…'; st.style.color = ''
+  fetch('/admin/api/backup/db/create', {method: 'POST'}).then(function(r){ return r.json() }).then(function(d){
+    if(d.ok){ st.textContent = 'Saved ' + d.name; st.style.color = 'var(--green, #1e8e5a)'; _bkList(d.backups) }
+    else { st.textContent = d.error || 'The backup failed.'; st.style.color = 'var(--red, #c0392b)' }
+  }).catch(function(e){ st.textContent = 'The backup failed: ' + e })
+}
+function backupDelete(name){
+  if(!confirm('Delete ' + name + ' from the server?')) return
+  fetch('/admin/api/backup/db/' + encodeURIComponent(name) + '/delete', {method: 'POST'}).then(function(r){ return r.json() }).then(function(d){ if(d.ok) _bkList(d.backups) })
+}
+function backupRestore(name){
+  var st = document.getElementById('bk-restore-status'), f = document.getElementById('bk-file').files[0]
+  if(!name && !f){ st.textContent = 'Choose a backup file first.'; st.style.color = 'var(--red, #c0392b)'; return }
+  if(document.getElementById('bk-confirm').value.trim() !== 'RESTORE'){ st.textContent = 'Type RESTORE in the box to confirm.'; st.style.color = 'var(--red, #c0392b)'; return }
+  var fd = new FormData(); fd.append('confirm', 'RESTORE')
+  if(name) fd.append('name', name); else fd.append('file', f)
+  st.textContent = 'Starting…'; st.style.color = ''
+  fetch('/admin/api/backup/db/restore', {method: 'POST', body: fd}).then(function(r){ return r.json() }).then(function(d){
+    if(!d.ok){ st.textContent = d.error || 'Not restored.'; st.style.color = 'var(--red, #c0392b)'; return }
+    document.getElementById('bk-confirm').value = ''
+    _bkWatch()
+  }).catch(function(e){ st.textContent = 'Not restored: ' + e })
+}
+function _bkRestoreState(r){
+  var st = document.getElementById('bk-restore-status')
+  if(!r || r.state === 'idle') return
+  st.textContent = r.message; st.style.color = r.state === 'failed' ? 'var(--red, #c0392b)' : r.state === 'done' ? 'var(--green, #1e8e5a)' : ''
+}
+function _bkWatch(){
+  clearTimeout(_bkPoll)
+  fetch('/admin/api/backup/status').then(function(r){ return r.json() }).then(function(d){
+    _bkRestoreState(d.restore); _bkList(d.backups)
+    if(d.restore && d.restore.state === 'running') _bkPoll = setTimeout(_bkWatch, 2000)
+  }).catch(function(){ _bkPoll = setTimeout(_bkWatch, 3000) })     // the app may be briefly busy while the database is replaced
+}
+window.loadBackupTab = loadBackupTab
 
 var twofaLoaded = false
 async function loadTwofaStatus(){
@@ -17387,7 +17498,7 @@ function loadDashboard(){
   _dashLoadSecurity()
   _dashLoadPending()
   _dashLoadLibrary()
-  _dashLoadShows()
+  _dashLoadPresence()
   _dashLoadRecent()
 }
 window.loadDashboard = loadDashboard
@@ -17508,36 +17619,42 @@ function _dashLoadLibrary(){
   })
 }
 
-function _dashLoadShows(){
-  var el = document.getElementById('dash-shows')
+function _dashAgo(sec){
+  if(sec < 45) return 'just now'
+  if(sec < 3600) return Math.round(sec / 60) + ' min ago'
+  return Math.round(sec / 3600) + ' h ago'
+}
+
+var _dashPresenceT = null
+function _dashLoadPresence(){
+  var el = document.getElementById('dash-presence')
   if(!el) return
-  fetch('/api/templates').then(function(r){
-    if(r.status === 403) return {_forbidden: true}
-    return r.json()
-  }).then(function(d){
-    if(d._forbidden){
-      el.innerHTML = '<p style="opacity:.6;margin:0">Not available for this account.</p>'
-      return
-    }
-    var items = (d.templates || []).slice(0, 5)
-    if(!items.length){
-      el.innerHTML = '<p style="opacity:.6;margin:0">No saved shows yet — save one from Highlights Video.</p>'
-      return
-    }
-    el.innerHTML = items.map(function(t){
-      var sub = t.genre ? t.genre.charAt(0).toUpperCase() + t.genre.slice(1) : 'Custom'
-      return '<div class="dash-show-row" data-tpl-id="' + t.id + '" ' +
-             'style="display:flex;justify-content:space-between;gap:10px;padding:6px 4px;border-bottom:1px solid var(--line);cursor:pointer;border-radius:6px">' +
-             '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtmlLite(t.name) + '</span>' +
-             '<span style="opacity:.6;font-size:12px;white-space:nowrap">' + sub + '</span></div>'
+  clearTimeout(_dashPresenceT)
+  fetch('/api/dashboard/presence').then(function(r){ return r.json() }).then(function(d){
+    if(!d.ok){ el.innerHTML = '<p style="opacity:.6;margin:0">Not available.</p>'; return }
+    var head = '<p style="margin:0 0 6px;opacity:.7;font-size:12px">' + d.users.length + (d.users.length === 1 ? ' user' : ' users') + ', ' +
+               d.sessions + (d.sessions === 1 ? ' session' : ' sessions') + ' &middot; active in the last ' + d.window_minutes + ' min</p>'
+    if(!d.users.length){ el.innerHTML = head; return }
+    el.innerHTML = head + d.users.map(function(u){
+      var more = u.sessions.map(function(s){
+        return (s.device ? escapeHtmlLite(s.device) + (s.ip ? ' &middot; ' + escapeHtmlLite(s.ip) : '') + ' &middot; ' : '') +
+               (s.you ? 'this browser' : _dashAgo(s.seconds_ago))
+      })
+      var admin = u.role === 'admin' ? ' <span class="score-chip" style="font-size:10px">admin</span>' : ''
+      return '<div style="padding:6px 4px;border-bottom:1px solid var(--line)">' +
+             '<div style="display:flex;justify-content:space-between;gap:10px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><b>' +
+             escapeHtmlLite(u.username) + '</b>' + admin + '</span><span style="opacity:.6;font-size:12px;white-space:nowrap">' +
+             (u.sessions.length > 1 ? u.sessions.length + ' sessions &middot; ' : '') + _dashAgo(u.seconds_ago) + '</span></div>' +
+             (more.some(function(m){ return m.indexOf('&middot;') >= 0 && m.indexOf('this browser') < 0 }) || u.sessions.some(function(s){ return s.device })
+               ? '<div style="opacity:.6;font-size:11px;margin-top:2px">' + more.join('<br>') + '</div>' : '') +
+             '</div>'
     }).join('')
-    el.querySelectorAll('.dash-show-row').forEach(function(row){
-      row.addEventListener('click', function(){ _dashOpenShow(row.getAttribute('data-tpl-id')) })
-      row.addEventListener('mouseenter', function(){ row.style.background = 'var(--soft, var(--sunken))' })
-      row.addEventListener('mouseleave', function(){ row.style.background = '' })
-    })
   }).catch(function(){
-    el.innerHTML = '<p style="opacity:.6;margin:0">Could not load saved shows.</p>'
+    el.innerHTML = '<p style="opacity:.6;margin:0">Could not load who is signed in.</p>'
+  }).then(function(){
+    // Refreshes itself while the dashboard is the open tab.
+    var panel = document.getElementById('p-dashboard')
+    if(panel && panel.classList.contains('active')) _dashPresenceT = setTimeout(_dashLoadPresence, 30000)
   })
 }
 

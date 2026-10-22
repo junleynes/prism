@@ -20,6 +20,7 @@ import pipeline         # noqa: F401 -- exposed as main.pipeline (tests patch it
 import shorts           # noqa: F401 -- registers the Vertical Shorts tab's /api/shorts/* routes
 import schedule         # noqa: F401 -- registers the Schedule Plug tab's /api/schedule/* routes
 import storage          # noqa: F401 -- Config > Storage: retention, disk guard, usage
+import backup           # noqa: F401 -- Config > Backup: database dump / restore, configuration export
 
 
 @app.route('/')
