@@ -31,3 +31,6 @@ The number of part videos must equal the number of caption files. Without part v
 
 ## Lines unheard next to a cut are no longer dropped with it
 A cut removes a known length (the shift between the two matched captions on either side). Captions dropped for a cut now may not add up to much more than that length: lines Whisper simply did not hear (music, a mumble, a name) beside the cut used to be dropped along with it. Where the sound gives no evidence either way for the lines right at the cut's edge, text matching can still pick the wrong ones; **audio matching** (give the uncut part videos) places the cut to the hundredth of a second and has no such guesswork.
+
+## Audio matching: stretches the sound did not match no longer drop captions
+With the uncut part videos given, no transcript is used; each caption follows the stretch of sound it falls in. Where the matching found nothing (music laid over a scene, a mix that differs, a short stretch) the captions there used to be dropped. Now a hole between two matches that share the same offset is simply joined (it is not a cut), and in a hole with a shift across it each side fills half of the unmatched video: captions in those stretches are kept and marked **check**, and only the middle, the length the cut removes, is dropped. The same goes for an unmatched start or end of the video.

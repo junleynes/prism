@@ -10805,7 +10805,8 @@ def api_stt_retime():
         if not m['stretches']:
             return jsonify(ok=False, error='The cut video\'s sound was not found in the part videos. Check that they '
                                            'are the same programme and that the parts are the uncut ones.'), 422
-        result = captionretime.align_audio(parts, m['stretches'], m['part_offsets'], m['part_durations'])
+        result = captionretime.align_audio(parts, m['stretches'], m['part_offsets'], m['part_durations'],
+                                           video_duration=m.get('video_duration'))
         labels = request.form.get('strip_labels') in ('1', 'true', 'on')
         descs = request.form.get('strip_descriptors') in ('1', 'true', 'on')
         return jsonify(ok=True, srt=captionretime.write_srt(result, labels=labels, descriptors=descs),

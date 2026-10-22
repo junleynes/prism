@@ -110,3 +110,21 @@ def test_route_uses_the_part_videos_when_given(media, monkeypatch):
     data['captions'] = [(io.BytesIO(b'1\n00:00:01,000 --> 00:00:02,000\nx\n'), 'a.srt'), (io.BytesIO(b'1\n00:00:01,000 --> 00:00:02,000\ny\n'), 'b.srt')]
     r = client.post('/api/stt/retime', data=data, headers={'X-CSRF-Token': 't'}, content_type='multipart/form-data')
     assert r.status_code == 400 and 'one part video per caption file' in r.get_json()['error']
+
+
+def test_captions_in_a_hole_of_the_matching_are_kept_not_dropped():
+    """The sound was not matched between 40 and 50 s of the cut video, but the video there is source: only the
+    middle of the source the cut removed is dropped, and a hole with no shift across it is no cut at all."""
+    cues = lambda *spans: [{'start': a, 'end': b, 'text': f'line {i}'} for i, (a, b) in enumerate(spans)]
+    # cut video: 0-40 is source 0-40; 50-100 is source 70-120 (30 s of source gone, 10 s of video unmatched)
+    parts = [cues((10, 12), (41, 43), (55, 57), (66, 68), (80, 82))]
+    res = rt.align_audio(parts, [(0, 40, 0), (50, 100, 70)], [0.0], [200.0], video_duration=100.0)
+    by = {c['idx']: c for c in res['cues']}
+    assert not by[0]['drop'] and by[0]['status'] == 'matched' and abs(by[0]['new_start'] - 10) < 0.01
+    assert not by[1]['drop'] and by[1]['status'] == 'check' and 40 <= by[1]['new_start'] < 45     # from the earlier side
+    assert by[2]['drop'], 'the middle is what the cut removed'
+    assert not by[3]['drop'] and by[3]['status'] == 'check' and 45 <= by[3]['new_start'] < 50    # from the later side
+    assert not by[4]['drop'] and by[4]['status'] == 'matched' and abs(by[4]['new_start'] - 60) < 0.01
+    # The same hole with the same offset on both sides is not a cut: nothing there is dropped.
+    res = rt.align_audio(parts, [(0, 40, 0), (50, 100, 10)], [0.0], [200.0], video_duration=100.0)
+    assert not res['cuts'] and not any(c['drop'] for c in res['cues'][:2])

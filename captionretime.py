@@ -420,20 +420,57 @@ def align(parts, words, segments, labels=True, descriptors=True, drop_unsure=Fal
 
 
 
-def align_audio(parts, stretches, part_offsets, part_durations, labels=True, descriptors=True):
+def _merge_stretches(stretches, tol=0.05):
+    """Neighbouring stretches that put the sound at the same offset are one: a hole in the matching (a bar of
+    music laid over it, a line the fingerprint did not catch) with no shift across it is not a cut."""
+    out = []
+    for v0, v1, s0 in stretches:
+        if out and abs((s0 - v0) - (out[-1][2] - out[-1][0])) <= tol:
+            out[-1] = (out[-1][0], max(v1, out[-1][1]), out[-1][2])
+        else:
+            out.append((v0, v1, s0))
+    return out
+
+
+def align_audio(parts, stretches, part_offsets, part_durations, labels=True, descriptors=True, video_duration=None):
     """The same result as align(), from where the sound says each stretch of the cut video comes from
     (audioalign.align_files): every caption is moved by the stretch it falls in; a caption that runs into a
-    cut keeps the part that is still in the video; one wholly inside a cut is dropped."""
+    cut keeps the part that is still in the video; one wholly inside a cut is dropped.
+
+    Where the sound was not matched (a hole between two stretches, or before the first / after the last) the
+    video there still comes from the source next to it, so a caption is kept, and marked to check, when it
+    falls in the stretch of source that fills the hole from either side; only the middle, the length the cut
+    really removes, is dropped."""
     cues = _flatten(parts, labels, descriptors)
     shifts = []
     for pi, part in enumerate(parts):
         _c, shift = captionfile.fit_to_video([dict(x) for x in part], part_durations[pi] if pi < len(part_durations) else 0)
         shifts.append(shift or 0.0)
+    raw = list(stretches)
+    stretches = _merge_stretches(raw)
+    # (source start, source end, video start, video end, guessed): the pieces a caption can be found in
+    pieces = [(s0, s0 + (v1 - v0), v0, v1, False) for v0, v1, s0 in stretches]
+    for (v0, v1, s0), (w0, w1, t0) in zip(stretches, stretches[1:]):
+        hv, se = w0 - v1, s0 + (v1 - v0)
+        if hv > 0.05 and t0 > se:
+            # Where in the hole the cut sits is not known, so each side fills half of it (no two captions on top
+            # of each other); what lies between is the cut.
+            hv = min(hv, t0 - se) / 2
+            pieces.append((se, se + hv, v1, v1 + hv, True))             # filling the hole from the earlier side
+            pieces.append((t0 - hv, t0, w0 - hv, w0, True))             # and from the later side
+    if stretches:
+        v0, v1, s0 = stretches[0]
+        if v0 > 0.05:
+            pieces.append((max(0.0, s0 - v0), s0, v0 - min(v0, s0), v0, True))      # the video before the first match
+        if video_duration and video_duration - stretches[-1][1] > 0.05:
+            v0, v1, s0 = stretches[-1]
+            tail = video_duration - v1
+            pieces.append((s0 + (v1 - v0), s0 + (v1 - v0) + tail, v1, v1 + tail, True))
 
     def where(src):
-        for k, (v0, v1, s0) in enumerate(stretches):
-            if s0 - 1e-6 <= src < s0 + (v1 - v0) + 1e-6:
-                return k, v0 + (src - s0)
+        for k, (a0, a1, v0, v1, guess) in enumerate(pieces):
+            if a0 - 1e-6 <= src < a1 + 1e-6:
+                return k, v0 + (src - a0)
         return None, None
 
     for c in cues:
@@ -450,15 +487,17 @@ def align_audio(parts, stretches, part_offsets, part_durations, labels=True, des
             continue
         status = 'matched'
         if ka is None:
-            va, status = stretches[kb][0], 'placed'          # starts in a cut: the part after it
+            va, status = pieces[kb][2], 'placed'             # starts in a cut: the part after it
         if kb is None:
-            vb, status = stretches[ka][1], 'placed'          # ends in a cut: the part before it
-        elif ka is not None and kb != ka and stretches[kb][0] - stretches[ka][1] > 0.05:
-            vb, status = stretches[ka][1], 'placed'
+            vb, status = pieces[ka][3], 'placed'             # ends in a cut: the part before it
+        elif ka is not None and kb != ka and (pieces[ka][4] or pieces[kb][4] or pieces[kb][2] - pieces[ka][3] > 0.05):
+            vb, status = pieces[ka][3], 'placed'
+        if (ka is not None and pieces[ka][4]) or (kb is not None and pieces[kb][4]):
+            status = 'check'                                 # put where the video's own unmatched stretch says
         if vb - va < 0.3:
             c.update(drop=True, status='dropped')
             continue
-        c.update(offset=va - c['start'], status=status, score=1.0, new_start=va, new_end=vb)
+        c.update(offset=va - c['start'], status=status, score=1.0 if status != 'check' else None, new_start=va, new_end=vb)
     kept = [c for c in cues if not c['drop'] and c.get('new_start') is not None]
     kept.sort(key=lambda c: (c['new_start'], c['part'], c['idx']))
     for x, y in zip(kept, kept[1:]):
