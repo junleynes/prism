@@ -126,3 +126,12 @@ def test_a_user_changes_their_own_password(users_db):
     with other.session_transaction() as s:
         s.update(authed=True, user_id=uid, username='ana', role='user', csrf_token='t', sv=0)
     assert other.get('/api/dashboard/presence').status_code in (401, 302), 'the other sessions ended'
+
+
+def test_every_user_not_only_admins_can_reach_the_password_change():
+    c = main.app.test_client()
+    with c.session_transaction() as s:
+        s.update(authed=True, user_id=2, username='ana', role='user', csrf_token='t')
+    html = c.get('/').get_data(as_text=True)
+    assert 'openPasswordDialog()' in html and 'id=pw-dialog' in html and "changeOwnPassword('pwd')" in html
+    assert "switchTab('p-config'" not in html and 'p-config-backup' not in html.split('<nav')[1], 'Config and Backup stay admin-only'

@@ -1197,6 +1197,20 @@ input.sh-num[type=number]{width:92px}
 var IS_ADMIN = {{ 'true' if current_role == 'admin' else 'false' }}
 var CURRENT_USERNAME = {{ current_username|tojson }}
 </script>
+<dialog id=pw-dialog style="border:1px solid var(--line);border-radius:12px;background:var(--panel, #fff);color:var(--ink);padding:20px;max-width:380px;width:92vw">
+  <h3 style="margin:0 0 4px">Change your password</h3>
+  <p style="margin:0 0 12px;font-size:12px;opacity:.7">Your other sessions are signed out; this one stays signed in.</p>
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <input type=password id=pwd-current placeholder="Current password" autocomplete="current-password" style="margin:0">
+    <input type=password id=pwd-new placeholder="New password (12+ characters)" autocomplete="new-password" style="margin:0">
+    <input type=password id=pwd-new2 placeholder="New password again" autocomplete="new-password" style="margin:0">
+  </div>
+  <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <button type=button class=btn onclick="changeOwnPassword('pwd')">Change password</button>
+    <button type=button class=btn-sm onclick="document.getElementById('pw-dialog').close()">Close</button>
+    <span id=pwd-status style="font-size:12px"></span>
+  </div>
+</dialog>
 <nav class="rail">
   <div class="rail-brand">
     <a class="rail-brand-link" href="/" title="{{ brand_name }}">
@@ -1258,7 +1272,10 @@ var CURRENT_USERNAME = {{ current_username|tojson }}
       <span class="rail-user-label">Signed in</span>
       <strong class="rail-user-name">{{ current_username }}</strong>
     </div>
-    <form method=post action="/logout" style="margin:0"><input type=hidden name=_csrf value="{{ csrf_token }}"><button type=submit class="rail-signout">Sign out</button></form>
+    <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch">
+      <button type=button class="rail-signout" onclick="openPasswordDialog()" title="Change your own password">Password</button>
+      <form method=post action="/logout" style="margin:0"><input type=hidden name=_csrf value="{{ csrf_token }}"><button type=submit class="rail-signout" style="width:100%">Sign out</button></form>
+    </div>
   </div>
   {% if brand_footer %}
   <div class="rail-footer">{{ brand_footer }}</div>
@@ -15305,15 +15322,24 @@ async function saveConfigTab(){
 }
 window.saveConfigTab = saveConfigTab
 
-function changeOwnPassword(){
-  var st = document.getElementById('pw-status')
-  var cur = document.getElementById('pw-current').value, n1 = document.getElementById('pw-new').value, n2 = document.getElementById('pw-new2').value
+function openPasswordDialog(){
+  var dlg = document.getElementById('pw-dialog')
+  ;['pwd-current', 'pwd-new', 'pwd-new2'].forEach(function(i){ document.getElementById(i).value = '' })
+  document.getElementById('pwd-status').textContent = ''
+  if(dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', '')
+  document.getElementById('pwd-current').focus()
+}
+function changeOwnPassword(pre){
+  pre = pre || 'pw'
+  var f = function(n){ return document.getElementById(pre === 'pw' ? 'pw-' + n : pre + '-' + n) }
+  var st = pre === 'pw' ? document.getElementById('pw-status') : document.getElementById(pre + '-status')
+  var cur = f('current').value, n1 = f('new').value, n2 = f('new2').value
   var say = function(t, bad){ st.textContent = t; st.style.color = bad ? 'var(--red, #c0392b)' : 'var(--green, #1e8e5a)' }
   if(!cur || !n1){ say('Fill in the current and the new password.', true); return }
   if(n1 !== n2){ say('The two new passwords are not the same.', true); return }
   fetch('/api/account/password', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({current: cur, password: n1})})
     .then(function(r){ return r.json() }).then(function(d){
-      if(d.ok){ ['pw-current', 'pw-new', 'pw-new2'].forEach(function(i){ document.getElementById(i).value = '' }); say(d.notice || 'Password changed.') }
+      if(d.ok){ ['current', 'new', 'new2'].forEach(function(n){ f(n).value = '' }); say(d.notice || 'Password changed.') }
       else say(d.error || 'Could not change the password.', true)
     }).catch(function(e){ say('Could not change the password: ' + e, true) })
 }
