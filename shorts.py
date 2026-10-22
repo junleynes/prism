@@ -2342,7 +2342,7 @@ def _resolve_source(field='shorts_file'):
     staged = (request.form.get(field + '_network') or '').strip()
     if staged:
         safe = os.path.basename(staged)
-        path = pipeline.staged_path(safe)          # the copy here, or the file where it was left on the share
+        path = pipeline.staged_path_or_fetch(safe)          # the copy here, or the file where it was left on the share
         if safe.startswith('net_') and os.path.exists(path):
             return path, re.sub(r'^net_\d+_', '', safe), None
         return None, None, 'Selected network file is no longer available -- please re-select it'
@@ -2371,7 +2371,7 @@ def _resolve_sources():
             raw_cap, cap_name = cap.read(captionfile.MAX_BYTES + 1), cap.filename
         elif cap_net:
             # Picked with Browse library: only a file this server staged itself is read.
-            cpath = pipeline.staged_path(cap_net)
+            cpath = pipeline.staged_path_or_fetch(cap_net)
             ext = os.path.splitext(cap_net)[1].lower().lstrip('.')
             if not cap_net.startswith('net_') or ext not in pipeline.CAPTION_EXTENSIONS or not os.path.isfile(cpath):
                 return None, None, 'The caption file is no longer available -- pick it again.'
@@ -2558,7 +2558,7 @@ def api_shorts_sfx_preview(name):
     ext = os.path.splitext(name)[1].lower()
     if os.path.basename(name) != name or not name.startswith('net_') or ext not in _SFX_PREVIEW_EXTS:
         return jsonify(ok=False, error='That is not a sound effect picked from the library.'), 404
-    path = pipeline.staged_path(name)
+    path = pipeline.staged_path_or_fetch(name)
     if not os.path.isfile(path):
         return jsonify(ok=False, error='That sound effect is no longer available -- pick it again.'), 404
     resp = send_file(path, mimetype=_SFX_PREVIEW_EXTS[ext], conditional=True)
@@ -2575,7 +2575,7 @@ def api_shorts_sfx_split(name):
     ext = os.path.splitext(name)[1].lower()
     if os.path.basename(name) != name or not name.startswith('net_') or ext not in _SFX_PREVIEW_EXTS:
         return jsonify(ok=False, error='That is not a sound effect picked from the library.'), 404
-    path = pipeline.staged_path(name)
+    path = pipeline.staged_path_or_fetch(name)
     if not os.path.isfile(path):
         return jsonify(ok=False, error='That sound effect is no longer available -- pick it again.'), 404
     total = pipeline.probe_duration(path) or 0.0

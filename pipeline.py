@@ -843,6 +843,15 @@ def staged_path(local_name):
     return os.path.join(app.config['UPLOAD_FOLDER'], local_name)
 
 
+def staged_path_or_fetch(local_name):
+    """staged_path(), but a staged copy that has been cleared (by age or a restart) is fetched again from where
+    it was picked (the origin is kept on disk). Used where a job or preview starts, never for mere existence checks."""
+    path = staged_path(local_name)
+    if os.path.exists(path) or not local_name.startswith('net_'):
+        return path
+    return restage(local_name)[0] or path
+
+
 def staged_name_of(path):
     """The staged name the browser uses for a source path: the name it was staged under when it is read in place
     on a share (the file's own name there can hold spaces and so is not a valid staged name), else its file name."""
@@ -2526,7 +2535,7 @@ def load_video(req):
         # Must be a name we generated ourselves in fetch_network_video() (net_<ts>_<name>)
         # and that still exists in UPLOAD_FOLDER -- never trust an arbitrary path here.
         safe = os.path.basename(staged)
-        path = staged_path(safe)          # the copy here, or the file where it was left on the share
+        path = staged_path_or_fetch(safe)          # the copy here, or the file where it was left on the share
         if safe.startswith('net_') and os.path.exists(path):
             return path, safe
         return None, 'Selected network file is no longer available -- please re-select it'
@@ -2570,7 +2579,7 @@ def _resolve_upload(field_name, exts=None):
         # Must be a name we generated ourselves in fetch_network_file() (net_<ts>_<name>)
         # and that still exists in UPLOAD_FOLDER -- never trust an arbitrary path here.
         safe = os.path.basename(staged)
-        path = staged_path(safe)
+        path = staged_path_or_fetch(safe)
         if safe.startswith('net_') and os.path.exists(path) and (exts is None or allowed_file(safe, exts)):
             return path
     return None

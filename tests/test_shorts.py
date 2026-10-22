@@ -4297,3 +4297,14 @@ def test_project_folder_name_is_safe_for_a_windows_share():
     assert f({'title': 'Magpakailanman', 'episode': '383'}) == 'Magpakailanman - 383'
     assert f({'title': 'Tadhana: "Ang" Balik?', 'episode': 'Ep. 101.'}) == 'Tadhana Ang Balik - Ep. 101'
     assert f({'title': 'Tadhana', 'episode': ''}) == 'Tadhana' and f(None) is None
+
+
+def test_any_staged_pick_is_fetched_again_when_it_has_been_cleared(monkeypatch, tmp_path):
+    name = f'net_{int(time.time())}_card.mp4'
+    pipeline.STAGED_ORIGINS[name] = {'category': 'tcard', 'subpath': '', 'name': 'card.mp4'}
+    fresh = tmp_path / 'card.mp4'
+    fresh.write_bytes(b'x')
+    monkeypatch.setattr(pipeline, 'stage_network_file', lambda n, c, s: {'path': str(fresh)})
+    assert pipeline.staged_path_or_fetch(name) == str(fresh)
+    pipeline.STAGED_ORIGINS.pop(name, None)
+    assert pipeline.staged_path_or_fetch(name) == pipeline.staged_path(name)
