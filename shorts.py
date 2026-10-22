@@ -2912,6 +2912,93 @@ def api_shorts_refetch(aid):
     return jsonify(ok=True, source_available=True)
 
 
+SHORTS_PROXY_HEIGHT = 480
+_PROXY_JOBS = {}            # out_name -> {'state': 'building'|'ready'|'failed', 'error': str}
+_PROXY_LOCK = threading.Lock()
+_PROXY_MAX_RUNNING = 1      # one encode at a time: it must not starve renders
+
+
+def _proxy_name(path):
+    try:
+        st = os.stat(path)
+        # Not the modified time: reading the episode refreshes it (_touch), which would name a new copy every time.
+        key = f"{os.path.basename(path)}|{st.st_size}|{SHORTS_PROXY_HEIGHT}"
+    except OSError:
+        key = os.path.basename(path)
+    return 'shproxy_' + hashlib.sha1(key.encode()).hexdigest()[:16] + '.mp4'
+
+
+def _proxy_build(src, out_path, take, name):
+    """Whole-part, browser-playable, keyframe every second: lets the editor seek anywhere at once. Written under
+    a private name and renamed into place only when complete, so a half file is never handed out."""
+    part = os.path.join(app.config['UPLOAD_FOLDER'], f'shpart_{secrets.token_hex(6)}.mp4')
+    err = ''
+    try:
+        sound = (['-filter_complex', sc.take_to_stereo(take) + '[a]', '-map', '0:v:0', '-map', '[a]']
+                 if take else ['-map', '0:v:0', '-map', '0:a:0?'])
+        r = pipeline.run_ffmpeg([pipeline.FFMPEG, '-y', '-i', src] + sound +
+                                ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-g', '25', '-keyint_min', '25',
+                                 '-sc_threshold', '0', '-vf', f"scale=-2:'min({SHORTS_PROXY_HEIGHT},ih)'", '-pix_fmt', 'yuv420p',
+                                 '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-movflags', '+faststart', part],
+                                timeout=max(pipeline.FFMPEG_TIMEOUT, 7200), label='shorts editing proxy')
+        if os.path.exists(part) and os.path.getsize(part) > 0:
+            os.replace(part, out_path)
+        else:
+            err = (r.stderr or '')[-200:] or 'no output'
+    except Exception as e:      # noqa: BLE001 -- reported to the editor, which falls back to the clips
+        err = str(e)[:200]
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+    with _PROXY_LOCK:
+        _PROXY_JOBS[name] = {'state': 'ready' if os.path.exists(out_path) else 'failed', 'error': err}
+
+
+@app.route('/api/shorts/proxy', methods=['POST'])
+@require_permission('vertical_shorts')
+def api_shorts_proxy():
+    """A small copy of one part of the episode with a keyframe every second, made once in the background. With
+    it the editor plays any in/out/cut straight from the browser -- no clip to wait for after each change.
+    Asking again while it builds just reports the state."""
+    data = request.get_json(silent=True) or {}
+    a, err = _analysis_or_error((data.get('analysis_id') or '').strip())
+    if err:
+        return err
+    try:
+        k = int(data.get('part') or 0)
+    except (TypeError, ValueError):
+        k = 0
+    if _is_multi(a):
+        if not 0 <= k < len(a['parts']):
+            return jsonify(ok=False, error='No such part.'), 400
+    else:
+        k = 0
+    v = _part_view(a, k)
+    if not os.path.exists(v['path']):
+        return _source_gone(v)
+    _touch(v['path'])
+    name = _proxy_name(v['path'])
+    out_path = os.path.join(app.config['UPLOAD_FOLDER'], name)
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        _touch(out_path)
+        return jsonify(ok=True, state='ready', url=f'/uploads/{name}', offset=v.get('_offset', 0.0))
+    with _PROXY_LOCK:
+        job = _PROXY_JOBS.get(name)
+        if job and job['state'] == 'failed' and not data.get('retry'):
+            return jsonify(ok=True, state='failed', error=job.get('error', ''))
+        running = sum(1 for j in _PROXY_JOBS.values() if j['state'] == 'building')
+        if not job or job['state'] != 'building':
+            if running >= _PROXY_MAX_RUNNING:
+                return jsonify(ok=True, state='building', queued=True)
+            _PROXY_JOBS[name] = {'state': 'building', 'error': ''}
+            threading.Thread(target=_proxy_build, args=(v['path'], out_path, v['info'].get('audio_take'), name),
+                             daemon=True).start()
+    return jsonify(ok=True, state='building')
+
+
 @app.route('/api/shorts/clip', methods=['POST'])
 @require_permission('vertical_shorts')
 def api_shorts_clip():

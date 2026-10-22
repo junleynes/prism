@@ -8695,6 +8695,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
         <input type=range id=ws-scrub min=0 max=1 step=0.01 value=0 aria-label="Position in the moment">
         <span id=ws-clock class="ws-clock">0:00.0 / 0:00.0</span>
       </div>
+      <div id=ws-live-note class="sh-note" style="text-align:center;margin:2px 0 0"></div>
       <div class="ws-tools">
         <button type=button class="btn-sm" id=ws-stepb title="Back one frame (, or <)" aria-label="Step back one frame">&#9664;| 1 frame</button>
         <button type=button class="btn-sm" id=ws-stepf title="Forward one frame (. or >)" aria-label="Step forward one frame">1 frame |&#9654;</button>
@@ -8747,7 +8748,8 @@ var SH = {analysis: null, cands: [], jobId: null, options: null, destinations: n
 // The Moments workspace: which moment is selected, which inspector tab, and
 // what the stage (player) is showing.
 var WS = {selC: null, loadedC: null, tab: 'trim', token: 0, loadT: null, raf: null, cues: [], dur: 0, lead: 0, tail: 0, beyond: false,
-          screen: 'setup', zwin: null, drag: null, exact: false}
+          screen: 'setup', zwin: null, drag: null, exact: false,
+          live: false, base: 0, proxy: {}, liveUrl: null, liveShots: null, liveShotsC: null, liveDraft: undefined, wantExact: false, capT: null, shotT: null}
 
 function shFmt(t){
   t = Math.max(0, Number(t) || 0)
@@ -10028,7 +10030,7 @@ function shWsCuts(){
 function shWsCutHere(){
   var c = WS.selC, v = shEl('ws-video')
   if(!c || !v.getAttribute('src')) return
-  var t = Math.round((c.start - WS.lead + (v.currentTime || 0)) * 100) / 100
+  var t = Math.round((c.start - WS.lead + shWsGet(v)) * 100) / 100
   if(WS.cutFrom == null){
     if(t <= c.start + 0.2 || t >= c.end - 0.2){ shWsMsg('Cuts go inside the moment. To shorten its start or end, set In or Out.'); setTimeout(function(){ shWsMsg('') }, 2200); return }
     WS.cutFrom = t; shWsCuts(); return
@@ -10260,19 +10262,130 @@ function shPartBounds(c){
 var WS_BEYOND = 5
 function shWsTotal(){ return WS.lead + WS.dur + WS.tail }
 
+
+// ---- Live preview: the whole part as a small copy (one keyframe a second), played straight from the browser ----
+// In/out, cuts and the 9:16 window are only numbers laid over it, so changing them costs nothing.
+function shWsPartOf(c){ return shParts() ? shPartIdx(c) : 0 }
+function shWsLiveReady(c){ var px = c && WS.proxy[shWsPartOf(c)]; return !!(px && px.state === 'ready' && px.url) }
+function shWsGet(v){ return WS.live ? (v.currentTime || 0) - WS.base : (v.currentTime || 0) }
+function shWsSet(v, t){ v.currentTime = WS.live ? WS.base + t : t }
+function shWsVideoFill(on){
+  var v = shEl('ws-video'); if(!v) return
+  if(!on){ v.style.objectFit = ''; v.style.width = ''; v.style.height = ''; v.style.left = ''; v.style.right = ''; v.style.inset = ''; return }
+}
+
+function shWsProxyEnsure(k, retry){
+  var a = SH.analysis
+  if(!a) return
+  var aid = a.analysis_id, cur = WS.proxy[k]
+  if(cur && (cur.state === 'ready' || cur.polling || (cur.state === 'failed' && !retry))) return
+  WS.proxy[k] = {state: 'building', polling: true}
+  ;(function poll(){
+    shWsPost('/api/shorts/proxy', {analysis_id: aid, part: k, retry: !!retry}).then(function(r){
+      if(!SH.analysis || SH.analysis.analysis_id !== aid) return
+      if(!r.ok){ WS.proxy[k] = {state: 'failed'}; shWsProxyNote(); return }
+      if(r.state === 'building'){ WS.proxy[k] = {state: 'building', polling: true}; shWsProxyNote(); setTimeout(poll, 4000); return }
+      WS.proxy[k] = r.state === 'ready' ? {state: 'ready', url: r.url, offset: r.offset || 0} : {state: 'failed'}
+      shWsProxyNote()
+      if(r.state === 'ready' && WS.selC && WS.screen === 'moments' && !WS.wantExact) shWsLoad(0)
+    }).catch(function(){ WS.proxy[k] = {state: 'failed'}; shWsProxyNote() })
+  })()
+}
+
+function shWsProxyNote(){
+  var el = shEl('ws-live-note'); if(!el) return
+  var c = WS.selC, px = c && WS.proxy[shWsPartOf(c)], t = ''
+  if(px && px.state === 'ready') t = WS.live ? 'Live: in, out, cuts and framing show as you change them. Captions are approximate; <b>Exact render</b> shows the finished look.' : ''
+  else if(px && px.state === 'building') t = 'Preparing a fast editing copy of this episode (once). Until it is ready, a change shows after a short wait.'
+  el.innerHTML = t
+  shWsExactBtn()
+}
+
+function shWsLive(c, tok, newMoment){
+  var v = shEl('ws-video'), px = WS.proxy[shWsPartOf(c)], a = SH.analysis
+  if(newMoment){ WS.liveDraft = undefined; WS.liveShots = null; WS.liveShotsC = null; WS.cues = []; shEl('ws-cap').textContent = ''; shWsStop() }
+  WS.live = true; WS.exact = false; WS.loadedC = c; WS.dur = c.end - c.start
+  WS.base = c.start - (px.offset || 0) - WS.lead
+  shWsVideoFill(true); shWsCapVis(); shWsMsg(''); shWsProxyNote()
+  v.style.objectFit = 'fill'
+  shEl('ws-scrub').max = shWsTotal()
+  if(WS.liveUrl !== px.url){
+    WS.liveUrl = px.url; v.src = px.url; v.load(); v.currentTime = WS.base + WS.lead
+  } else {
+    // Same copy: the playhead stays where it was through an edit unless it now lies outside the moment.
+    var ct = v.currentTime || 0
+    if(newMoment || ct < WS.base - 0.001 || ct > WS.base + shWsTotal() + 0.001) v.currentTime = WS.base + WS.lead
+  }
+  shWsPaint()
+  // Lines: only fetched again after a short pause, so dragging an end stays smooth.
+  clearTimeout(WS.capT)
+  WS.capT = setTimeout(function(){
+    if(tok !== WS.token) return
+    shWsPost('/api/shorts/captions', {analysis_id: a.analysis_id, start: c.start - WS.lead, end: c.end + WS.tail,
+      subtitle_size: shEl('sh-caption-size').value, split_caption: shEl('sh-split-cap').value, edited: WS.lead || WS.tail ? null : (c.captions || null)})
+      .then(function(r){ if(tok !== WS.token || !WS.live) return; WS.cues = r && r.ok ? r.cues : []; shWsPaint() })
+      .catch(function(){})
+  }, newMoment ? 0 : 250)
+  // Shots for the 9:16 window: kept while the moment only shrinks, worked out again when it reaches past them.
+  var d = WS.liveShots
+  if(!d || WS.liveShotsC !== c || c.start < d.start - 0.01 || c.end > d.end + 0.01){
+    clearTimeout(WS.shotT)
+    WS.shotT = setTimeout(function(){
+      if(WS.selC !== c) return
+      Promise.resolve(shShotsFor(c)).then(function(dd){
+        if(WS.selC !== c || !dd || !dd.ok) return
+        WS.liveShots = dd; WS.liveShotsC = c; shWsPaint()
+      }).catch(function(){})
+    }, newMoment ? 0 : 400)
+  }
+}
+
+// The 9:16 window for the shot on screen: the plan's, or the editor's correction, laid over the copy.
+function shWsLiveFrame(c, t){
+  var v = shEl('ws-video'), d = WS.liveShots
+  if(!d || !d.shots || !d.shots.length){ v.style.objectFit = 'cover'; v.style.width = '100%'; v.style.left = '0'; return }
+  var draft = WS.liveDraft !== undefined ? WS.liveDraft : (c.framing || null)
+  var sh = null
+  d.shots.forEach(function(s){ if(t >= s.start - 1e-6 && (t < s.end || (s === d.shots[d.shots.length - 1] && t <= s.end + 1e-6))) sh = s })
+  if(!sh) sh = d.shots[0]
+  var layout = sh.auto === 'fit' ? 'fit' : sh.auto === 'split' ? 'split' : 'crop', x = sh.x
+  ;((draft && draft.shots) || []).forEach(function(o){
+    if(o.at >= sh.start - 1e-6 && o.at <= sh.end + 1e-6 && o.layout !== 'auto'){ layout = o.layout; if(o.layout === 'crop' && o.x != null) x = o.x }
+  })
+  v.style.height = '100%'
+  if(layout === 'fit' || layout === 'split'){
+    // The whole picture across the width (split screen is shown whole here; the exact render stacks the two panes).
+    v.style.objectFit = 'contain'; v.style.width = '100%'; v.style.left = '0'
+    return
+  }
+  if(x == null) x = (d.max_x || 0) / 2
+  x = Math.max(0, Math.min(d.max_x != null ? d.max_x : x, x))
+  // The window is crop_w wide in a frame disp_w wide: scale the picture so the window fills the phone, then slide it.
+  v.style.objectFit = 'fill'
+  v.style.width = (d.disp_w / d.crop_w * 100) + '%'
+  v.style.left = (-x / d.crop_w * 100) + '%'
+}
+
 function shWsLoad(delay, raw){
   clearTimeout(WS.loadT)
   var tok = ++WS.token
-  if(delay){ WS.loadT = setTimeout(function(){ if(tok === WS.token) shWsLoad(0, raw) }, delay); return }
+  WS.wantExact = false
+  if(WS.selC && SH.analysis) shWsProxyEnsure(shWsPartOf(WS.selC))
+  // With the fast editing copy ready an edit shows at once: nothing is rendered, so there is nothing to wait for.
+  if(delay && !(WS.selC && !raw && shWsLiveReady(WS.selC))){ WS.loadT = setTimeout(function(){ if(tok === WS.token) shWsLoad(0, raw) }, delay); return }
   var c = WS.selC, a = SH.analysis, v = shEl('ws-video')
-  shWsStop()
-  WS.exact = false; v.style.objectFit = ''; shWsCapVis()
-  if(!c || !a){ v.removeAttribute('src'); shWsMsg('Select a moment'); return }
+  var stay = !!(c && a && !raw && WS.live && shWsLiveReady(c))     // an edit in the live view: playing carries on
+  if(!stay) shWsStop()
+  WS.exact = false; shWsCapVis()
+  if(!c || !a){ WS.live = false; WS.liveUrl = null; shWsVideoFill(false); shWsProxyNote(); v.removeAttribute('src'); shWsMsg('Select a moment'); return }
+  var prevC = WS.loadedC
   WS.loadedC = c
   WS.dur = c.end - c.start
   var bnd = shPartBounds(c)
   WS.lead = WS.beyond ? Math.max(0, Math.min(WS_BEYOND, c.start - bnd[0])) : 0
   WS.tail = WS.beyond ? Math.max(0, Math.min(WS_BEYOND, bnd[1] - c.end)) : 0
+  if(!raw && shWsLiveReady(c)){ shWsLive(c, tok, prevC !== c); return }
+  WS.live = false; WS.liveUrl = null; shWsVideoFill(false); shWsProxyNote()
   WS.cues = []
   shEl('ws-cap').textContent = ''
   // The exact 9:16 copy (framing, corrections and captions in) is what opens, unless it is switched off or the
@@ -10296,7 +10409,7 @@ function shWsLoad(delay, raw){
 function shWsPaint(){
   var v = shEl('ws-video'), c = WS.selC
   if(!c) return
-  var tv = Math.max(0, Math.min(shWsTotal(), v.currentTime || 0)), t = tv - WS.lead   // t: seconds into the moment (negative before it)
+  var tv = Math.max(0, Math.min(shWsTotal(), shWsGet(v))), t = tv - WS.lead   // t: seconds into the moment (negative before it)
   if(document.activeElement !== shEl('ws-scrub')) shEl('ws-scrub').value = tv
   shEl('ws-clock').textContent = t.toFixed(2) + ' / ' + WS.dur.toFixed(1) + ((t < -1e-6 || t > WS.dur + 1e-6) ? ' (outside)' : '')
   var line = ''
@@ -10304,6 +10417,7 @@ function shWsPaint(){
   var cap = shEl('ws-cap')
   if(cap.textContent !== line) cap.textContent = line
   if(WS.onPaint) WS.onPaint()
+  if(WS.live) shWsLiveFrame(c, c.start + t)
   shWsPlayhead(c.start + t)
 }
 
@@ -10312,8 +10426,14 @@ function shWsTick(){
   var v = shEl('ws-video'), c = WS.selC
   if(c && c.cuts && c.cuts.length && !v.paused){
     // Played as it will come out: a cut part is jumped over.
-    var at = c.start - WS.lead + v.currentTime
-    shCutsClean(c).forEach(function(x){ if(at >= x[0] && at < x[1] - 0.02) v.currentTime = Math.min(shWsTotal(), x[1] - c.start + WS.lead) })
+    var at = c.start - WS.lead + shWsGet(v)
+    shCutsClean(c).forEach(function(x){ if(at >= x[0] && at < x[1] - 0.02) shWsSet(v, Math.min(shWsTotal(), x[1] - c.start + WS.lead)) })
+  }
+  // The copy holds the whole part: stop at the moment's end (and do not run on from before its start).
+  if(c && WS.live && !v.paused){
+    var g = shWsGet(v)
+    if(g >= shWsTotal() - 0.02){ v.pause(); shWsSet(v, shWsTotal()); shWsPaint() }
+    else if(g < -0.05){ shWsSet(v, 0) }
   }
   WS.raf = (!v.paused && !v.ended) ? requestAnimationFrame(shWsTick) : null
 }
@@ -10324,6 +10444,7 @@ function shWsTick(){
   v.addEventListener('loadedmetadata', function(){ shWsMsg(''); shWsPaint() })
   v.addEventListener('error', function(){
     if(!v.getAttribute('src')) return
+    if(WS.live){ var pk = WS.selC ? shWsPartOf(WS.selC) : 0; WS.proxy[pk] = {state: 'failed'}; WS.live = false; shWsLoad(0); return }
     // An exact copy that cannot be played is made again once (the server checks it), then it is said.
     if(WS.exact && !WS.exactTry){ shWsExact(WS.draft, true); return }
     shWsMsg("This couldn't be played back.")
@@ -10332,10 +10453,10 @@ function shWsTick(){
   v.addEventListener('pause', function(){ b.innerHTML = '&#9654;' })
   v.addEventListener('ended', function(){ b.innerHTML = '&#9654;'; shWsPaint() })
   v.addEventListener('seeked', shWsPaint)
-  function toggle(){ if(!v.getAttribute('src')) return; if(v.paused){ if(v.ended || v.currentTime >= shWsTotal() - 0.05) v.currentTime = WS.lead; v.play().catch(function(){}) } else v.pause() }
+  function toggle(){ if(!v.getAttribute('src')) return; if(v.paused){ if(v.ended || shWsGet(v) >= shWsTotal() - 0.05) shWsSet(v, WS.lead); v.play().catch(function(){}) } else v.pause() }
   b.addEventListener('click', toggle)
   shEl('ws-phone').addEventListener('click', toggle)
-  shEl('ws-scrub').addEventListener('input', function(){ v.currentTime = parseFloat(this.value) || 0; shWsPaint() })
+  shEl('ws-scrub').addEventListener('input', function(){ shWsSet(v, parseFloat(this.value) || 0); shWsPaint() })
   shEl('ws-stepb').addEventListener('click', function(){ shWsStep(-1) })
   shEl('ws-stepf').addEventListener('click', function(){ shWsStep(1) })
   shEl('ws-setin').addEventListener('click', function(){ shWsSetHere('start') })
@@ -10344,6 +10465,8 @@ function shWsTick(){
   shEl('ws-beyond').addEventListener('change', function(){ WS.beyond = this.checked; if(WS.selC) shWsLoad(0) })
   shWsExactBtn()
   shEl('ws-exact').addEventListener('click', function(){
+    // With the live copy this renders the finished look once; the next edit goes back to live.
+    if(WS.selC && shWsLiveReady(WS.selC)){ WS.wantExact = true; shWsExact(WS.liveDraft, true); return }
     try{ localStorage.setItem('prism_ws_exact', shWsExactOn() ? '0' : '1') }catch(e){}
     shWsExactBtn()
     if(WS.selC) shWsLoad(0)
@@ -10368,17 +10491,17 @@ function shWsStep(dir){
   var v = shEl('ws-video')
   if(!v || !v.getAttribute('src') || !WS.selC) return
   if(!v.paused) v.pause()
-  var fps = shWsFps(), n = Math.round((v.currentTime || 0) * fps) + dir
+  var fps = shWsFps(), n = Math.round(shWsGet(v) * fps) + dir
   var last = Math.max(0, Math.ceil(shWsTotal() * fps) - 1)
   n = Math.max(0, Math.min(last, n))
-  v.currentTime = Math.min(shWsTotal(), (n + 0.25) / fps)
+  shWsSet(v, Math.min(shWsTotal(), (n + 0.25) / fps))
   shWsPaint()
 }
 
 function shWsSetHere(which){
   var c = WS.selC, v = shEl('ws-video')
   if(!c || !v.getAttribute('src')) return
-  var t = c.start - WS.lead + (v.currentTime || 0)
+  var t = c.start - WS.lead + shWsGet(v)
   if(!shPointSet(c, which, Math.round(t * 100) / 100)){
     var tok = WS.token
     shWsMsg(which === 'start' ? 'In must be before the out point.' : 'Out must be after the in point.')
@@ -10391,6 +10514,12 @@ function shWsExactOn(){
 }
 function shWsExactBtn(){
   var b = shEl('ws-exact'); if(!b) return
+  if(WS.selC && shWsLiveReady(WS.selC)){
+    b.textContent = 'Exact render'; b.setAttribute('aria-pressed', WS.exact ? 'true' : 'false')
+    b.style.borderColor = WS.exact ? 'var(--accent, #34e6c5)' : ''
+    b.title = 'The editing view is live and approximate (captions, split screen, speaker following). This renders the exact 9:16 copy once.'
+    return
+  }
   var on = shWsExactOn()
   b.textContent = 'Exact 9:16 preview: ' + (on ? 'on' : 'off')
   b.setAttribute('aria-pressed', on ? 'true' : 'false')
@@ -10400,6 +10529,12 @@ function shWsExactBtn(){
 async function shWsExact(draft, force){
   var c = WS.selC, a = SH.analysis, v = shEl('ws-video'), btn = shEl('ws-exact')
   if(!c || !a) return
+  // The framing being worked on is laid over the live copy at once; only "Exact render" makes the real one.
+  if(!force && !WS.wantExact && shWsLiveReady(c)){
+    if(WS.live && WS.loadedC === c){ WS.liveDraft = draft; shWsPaint() } else { shWsLoad(0); WS.liveDraft = draft; shWsPaint() }
+    return
+  }
+  WS.live = false; WS.liveUrl = null; shWsVideoFill(false)
   WS.draft = draft; WS.exactTry = !!force
   var tok = ++WS.token
   shWsStop()
@@ -10424,6 +10559,7 @@ async function shWsExact(draft, force){
     shWsLoad(0, true); return
   }
   WS.exact = true; WS.loadedC = c; WS.dur = c.end - c.start
+  shWsProxyNote()
   shWsCapVis(); shEl('ws-cap').textContent = ''
   v.style.objectFit = 'contain'
   v.src = r.url; v.load(); shWsMsg('')
@@ -10743,8 +10879,8 @@ function shCapEditor(host, cues, opts){
 
   // ---- the preview: where we are in the short, and which line is on screen ----
   var t = 0, pinned = null, timer = null, shots = {}, asked = {}, bt = null
-  function seek(){ if(ready){ try{ vid.currentTime = Math.min(t, vid.duration || t) }catch(e){} } }
-  function now(){ return shared ? (vid.currentTime || 0) : t }
+  function seek(){ if(ready){ try{ if(shared) shWsSet(vid, t); else vid.currentTime = Math.min(t, vid.duration || t) }catch(e){} } }
+  function now(){ return shared ? shWsGet(vid) : t }
   function playing(){ return !!timer || !!raf }
   function pinTime(r){ return Math.max(0, r.start + Math.min(0.3, Math.max(0, (r.end - r.start) / 2))) }
   function isPlaying(){ return shared ? !vid.paused && !vid.ended : playing() }
@@ -10813,12 +10949,12 @@ function shCapEditor(host, cues, opts){
     if(ready){
       // The real clip with its sound: the line shown is read off the
       // picture's own clock, so it is on screen with the voice.
-      vid.currentTime = t
+      if(shared) shWsSet(vid, t); else vid.currentTime = t
       playBtn.innerHTML = '&#10074;&#10074; Pause'
       vid.play().catch(function(){ stop() })
       var loop = function(){
         if(!host.contains(line)){ stop(); return }
-        t = Math.min(dur, vid.currentTime)
+        t = Math.min(dur, shared ? shWsGet(vid) : vid.currentTime)
         paint()
         if(vid.ended || t >= dur - 0.02){ stop(); return }
         raf = requestAnimationFrame(loop)
@@ -14548,7 +14684,7 @@ job. Configured via env vars:
       </ul>
       <p>Each candidate's score (0&ndash;100) weighs story most, then visual drama, then dialogue pace, then sound. Both Ollama and faster-whisper must be reachable; the job refuses to start otherwise rather than choose on half the evidence. The same goes for a transcription that fails part-way (the service errors or times out): the job stops and says why. Only a source with genuinely nothing to hear &mdash; no audio track, or no speech in it &mdash; falls back to picture alone. A warning above the list tells you when a fallback was used (no story found, or no dialogue at all). The speech-to-text service has to return timings as well as text: it is asked for <code>verbose_json</code> with timestamps and, if it answers that with the text alone, for <code>srt</code> and then <code>vtt</code>, which every Whisper server can write. Subtitle timings are per line, not per word, so captions made that way change a line at a time. A server that gives no timings in any of the three stops the job with a message saying so. On a master that keeps its sound on separate tracks or channels (eight mono tracks, say, with the full mix on 3 and 4), the dialogue is looked for where there is sound rather than on the first track: silent channels are never sent, a stereo pair recorded out of phase is sent as one side, and if the first candidate has no speech in it the next is tried, up to four. A note above the list says which track the dialogue was read from, and the shorts and their previews take their sound from the same place. When nothing is found, the warning lists what was tried and at what level.</p>
       <h3>2. Review</h3>
-      <p>The page works in three steps, shown along the top: <strong>1 Source</strong> (the episode, lengths, language and Output settings), <strong>2 Moments</strong> and <strong>3 Export</strong> (the finished shorts). Moments is a workspace. On the left is the list of moments, best first or in episode order, each with a thumbnail, its in&ndash;out, length and score (green 75 and over, amber 50 and over); the tick decides whether it is rendered, and clicking a row selects it. In the middle is a 9:16 player: it plays the real clip with its sound and shows the captions the moment will get, as they will be burned in (a correction made in <strong>Captions</strong> shows at once). <strong>Set In here</strong> and <strong>Set Out here</strong> take the in or out point from the picture&rsquo;s position; <strong>Exact 9:16 preview</strong> renders a small copy with the framing, corrections and captions applied. On the right the editor has four tabs: <strong>Trim</strong> (title, in and out typed as <code>m:ss.s</code> or seconds, or nudged by &plusmn;0.1 and &plusmn;1 s), <strong>Captions</strong>, <strong>Framing</strong> and <strong>Dialogue</strong>. Under them, the whole episode is drawn as a timeline of its moments (ticked ones solid, unticked hatched, the selected one outlined, the joins between parts marked) and, below it, the selected moment with its surroundings, where the two ends can be dragged. A moment can be made longer as well as shorter: type a new in or out, nudge it, drag an end, or tick <strong>show 5 s beyond the ends</strong> under the player, which plays a little before and after the moment so <strong>Set In here</strong> / <strong>Set Out here</strong> can reach past where it ends now. The <em>Length of each short</em> you set on Source only steers which moments are found; what you may trim to is 3 seconds up to 5 minutes, and a change outside that is refused (a moment that already breaks it may not be made worse). The bar at the bottom stays in view: total running time, a summary of the Output settings (open them there, with presets &mdash; <em>Standard</em>, <em>Two-person scenes</em> and <em>Whole frame</em>), and <strong>Render</strong>. A finished render lights up <strong>Export</strong> and is offered in the queue as <strong>Show the shorts</strong>; it never takes the editor away from you. Keys, when you are not typing in a box: <kbd>Space</kbd> play or pause, <kbd>&uarr;</kbd> <kbd>&darr;</kbd> previous or next moment, <kbd>I</kbd> and <kbd>O</kbd> set in and out at the playhead, <kbd>X</kbd> tick or untick. The player shows the source framing; reframing happens at render, and the exact preview shows it.</p>
+      <p>The page works in three steps, shown along the top: <strong>1 Source</strong> (the episode, lengths, language and Output settings), <strong>2 Moments</strong> and <strong>3 Export</strong> (the finished shorts). Moments is a workspace. On the left is the list of moments, best first or in episode order, each with a thumbnail, its in&ndash;out, length and score (green 75 and over, amber 50 and over); the tick decides whether it is rendered, and clicking a row selects it. In the middle is a 9:16 player: it plays the real clip with its sound and shows the captions the moment will get, as they will be burned in (a correction made in <strong>Captions</strong> shows at once). <strong>Set In here</strong> and <strong>Set Out here</strong> take the in or out point from the picture&rsquo;s position; <strong>Exact 9:16 preview</strong> renders a small copy with the framing, corrections and captions applied. On the right the editor has four tabs: <strong>Trim</strong> (title, in and out typed as <code>m:ss.s</code> or seconds, or nudged by &plusmn;0.1 and &plusmn;1 s), <strong>Captions</strong>, <strong>Framing</strong> and <strong>Dialogue</strong>. Under them, the whole episode is drawn as a timeline of its moments (ticked ones solid, unticked hatched, the selected one outlined, the joins between parts marked) and, below it, the selected moment with its surroundings, where the two ends can be dragged. A moment can be made longer as well as shorter: type a new in or out, nudge it, drag an end, or tick <strong>show 5 s beyond the ends</strong> under the player, which plays a little before and after the moment so <strong>Set In here</strong> / <strong>Set Out here</strong> can reach past where it ends now. The <em>Length of each short</em> you set on Source only steers which moments are found; what you may trim to is 3 seconds up to 5 minutes, and a change outside that is refused (a moment that already breaks it may not be made worse). The bar at the bottom stays in view: total running time, a summary of the Output settings (open them there, with presets &mdash; <em>Standard</em>, <em>Two-person scenes</em> and <em>Whole frame</em>), and <strong>Render</strong>. A finished render lights up <strong>Export</strong> and is offered in the queue as <strong>Show the shorts</strong>; it never takes the editor away from you. Keys, when you are not typing in a box: <kbd>Space</kbd> play or pause, <kbd>&uarr;</kbd> <kbd>&darr;</kbd> previous or next moment, <kbd>I</kbd> and <kbd>O</kbd> set in and out at the playhead, <kbd>X</kbd> tick or untick. The player is <strong>live</strong>: the first time an episode is opened PRISM makes a small editing copy of it in the background (once; a note under the player says so), and from then on a change to in, out, cuts or the 9:16 window shows at once with nothing to render. Until the copy is ready, a change shows after a short wait as before. In the live view the 9:16 window is laid over the picture as the plan or your correction sets it, captions are approximate, split screen is shown as the whole picture and a speaker-following shot at its middle position; <strong>Exact render</strong> makes the real 9:16 copy once, and the next edit goes back to live.</p>
       <p>The <strong>Framing</strong> tab shows each of its shots as a still, with the 9:16 window drawn where it will be: dashed for what was worked out, solid for a correction. For any shot, choose <strong>Crop here</strong> and slide the window (or click the still where it should go), <strong>Whole frame</strong> to show the whole picture over a blurred copy, or <strong>Split screen</strong> to stack the two people of the shot, one above the other (offered only for a shot with exactly two people far enough apart to give each a pane; the panes are drawn on the still, numbered top to bottom, and every split in a clip shares one window size). <strong>Make vertical preview</strong> renders a small 9:16 copy of the moment as it will come out &mdash; framing, corrections and captions &mdash; in a few seconds, without spending a full render. <strong>Use this framing</strong> keeps the corrections with that moment (marked <em>framing set</em>); a corrected shot is framed that way for its whole length, even where the plan had followed someone, cut between speakers or split the screen. The corrections belong to the shots, not to the in and out points: move those afterwards and each correction stays on the shot it was made for. <strong>Back to automatic</strong> drops them.</p>
       <p>The <strong>Captions</strong> tab opens the lines it will be captioned with, exactly as they will appear: change the wording, change when a line is on screen (times are from the start of the short, to a hundredth of a second), empty a line to drop it, or add one. <strong>Use these captions</strong> keeps them with that moment &mdash; it is marked <em>captions edited</em> &mdash; and they are what is burned in and written to its .srt. Moving the in or out point afterwards does not lose them: the lines still inside the new range stay, moved to where they now fall, and whatever the range gained at either end gets the automatic captions. <strong>Back to automatic</strong> drops the corrections. A phone-shaped <strong>preview</strong> beside the lines shows the line as it is burned in (size, outline and position) and follows what you do: click or type in a line and it shows that line; drag the slider to any point of the short. <strong>Play</strong> plays the real clip with its sound, a few seconds after the editor opens (while it is prepared the preview is stills and a clock), and the line on screen follows the picture&rsquo;s own clock, so each caption is shown with its voice. Captions are timed from the words: when an analysis is made the first word after a silence is moved to where the speech really begins, so a caption does not come up early and wait for the voice. Beside a line, <strong>Split</strong> cuts it in two at the text cursor (the time is divided in proportion), <strong>Join</strong> runs it into the next; in a time box the up and down keys move it by 0.05 s (Shift: 0.5 s). A line longer than fits on one line at the chosen size is marked amber and the preview shows it wrapped. One caption is on screen at a time, so where two lines overlap the earlier one ends as the next begins.</p>
       <p><strong>Your review is saved as you make it</strong> &mdash; ticks, titles, in and out points, corrected captions and framing, and moments added by hand. The analysis and the review are kept on the server (in <code>shorts_analyses</code> next to the library; <code>SHORTS_ANALYSES_DIR</code> to put them elsewhere) for 14 days after they were last opened (<code>SHORTS_ANALYSIS_DAYS</code>), so a restart or a day away does not mean analysing the episode again. <strong>Earlier cuts of this project</strong>, at the top of <strong>Create shorts</strong>, lists them with <strong>Open</strong>, which brings the cut back as it was left, and <strong>Delete</strong>, which removes the analysis and its review but never shorts made from it. You see your own; admins see everyone&rsquo;s.</p>

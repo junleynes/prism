@@ -906,6 +906,45 @@ def test_preview_clip_is_a_small_proxy_of_the_requested_range(env, monkeypatch):
     assert r.status_code == 410 and 're-analyse' in r.get_json()['error']
 
 
+def test_editing_proxy_covers_the_whole_part_and_is_made_once_in_the_background(env, monkeypatch):
+    Services(monkeypatch)
+    shorts._PROXY_JOBS.clear()
+    client, headers = _client()
+    aid = _analyze(client, headers, env)['result']['analysis_id']
+    d = client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).get_json()
+    assert d['ok'] and d['state'] in ('building', 'ready')
+    for _ in range(200):
+        if d['state'] == 'ready':
+            break
+        time.sleep(0.1)
+        d = client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).get_json()
+    assert d['state'] == 'ready' and d['url'].startswith('/uploads/shproxy_') and d['offset'] == 0
+    path = os.path.join(main.app.config['UPLOAD_FOLDER'], os.path.basename(d['url']))
+    fr = _frames(path)
+    assert len(fr) >= 25 * 12, 'the whole part, not a range'
+    assert fr[0].shape[:2] == (180, 320), 'source framing, small'
+    # Asked again it is the same file, not another encode.
+    mt = os.path.getmtime(path)
+    d2 = client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).get_json()
+    assert d2['url'] == d['url'] and os.path.getmtime(path) >= mt
+    assert client.post('/api/shorts/proxy', json={'analysis_id': aid, 'part': 5}, headers=headers).status_code in (200, 400)
+    assert client.post('/api/shorts/proxy', json={'analysis_id': 'gone'}, headers=headers).status_code == 404
+    os.remove(env['path'])
+    os.remove(path)
+    shorts._PROXY_JOBS.clear()
+    assert client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).status_code == 410
+
+
+def test_review_screen_plays_the_proxy_live_instead_of_rendering_per_edit():
+    html = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'templates', 'index.html'),
+                encoding='utf-8').read()
+    assert "/api/shorts/proxy" in html and 'function shWsLive(' in html and 'function shWsLiveFrame(' in html
+    # An edit with the copy ready is not held back by the debounce, and every place that reads the player's
+    # clock goes through the live offset.
+    assert 'shWsLiveReady(WS.selC)))' in html
+    assert 'shWsGet(v)' in html and 'shWsSet(v,' in html
+
+
 # --------------------------------------------------------------------------
 # The tab: render, batches, delivery
 # --------------------------------------------------------------------------
