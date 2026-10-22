@@ -9557,7 +9557,8 @@ def send_file_to_network_destination(local_path, remote_filename, destination, s
         folder = root
         if subfolder:
             # A new folder under the destination (made if it is not there yet); never anything else in it touched.
-            if not re.match(r'^[A-Za-z0-9_-]{1,40}$', subfolder):
+            if (not subfolder or len(subfolder) > 120 or subfolder != subfolder.strip(' .')
+                    or re.search(r'[\\/:*?"<>|\x00-\x1f]', subfolder) or '..' in subfolder):
                 raise ValueError('Invalid folder name')
             folder = root + '\\' + subfolder
             smbclient.makedirs(folder, exist_ok=True)

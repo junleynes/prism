@@ -1540,14 +1540,14 @@ def test_a_short_can_be_delivered_as_prores_and_that_is_the_file_handed_over(env
     assert r.status_code == 200, r.get_json()
     assert sent == [(s['delivery'], 'TADHANA_EP101_teaser.mov'), (s['srt'], 'TADHANA_EP101_teaser.srt')], \
         'renamed, but still a .mov: the name cannot change what the file is'
-    # "In a new folder named with today's date": MMDDYY, like 102126.
+    # "In a folder named Program Title - Episode": the project's, made if it is not there yet.
     dated = []
     monkeypatch.setattr(pipeline, 'send_file_to_network_destination',
                         lambda local, name, dest, subfolder=None: dated.append((name, subfolder)))
     r = client.post(f"/api/shorts/batches/{batch['batch_id']}/send", headers=headers,
-                    json={'destination_id': 1, 'files': [s['file']], 'dated_folder': True})
-    assert r.status_code == 200 and r.get_json().get('folder') == time.strftime('%m%d%y')
-    assert dated and all(f == time.strftime('%m%d%y') and len(f) == 6 for _n, f in dated)
+                    json={'destination_id': 1, 'files': [s['file']], 'project_folder': True})
+    assert r.status_code == 200, r.get_json()
+    assert dated and all(f == 'Tadhana - Ep. 101' for _n, f in dated) and r.get_json()['folder'] == 'Tadhana - Ep. 101'
 
     # MP4 is one file, and anything unknown -- or AVC-Intra, which is a landscape format -- is MP4.
     crfs.clear()
@@ -4290,3 +4290,10 @@ def test_a_staged_sound_effect_that_is_gone_is_fetched_again_from_where_it_came_
     pipeline.STAGED_ORIGINS.pop(name, None)
     got, err = shorts._resolve_ending_sfx({'ending': 'cliffhanger', 'ending_sfx_name': name})
     assert got is None and 'no longer available' in err
+
+
+def test_project_folder_name_is_safe_for_a_windows_share():
+    f = shorts._project_folder_name
+    assert f({'title': 'Magpakailanman', 'episode': '383'}) == 'Magpakailanman - 383'
+    assert f({'title': 'Tadhana: "Ang" Balik?', 'episode': 'Ep. 101.'}) == 'Tadhana Ang Balik - Ep. 101'
+    assert f({'title': 'Tadhana', 'episode': ''}) == 'Tadhana' and f(None) is None

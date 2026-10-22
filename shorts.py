@@ -4296,6 +4296,16 @@ def api_shorts_batch_zip(bid):
                                        cleanup=lambda: os.path.exists(tmp) and os.remove(tmp))
 
 
+def _project_folder_name(proj):
+    """"Program Title - Episode" as a folder name a Windows share accepts, or None without a project."""
+    if not proj:
+        return None
+    clean = lambda t: re.sub(r'\s+', ' ', re.sub(r'[\\/:*?"<>|\x00-\x1f]', ' ', str(t or ''))).strip(' .')
+    title, ep = clean(proj.get('title')), clean(proj.get('episode'))
+    name = f'{title} - {ep}' if title and ep else title or ep
+    return name[:120].strip(' .') or None
+
+
 @app.route('/api/shorts/batches/<bid>/send', methods=['POST'])
 @require_permission('vertical_shorts')
 def api_shorts_batch_send(bid):
@@ -4327,8 +4337,14 @@ def api_shorts_batch_send(bid):
         rename, bad = pipeline.destination_filename(data.get('filename'), _delivery_name(shorts[0]))
         if bad:
             return jsonify(ok=False, error=bad), 400
-    # "Put them in a new folder named with today's date": MMDDYY, like 102126.
-    folder = time.strftime('%m%d%y') if data.get('dated_folder') else None
+    # "Put them in a folder named Program Title - Episode" (the project's), made if it is not there yet.
+    folder = None
+    if data.get('project_folder'):
+        proj = sp.load(SHORTS_PROJECTS_DIR, m['project_id']) if m.get('project_id') else None
+        folder = _project_folder_name(proj)
+        if not folder:
+            return jsonify(ok=False, error='This batch is not filed under a project, so there is no Program Title - '
+                           'Episode to name the folder after. Send without the folder.'), 400
     bdir, sent = _batch_dir(bid), []
     for s in shorts:
         # The delivery file: the MP4, or the ProRes made from it.

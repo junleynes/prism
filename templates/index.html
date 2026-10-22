@@ -11655,7 +11655,7 @@ function shSendOnePanel(panel, bid, s){
         'style="flex:1;min-width:0;margin:0;padding:4px 8px;font-size:12px">' +
       '<span style="opacity:.7">' + escapeHtmlLite(ext) + '</span></div>' +
     '<div style="display:flex;gap:6px;align-items:center;margin-top:6px">' +
-      '<label style="font-size:12px;display:inline-flex;gap:4px;align-items:center;font-weight:normal"><input type=checkbox data-send-date> in a new folder named with today\'s date (MMDDYY)</label>' +
+      '<label style="font-size:12px;display:inline-flex;gap:4px;align-items:center;font-weight:normal"><input type=checkbox data-send-date> in a folder named Program Title - Episode</label>' +
       '<button type=button class="btn-sm" data-send-go>Send</button>' +
       '<button type=button class="btn-sm" data-send-close style="opacity:.75">Cancel</button></div>' +
     '<div data-send-out style="font-size:12px;margin-top:4px;overflow-wrap:anywhere"></div>'
@@ -11678,7 +11678,7 @@ function shSendOnePanel(panel, bid, s){
         headers: {'Content-Type': 'application/json'},
         // Left as it was, no name is sent: the server uses the short's own.
         body: JSON.stringify({destination_id: parseInt(sel.value, 10), include_srt: true, files: [file],
-                              dated_folder: shDatedGet(panel.querySelector('[data-send-date]')),
+                              project_folder: shDatedGet(panel.querySelector('[data-send-date]')),
                               filename: typed === stem ? '' : typed})})).json()
       if(r.ok){ out.style.color = 'var(--phosphor)'; out.textContent = 'Sent to ' + r.destination + (r.folder ? '\\' + r.folder : '') + ' as ' + (r.sent || []).join(' + ') }
       else{ out.style.color = 'var(--tally)'; out.textContent = r.error || 'Send failed' }
@@ -11690,8 +11690,8 @@ function shSendOnePanel(panel, bid, s){
 // The date-folder tick is remembered in this browser (a convenience only).
 function shDatedInit(chk){
   if(!chk) return
-  try{ chk.checked = localStorage.getItem('sh_dated_folder') === '1' }catch(e){}
-  chk.addEventListener('change', function(){ try{ localStorage.setItem('sh_dated_folder', chk.checked ? '1' : '0') }catch(e){} })
+  try{ chk.checked = localStorage.getItem('sh_project_folder') === '1' }catch(e){}
+  chk.addEventListener('change', function(){ try{ localStorage.setItem('sh_project_folder', chk.checked ? '1' : '0') }catch(e){} })
 }
 function shDatedGet(chk){ return !!(chk && chk.checked) }
 
@@ -11712,7 +11712,7 @@ async function shFillSend(host, bid){
   host.style.cssText = 'display:inline-flex;gap:6px;align-items:center'
   host.innerHTML = '<select style="width:auto;margin:0;padding:4px 28px 4px 8px;font-size:12px" aria-label="Send all to">' +
     SH.destinations.map(function(x){ return '<option value="' + x.id + '">' + escapeHtmlLite(x.name) + '</option>' }).join('') +
-    '</select><label style="font-size:12px;display:inline-flex;gap:4px;align-items:center;font-weight:normal" title="Creates a folder named with today\'s date, like 102126, and puts the files in it"><input type=checkbox data-send-date> date folder</label><button type=button class="btn-sm">Send all</button><span style="font-size:12px"></span>'
+    '</select><label style="font-size:12px;display:inline-flex;gap:4px;align-items:center;font-weight:normal" title="Creates a folder named after the project, Program Title - Episode, and puts the files in it"><input type=checkbox data-send-date> project folder</label><button type=button class="btn-sm">Send all</button><span style="font-size:12px"></span>'
   var sel = host.querySelector('select'), btn = host.querySelector('button'), out = host.querySelector('span')
   var dchk = host.querySelector('[data-send-date]'); shDatedInit(dchk)
   btn.addEventListener('click', async function(e){
@@ -11722,7 +11722,7 @@ async function shFillSend(host, bid){
     try{
       var r = await (await fetch('/api/shorts/batches/' + bid + '/send', {method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({destination_id: parseInt(sel.value, 10), include_srt: true, dated_folder: dchk.checked})})).json()
+        body: JSON.stringify({destination_id: parseInt(sel.value, 10), include_srt: true, project_folder: dchk.checked})})).json()
       if(r.ok){ out.style.color = 'var(--phosphor)'; out.textContent = 'Sent ' + r.sent.length + ' file' + (r.sent.length === 1 ? '' : 's') + ' to ' + r.destination + (r.folder ? '\\' + r.folder : '') }
       else{ out.style.color = 'var(--tally)'; out.textContent = r.error || 'Send failed' }
     }catch(err){ out.style.color = 'var(--tally)'; out.textContent = 'Send failed: ' + err }
