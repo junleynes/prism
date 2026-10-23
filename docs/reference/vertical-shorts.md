@@ -77,7 +77,7 @@ Output settings holds the defaults for the batch. They are saved to the project,
 
 - Cuts: how pieces join (short crossfade by default).
 
-- Captions: burn in, size, position over a split screen (on the join between the panes or low), and Word highlighting.
+- Captions: burn in, embed in the file, size, position over a split screen (on the join between the panes or low), and Word highlighting.
 
 - EP labels: opening label (for example "EP {n}") and closing label (for example "NEXT: EP {n} \>\>"). Type any wording; {n} is the number.
 
@@ -195,3 +195,5 @@ The first time an episode's moments are opened, PRISM makes a small editing copy
 The live view is approximate in three ways: captions are shown as text, split screen is shown as the whole picture, and a shot that follows a speaker is shown at its middle position. **Exact render** (the button that was *Exact 9:16 preview*) renders the real 9:16 copy once; the next edit returns to live. The copy lives in the upload folder with the other staged files (cleared after `UPLOAD_TTL`, made again when needed); it is encoded one at a time so it never competes with a render.
 
 The editing copy is kept out of the way of real work: it is encoded at the lowest priority on about a quarter of the cores, and it does not start while any job (analysis, render, highlights) is running; the note under the player says it is waiting. `SHORTS_PROXY=0` in `.env` turns it off entirely, and the editor then works as before, with a short wait after a change.
+
+Embed captions in the file (Output settings > Captions, off by default) adds the captions to the MP4 and to a MOV/ProRes delivery file as a subtitle track (mov_text), beside or instead of Burn in captions. The picture and sound are copied untouched. A player or editor can show or hide the track (some players show it by default). The track is kept in step with the .srt: correcting the captions of a saved short updates it, and emptying them removes it. Delivery formats that are not MP4 or MOV cannot hold a track and only get the .srt; the batch card then carries a warning. A highlight reel is joined from its scenes first and then gets the track.

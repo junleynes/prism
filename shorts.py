@@ -647,6 +647,63 @@ def _send_prefix(raw):
     return pre, None
 
 
+_EMBED_EXT = ('.mp4', '.mov', '.m4v')
+
+
+def _embed_srt(media, srt):
+    """Puts `srt` into `media` as a subtitle track (mov_text) a player can switch on, with the picture and sound
+    copied untouched -- or takes the track out when `srt` is None. (ok, why not): the track can be shown or hidden
+    in a player or editor; the MP4/MOV muxers mark the first subtitle track as the default one, so some players show it.  The file is only replaced once the new one is complete."""
+    ext = os.path.splitext(media)[1].lower()
+    if ext not in _EMBED_EXT:
+        return False, f'a {ext or "this"} file cannot hold a caption track'
+    tmp = os.path.join(os.path.dirname(media), f'.emb_{secrets.token_hex(3)}{ext}')
+    cmd = [pipeline.FFMPEG, '-y', '-loglevel', 'error', '-i', media]
+    if srt:
+        cmd += ['-i', srt]
+    cmd += ['-map', '0', '-map', '-0:s?']
+    if srt:
+        cmd += ['-map', '1:0']
+    cmd += ['-c', 'copy']
+    if srt:
+        cmd += ['-c:s', 'mov_text', '-metadata:s:s:0', 'handler_name=Captions', '-metadata:s:s:0', 'title=Captions']
+    cmd += ['-movflags', '+faststart', tmp]
+    try:
+        r = pipeline.run_ffmpeg(cmd, timeout=pipeline.FFMPEG_TIMEOUT, label='shorts embed captions')
+        if not (os.path.exists(tmp) and os.path.getsize(tmp) > 0):
+            return False, sc.ffmpeg_error(getattr(r, 'stderr', '')) or 'ffmpeg produced no output'
+        os.replace(tmp, media)
+        return True, None
+    except pipeline.MediaToolTimeout as e:
+        return False, f'it took too long and was stopped ({e})'
+    except OSError as e:
+        return False, f'the file is in use ({e})'
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _embed_entry(bdir, s):
+    """The caption track of a short's files made to match its .srt now (or removed when it has none). Returns
+    the first reason a file could not take it, or None. Sizes in `s` are brought up to date."""
+    srt = os.path.join(bdir, s['srt']) if s.get('srt') else None
+    why = None
+    for key, size_key in (('file', 'size'), ('delivery', 'delivery_size')):
+        name = s.get(key)
+        if not name:
+            continue
+        ok, err = _embed_srt(os.path.join(bdir, name), srt)
+        if ok:
+            s[size_key] = os.path.getsize(os.path.join(bdir, name))
+        elif why is None:
+            why = f'{name}: {err}'
+    s['embedded'] = bool(srt) and why is None
+    return why
+
+
 def _delivery_name(s):
     return s.get('delivery') or s['file']
 
@@ -1865,6 +1922,7 @@ def _run_render(jid, params):
                 'parts': ([{'name': P.get('name'), 'offset': round(P['offset'], 3),
                             'duration': round(P['duration'], 3)} for P in parts] if multi else None),
                 'options': {'reframe': reframe, 'subtitles': want_captions,
+                            'embed_captions': bool(params.get('embed_captions')),
                             'subtitle_size': params['subtitle_size'],
                             'split_caption': params.get('split_caption') or 'join',
                             'episode_labels': params.get('episode_labels', True),
@@ -2039,6 +2097,10 @@ def _run_render(jid, params):
         if cues:
             sc.write_srt(cues, os.path.join(bdir, name + '.srt'))
             entry['srt'] = name + '.srt'
+        if params.get('embed_captions') and cues and not reel:      # a reel's scenes are joined first, then it gets its own
+            why = _embed_entry(bdir, entry)
+            if why:
+                manifest['warnings'].append(f"Short {n}: the captions could not be embedded ({why}).")
         if _poster(out_path, os.path.join(bdir, name + '.jpg'), entry['duration'] * 0.3):
             entry['thumb'] = name + '.jpg'
         if _make_proxy(out_path, _proxy_path(bdir, name + '.mp4')):
@@ -2204,6 +2266,10 @@ def _build_reels(bdir, manifest, fmt, ext, stem, burn, _unused=False):
         if cues:
             sc.write_srt(cues, os.path.join(bdir, name + '.srt'))
             entry['srt'] = name + '.srt'
+            if (manifest.get('options') or {}).get('embed_captions'):
+                why = _embed_entry(bdir, entry)
+                if why:
+                    manifest['warnings'].append(f"Reel {r}: the captions could not be embedded ({why}).")
         if _poster(mp4, os.path.join(bdir, name + '.jpg'), dur * 0.3):
             entry['thumb'] = name + '.jpg'
         if _make_proxy(mp4, _proxy_path(bdir, name + '.mp4')):
@@ -2536,6 +2602,8 @@ def _render_options(data):
     return {'reframe': reframe,
             'speaker': speaker and reframe != 'fit',
             'subtitles': data.get('subtitles', True) not in (False, 0, '0', 'false', 'off', None),
+            # The captions also go into the file as a subtitle track a player can show or hide (off unless asked).
+            'embed_captions': data.get('embed_captions', False) in (True, 1, '1', 'true', 'on', 'yes'),
             'subtitle_size': data.get('subtitle_size') if data.get('subtitle_size') in sc.SUBTITLE_SIZES else 'm',
             # Where a caption goes over a split screen: on the join between the panes, or low as everywhere else.
             'split_caption': 'low' if data.get('split_caption') == 'low' else 'join',
@@ -4144,7 +4212,7 @@ def api_shorts_project(pid):
 _SEL_TEXT = ('split_caption', 'highlight_color', 'cut_join', 'ending_look', 'ending_motion', 'mode', 'language', 'focus', 'avoid', 'leave_out', 'stt_prompt', 'vision_model', 'story_model',
              'reframe', 'subtitle_size', 'ending', 'format', 'loudness')
 _SEL_NUM = ('min_dur', 'max_dur', 'count', 'vision_frames', 'ending_hold', 'ending_zoom', 'ending_fade', 'ending_sfx_gain', 'ending_sfx_in', 'ending_sfx_out', 'parts_shown')
-_SEL_BOOL = ('word_highlight', 'speaker', 'subtitles', 'episode_labels', 'fade_last', 'caption_drop_sounds', 'caption_drop_speakers')
+_SEL_BOOL = ('word_highlight', 'speaker', 'subtitles', 'embed_captions', 'episode_labels', 'fade_last', 'caption_drop_sounds', 'caption_drop_speakers')
 _SEL_LIST = ('exclude_kinds',)
 _SEL_FILES = re.compile(r'^(?:shorts_file\d{0,2}|shorts_caption\d{0,2}|shorts_sfx|shorts_overlay)$')
 
@@ -4232,7 +4300,7 @@ def _restage(kept):
 
 
 # --- Templates: the Output settings under a name, shared by everyone with Vertical Shorts -----------------
-TEMPLATE_KEYS = ('reframe', 'speaker', 'subtitles', 'subtitle_size', 'split_caption', 'episode_labels', 'episode_text', 'next_text', 'word_highlight',
+TEMPLATE_KEYS = ('reframe', 'speaker', 'subtitles', 'embed_captions', 'subtitle_size', 'split_caption', 'episode_labels', 'episode_text', 'next_text', 'word_highlight',
                  'highlight_color', 'cut_join', 'ending', 'ending_hold', 'ending_zoom', 'ending_look', 'ending_motion',
                  'fade_last', 'ending_fade', 'ending_sfx_gain', 'ending_sfx_in', 'ending_sfx_out', 'format', 'loudness')
 TEMPLATE_NAME_MAX, TEMPLATES_MAX = 60, 100
@@ -4640,10 +4708,13 @@ def api_shorts_batch_captions(bid, index):
     # Not in the picture (or the picture cannot be redone): the .srt is the captions.
     _write_short_srt(bdir, s, cues)
     s['cues'], s['captions_edited'], s['rev'] = cues, True, int(time.time())
+    # The caption track inside the file is kept to match: the .srt alone would leave the old lines in it.
+    embed_why = _embed_entry(bdir, s) if (s.get('embedded') or (m.get('options') or {}).get('embed_captions')) else None
     _write_manifest(bdir, m)
     audit_log('shorts_captions_edit', target=f"{m.get('orig_name')}: {s.get('title')} (.srt)",
               user_id=session.get('user_id'), username=session.get('username'), ip=_client_ip())
-    return jsonify(ok=True, batch=_batch_public(m), srt_only=how == 'frozen')
+    return jsonify(ok=True, batch=_batch_public(m), srt_only=how == 'frozen',
+                   **({'embed_warning': f'The caption track inside the file could not be updated ({embed_why}).'} if embed_why else {}))
 
 
 def _write_short_srt(bdir, s, cues):
@@ -4725,6 +4796,8 @@ def _run_recaption(jid, params):
         _write_short_srt(bdir, s, cues)
         s['cues'], s['captions_edited'], s['rev'] = cues, True, int(time.time())
         s['captions'] = bool(cues)
+        if (m.get('options') or {}).get('embed_captions') or s.get('embedded'):
+            _embed_entry(bdir, s)       # the new files have no caption track yet
         s['size'] = os.path.getsize(os.path.join(bdir, s['file']))
         if delivery:
             s['delivery_size'] = os.path.getsize(os.path.join(bdir, delivery))

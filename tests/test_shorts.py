@@ -741,7 +741,7 @@ def test_generate_without_preview_analyses_then_renders_everything_as_one_job(en
     assert [s['title'] for s in batch['shorts']] == [c['title'] for c in a['candidates']]
     assert [(s['start'], s['end']) for s in batch['shorts']] == \
         [(round(c['start'] * 25) / 25, round(c['end'] * 25) / 25) for c in a['candidates']]
-    assert batch['options'] == {'reframe': 'fit', 'subtitles': False, 'subtitle_size': 'l', 'split_caption': 'join', 'episode_labels': True, 'word_highlight': False, 'highlight_color': None, 'cut_join': None, 'face_detector': None,
+    assert batch['options'] == {'reframe': 'fit', 'subtitles': False, 'embed_captions': False, 'subtitle_size': 'l', 'split_caption': 'join', 'episode_labels': True, 'word_highlight': False, 'highlight_color': None, 'cut_join': None, 'face_detector': None,
                                 'speaker': False, 'ending': 'none', 'ending_hold': None, 'ending_zoom': None, 'ending_look': None, 'ending_motion': None, 'fade_last': False, 'ending_fade': None, 'ending_sfx': None, 'ending_overlay': None, 'format': 'mp4_high',
                                 'format_label': 'MP4 (H.264 High Profile)', 'loudness': -14.0}, \
         'the Output settings sent with the request'
@@ -4415,3 +4415,49 @@ def test_send_all_names_every_file_from_the_prefix_and_the_short_number():
 def test_send_all_asks_for_a_prefix_in_the_page():
     html = open(os.path.join(os.path.dirname(shorts.__file__), 'templates', 'index.html'), encoding='utf-8').read()
     assert "placeholder = 'Filename prefix" in html and 'prefix: pre.value.trim()' in html
+
+
+def _sub_streams(path):
+    r = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 's', '-show_entries', 'stream=codec_name:stream_disposition=default',
+                        '-of', 'json', path], capture_output=True, text=True, check=True)
+    return json.loads(r.stdout).get('streams', [])
+
+
+def _sub_text(path):
+    r = subprocess.run(['ffmpeg', '-v', 'error', '-i', path, '-map', '0:s:0', '-f', 'srt', '-'], capture_output=True, text=True)
+    return r.stdout
+
+
+def test_captions_can_be_embedded_in_the_file_and_stay_in_step_with_corrections(env, monkeypatch):
+    client, headers = _client(user_id=7, role='user', username='ana')
+    batch = _batch(client, headers, env, monkeypatch, subtitles=False, embed_captions=True, format='prores_hq_2997')
+    assert batch['options']['embed_captions'] is True and batch['warnings'] == []
+    bid, s = batch['batch_id'], batch['shorts'][0]
+    bdir = os.path.join(shorts.SHORTS_DIR, bid)
+    mp4, mov = os.path.join(bdir, s['file']), os.path.join(bdir, s['delivery'])
+    for f in (mp4, mov):
+        subs = _sub_streams(f)
+        assert [x['codec_name'] for x in subs] == ['mov_text'], 'a caption track, with the picture and sound copied'
+        assert 'Linya 1 ng usapan.' in _sub_text(f)
+    assert s['size'] == os.path.getsize(mp4) and s['delivery_size'] == os.path.getsize(mov)
+    # Not burned in, so correcting the lines only rewrites the .srt -- and the track in both files.
+    url = f'/api/shorts/batches/{bid}/captions/{s["index"]}'
+    p = client.post(url, headers=headers, json={'cues': [{'start': 0.5, 'end': 1.5, 'text': 'Bagong linya'}]})
+    assert p.status_code == 200 and p.get_json().get('embed_warning') is None, p.get_json()
+    for f in (mp4, mov):
+        assert [x['codec_name'] for x in _sub_streams(f)] == ['mov_text'] and 'Bagong linya' in _sub_text(f)
+        assert 'Linya 1' not in _sub_text(f)
+    # All lines removed: the track goes too.
+    assert client.post(url, headers=headers, json={'cues': []}).status_code == 200
+    assert _sub_streams(mp4) == []
+
+
+def test_embedding_is_off_unless_asked_and_a_template_keeps_it(env, monkeypatch):
+    client, headers = _client(user_id=7, role='user', username='ana')
+    batch = _batch(client, headers, env, monkeypatch)
+    assert batch['options']['embed_captions'] is False
+    s = batch['shorts'][0]
+    assert _sub_streams(os.path.join(shorts.SHORTS_DIR, batch['batch_id'], s['file'])) == []
+    assert 'embed_captions' in shorts.TEMPLATE_KEYS and 'embed_captions' in shorts._SEL_BOOL
+    html = client.get('/').get_data(as_text=True)
+    assert 'id=sh-embed' in html and 'Embed captions in the file' in html and 'embed_captions: shEl' in html

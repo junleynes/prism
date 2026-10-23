@@ -8584,6 +8584,9 @@ document.getElementById('vf').addEventListener('submit', async function(e){
     <div class="sh-chk"><label style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
       <input type=checkbox id=sh-captions checked> Burn in captions
     </label></div>
+    <div class="sh-chk"><label title="Also puts the captions into the video file as a subtitle track (MP4 and MOV/ProRes). The picture is untouched; a player or editor can show or hide the captions (some players show the track by default). Works with or without Burn in captions, and is kept up to date when you correct the captions." style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
+      <input type=checkbox id=sh-embed> Embed captions in the file
+    </label></div>
     <div class="sh-fld"><span class="sh-fld-l">Size</span><select id=sh-caption-size><option value=s>Small</option><option value=m selected>Medium</option><option value=l>Large</option></select></div>
     <div class="sh-fld"><span class="sh-fld-l" title="Where the caption goes while the screen is split in two">Over split screen</span><select id=sh-split-cap><option value=join selected>On the join between the panes</option><option value=low>Low, as in other shots</option></select></div>
     <div class="sh-chk"><label title="Highlight the word being said in the caption. Needs the time of each word, so it applies to captions made by speech-to-text, not to ones read from an uploaded caption file." style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
@@ -9346,6 +9349,7 @@ function shRenderOptions(){
   return {reframe: shEl('sh-reframe').value,
           speaker: shEl('sh-speaker').checked && !shEl('sh-speaker').disabled,
           subtitles: shEl('sh-captions').checked,
+          embed_captions: shEl('sh-embed').checked,
           subtitle_size: shEl('sh-caption-size').value,
           split_caption: shEl('sh-split-cap').value,
           episode_labels: shEl('sh-ep-labels').checked,
@@ -11253,7 +11257,7 @@ async function shCandCaptions(i){
     },
     note: (r.edited ? 'Your corrected captions for this moment.' : 'The automatic captions for this moment, as they will appear.') +
       ' Change the wording, or when a line is on screen; empty a line to drop it. Times are from the start of the short.' +
-      (burning ? '' : ' <b>Burn in captions</b> is off, so these go to the .srt only.') +
+      (burning ? '' : ' <b>Burn in captions</b> is off, so these go to the .srt' + (shEl('sh-embed').checked ? ' and the caption track in the file.' : ' only.')) +
       (r.spoken ? '' : ' Nothing was transcribed for this video, so there are none to start from.'),
     onSave: async function(cues, say){
       // Checked by the server (which also tidies overlaps), then kept with the moment.
@@ -11631,6 +11635,7 @@ async function shBatchCaptions(card, b, s){
         told.style.color = 'var(--phosphor)'
         told.textContent = p.job_id ? 'Rendered again with the corrected captions: ' + (s.title || 'short ' + s.index) + '.'
           : p.srt_only ? 'The .srt was updated. The captions in the picture are unchanged.' : 'Captions saved to the .srt.'
+        if(p.embed_warning){ told.style.color = 'var(--tally)'; told.textContent += ' ' + p.embed_warning }
         fresh.appendChild(told)
       }
     }
@@ -11686,6 +11691,7 @@ function shBatchDetails(b){
     row('Follow the speaker', o.speaker ? 'on' : 'off')]))
   cards.push(card('Captions', [
     row('Burned in', o.subtitles ? 'yes' : 'no'),
+    row('Embedded track', o.embed_captions ? 'yes' : 'no'),
     o.subtitles ? row('Size', {s: 'Small', m: 'Medium', l: 'Large'}[o.subtitle_size] || E(o.subtitle_size || '')) : '',
     o.subtitles ? row('Word highlighting', o.word_highlight ? 'on <span style="display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px;background:#' + E(/^[0-9a-fA-F]{6}$/.test(o.highlight_color || '') ? o.highlight_color : 'FFD400') + '"></span>' : 'off') : '',
     row('EP labels', o.episode_labels === false ? 'off' : E((o.episode_text || 'EP {n}') + ' / ' + (o.next_text || 'NEXT: EP {n} >>')))]))
@@ -12207,7 +12213,7 @@ var SH_SEL = {
          episode_text: 'sh-ep-text', next_text: 'sh-next-text', split_caption: 'sh-split-cap', subtitle_size: 'sh-caption-size', highlight_color: 'sh-hl-color', cut_join: 'sh-cut-join', ending_look: 'sh-ending-look', ending_motion: 'sh-ending-motion', ending: 'sh-ending', format: 'sh-format', loudness: 'sh-level'},
   num: {min_dur: 'sh-min', max_dur: 'sh-max', vision_frames: 'sh-frames', ending_hold: 'sh-ending-hold', ending_zoom: 'sh-ending-zoom',
         ending_fade: 'sh-ending-fade', ending_sfx_gain: 'sh-ending-sfx-gain', ending_sfx_in: 'sh-sfx-in', ending_sfx_out: 'sh-sfx-out'},
-  bool: {word_highlight: 'sh-word-hl', speaker: 'sh-speaker', subtitles: 'sh-captions', episode_labels: 'sh-ep-labels', fade_last: 'sh-fade-last',
+  bool: {word_highlight: 'sh-word-hl', speaker: 'sh-speaker', subtitles: 'sh-captions', embed_captions: 'sh-embed', episode_labels: 'sh-ep-labels', fade_last: 'sh-fade-last',
          caption_drop_sounds: 'sh-cap-sounds', caption_drop_speakers: 'sh-cap-speakers'}
 }
 var SH_SEL_FILES = ['shorts_file', 'shorts_caption', 'shorts_sfx', 'shorts_overlay'].concat(
