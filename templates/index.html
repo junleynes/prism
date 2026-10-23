@@ -881,6 +881,7 @@ input.sh-num[type=number]{width:92px}
 .ws-stage{position:sticky;top:8px;display:flex;flex-direction:column;gap:8px;align-items:stretch}
 .ws-phone{max-width:290px;width:100%;margin:0 auto;cursor:pointer}
 .ws-phone video{object-fit:cover}
+.ws-phone canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
 .ws-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:14px;font-size:12px;color:rgba(255,255,255,.75);pointer-events:none}
 .ws-transport{display:flex;gap:8px;align-items:center}
 .ws-transport input[type=range]{flex:1;margin:0}
@@ -8453,13 +8454,28 @@ document.getElementById('vf').addEventListener('submit', async function(e){
       <option value=highlights>Highlight reel</option>
     </select>
   </div>
-  <div>
+  <div id=sh-md-by-wrap style="display:none">
+    <label for=sh-md-by>Cut the mini-drama by</label>
+    <select id=sh-md-by onchange="shModeSync()">
+      <option value=length selected>Length of each short</option>
+      <option value=episodes>Number of episodes</option>
+    </select>
+  </div>
+  <div id=sh-len-wrap>
     <label>Length of each short (seconds)</label>
     <div style="display:flex;gap:8px;align-items:center">
       <input type=number id=sh-min class=sh-num value=120 min=5 max=240 step=5>
       <span style="font-size:12px;opacity:.7">to</span>
       <input type=number id=sh-max class=sh-num value=180 min=10 max=300 step=5>
     </div>
+  </div>
+  <div id=sh-ep-wrap style="display:none">
+    <label for=sh-episodes>Number of episodes</label>
+    <select id=sh-episodes title="The length of each episode is worked out from this and the story time of the programme">
+      <option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option>
+      <option value=10 selected>10</option><option>12</option><option>15</option><option>20</option><option>25</option>
+      <option>30</option><option>40</option><option>50</option>
+    </select>
   </div>
   <div>
     <label for=sh-count id=sh-count-label>Moments to find</label>
@@ -8477,7 +8493,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   </div>
 </div>
 <p class="sh-note" id=sh-reel-note style="margin-top:6px;display:none">A highlight reel joins the best scenes of the episode into one short. The length above is the length of the whole reel; each scene is found at about a fifth of it, the best-scoring ones are picked until the reel is full, and they play in episode order with a short fade between them. &ldquo;Moments to find&rdquo; becomes the number of reels: several reels never reuse a scene, and &ldquo;Auto&rdquo; makes one. Captions are burned into every scene.</p>
-<p class="sh-note" id=sh-mode-note style="margin-top:6px;display:none">Mini-drama uses every stretch of the story, in order, none skipped. Billboards, credits, host and the other ticked material below are left out and the chapters carry on after them. Each chapter ends at the end of a spoken line, near a shot cut, at the strongest nearby beat. Each chapter opens with an <b>EP n</b> label and, when the next chapter follows on, closes with <b>NEXT: EP n+1 &raquo;</b>. &ldquo;Moments to find&rdquo;, &ldquo;Focus&rdquo; and &ldquo;Avoid&rdquo; do not apply.</p>
+<p class="sh-note" id=sh-mode-note style="margin-top:6px;display:none">Mini-drama uses every stretch of the story, in order, none skipped. Billboards, credits, host and the other ticked material below are left out and the chapters carry on after them. Each chapter ends at the end of a spoken line, near a shot cut, at the strongest nearby beat. Each chapter opens with an <b>EP n</b> label and, when the next chapter follows on, closes with <b>NEXT: EP n+1 &raquo;</b>. Cut it by <b>Length of each short</b> (a range, in seconds) or by <b>Number of episodes</b>: PRISM then works the length out itself from the story time that is left once billboards, credits and the like are taken out, so the episodes come out about equal. &ldquo;Focus&rdquo; and &ldquo;Avoid&rdquo; do not apply.</p>
 <p class="sh-note" id=sh-count-note style="margin-top:6px;display:none"></p>
 <p class="sh-note" style="margin-top:6px">Say what is spoken and the captions and the choice of moments are more accurate than when Whisper guesses from the first seconds, which goes wrong on a programme that opens on music or mixes Filipino and English. Leave it on Auto-detect for a mix of languages.</p>
 </div>
@@ -8716,6 +8732,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
     <section class="ws-stage" aria-label="Preview">
       <div class="sh-cp ws-phone" id=ws-phone style="--cp-px:64">
         <video id=ws-video playsinline preload=auto></video>
+        <canvas id=ws-canvas aria-hidden="true" style="display:none"></canvas>
         <div id=ws-cap class="sh-cp-line"></div>
         <div id=ws-msg class="ws-msg">Select a moment</div>
       </div>
@@ -8889,6 +8906,15 @@ function shModeSync(){
   shEl('sh-count-label').textContent = reel ? 'Reels to make' : 'Moments to find'
   var c = shEl('sh-count'); if(c && c.parentNode) c.parentNode.style.opacity = mini ? '.4' : ''
   if(c) c.disabled = mini
+  // A mini-drama is cut by a length range, or into a number of episodes (the length is then worked out).
+  var eps = mini && shEl('sh-md-by').value === 'episodes'
+  shEl('sh-md-by-wrap').style.display = mini ? '' : 'none'
+  shEl('sh-len-wrap').style.display = eps ? 'none' : ''
+  shEl('sh-ep-wrap').style.display = eps ? '' : 'none'
+  if(c && c.parentNode) c.parentNode.style.display = mini ? 'none' : ''
+}
+function shEpisodesWanted(){
+  return shEl('sh-mode').value === 'minidrama' && shEl('sh-md-by').value === 'episodes' ? parseInt(shEl('sh-episodes').value, 10) : 0
 }
 
 function shCountNote(){
@@ -9397,7 +9423,7 @@ async function shortsAnalyze(auto){
   if(!project){ shNote('Open the project these shorts are for first.', true); return }
   if(!hasLocal && !net){ shNote('Pick a video first, using Browse library.', true); return }
   var minD = parseFloat(shEl('sh-min').value), maxD = parseFloat(shEl('sh-max').value)
-  if(!(minD >= 5) || !(maxD >= minD + 5)){
+  if(!shEpisodesWanted() && (!(minD >= 5) || !(maxD >= minD + 5))){
     shNote('The maximum length must be at least 5 seconds more than the minimum.', true); return
   }
   var fd = new FormData()
@@ -9416,6 +9442,7 @@ async function shortsAnalyze(auto){
   fd.append('min_dur', minD); fd.append('max_dur', maxD)
   fd.append('count', shEl('sh-count').value)
   fd.append('mode', shEl('sh-mode').value)
+  if(shEpisodesWanted()) fd.append('episodes', String(shEpisodesWanted()))
   fd.append('focus', shEl('sh-focus').value)
   fd.append('avoid', shEl('sh-avoid').value)
   fd.append('leave_out', shEl('sh-leave-out').value)
@@ -10325,7 +10352,7 @@ function shWsProxyEnsure(k, retry){
 function shWsProxyNote(){
   var el = shEl('ws-live-note'); if(!el) return
   var c = WS.selC, px = c && WS.proxy[shWsPartOf(c)], t = ''
-  if(px && px.state === 'ready') t = WS.live ? 'Live: in, out, cuts and framing show as you change them. Captions are approximate; <b>Exact render</b> shows the finished look.' : ''
+  if(px && px.state === 'ready') t = WS.live ? 'Live: in, out, cuts, framing and captions show as you change them, drawn as the render will make them.' : ''
   else if(px && px.state === 'building') t = (px.waiting ? 'A fast editing copy of this episode will be made once the server is free of other jobs.' : 'Preparing a fast editing copy of this episode (once, at low priority).') + ' Until it is ready, a change shows after a short wait.'
   el.innerHTML = t
   shWsExactBtn()
@@ -10337,7 +10364,6 @@ function shWsLive(c, tok, newMoment){
   WS.live = true; WS.exact = false; WS.loadedC = c; WS.dur = c.end - c.start
   WS.base = c.start - (px.offset || 0) - WS.lead
   shWsVideoFill(true); shWsCapVis(); shWsMsg(''); shWsProxyNote()
-  v.style.objectFit = 'fill'
   shEl('ws-scrub').max = shWsTotal()
   if(WS.liveUrl !== px.url){
     WS.liveUrl = px.url; v.src = px.url; v.load(); v.currentTime = WS.base + WS.lead
@@ -10356,45 +10382,185 @@ function shWsLive(c, tok, newMoment){
       .then(function(r){ if(tok !== WS.token || !WS.live) return; WS.cues = r && r.ok ? r.cues : []; shWsPaint() })
       .catch(function(){})
   }, newMoment ? 0 : 250)
-  // Shots for the 9:16 window: kept while the moment only shrinks, worked out again when it reaches past them.
-  var d = WS.liveShots
-  if(!d || WS.liveShotsC !== c || c.start < d.start - 0.01 || c.end > d.end + 0.01){
-    clearTimeout(WS.shotT)
-    WS.shotT = setTimeout(function(){
-      if(WS.selC !== c) return
-      Promise.resolve(shShotsFor(c)).then(function(dd){
-        if(WS.selC !== c || !dd || !dd.ok) return
-        WS.liveShots = dd; WS.liveShotsC = c; shWsPaint()
-      }).catch(function(){})
-    }, newMoment ? 0 : 400)
-  }
+  // The exact framing of every frame, as numbers: drawn at once from the plan in hand, then from the one for
+  // the new in/out as soon as the server has it.
+  shWsPlanWant(c, newMoment)
 }
 
-// The 9:16 window for the shot on screen: the plan's, or the editor's correction, laid over the copy.
-function shWsLiveFrame(c, t){
-  var v = shEl('ws-video'), d = WS.liveShots
-  if(!d || !d.shots || !d.shots.length){ v.style.objectFit = 'cover'; v.style.width = '100%'; v.style.left = '0'; return }
-  var draft = WS.liveDraft !== undefined ? WS.liveDraft : (c.framing || null)
-  var sh = null
-  d.shots.forEach(function(s){ if(t >= s.start - 1e-6 && (t < s.end || (s === d.shots[d.shots.length - 1] && t <= s.end + 1e-6))) sh = s })
-  if(!sh) sh = d.shots[0]
-  var layout = sh.auto === 'fit' ? 'fit' : sh.auto === 'split' ? 'split' : 'crop', x = sh.x
-  ;((draft && draft.shots) || []).forEach(function(o){
-    if(o.at >= sh.start - 1e-6 && o.at <= sh.end + 1e-6 && o.layout !== 'auto'){ layout = o.layout; if(o.layout === 'crop' && o.x != null) x = o.x }
-  })
-  v.style.height = '100%'
-  if(layout === 'fit' || layout === 'split'){
-    // The whole picture across the width (split screen is shown whole here; the exact render stacks the two panes).
-    v.style.objectFit = 'contain'; v.style.width = '100%'; v.style.left = '0'
-    return
-  }
-  if(x == null) x = (d.max_x || 0) / 2
-  x = Math.max(0, Math.min(d.max_x != null ? d.max_x : x, x))
-  // The window is crop_w wide in a frame disp_w wide: scale the picture so the window fills the phone, then slide it.
-  v.style.objectFit = 'fill'
-  v.style.width = (d.disp_w / d.crop_w * 100) + '%'
-  v.style.left = (-x / d.crop_w * 100) + '%'
+// ---- Live 9:16 compositor ----
+// The moment is drawn on a canvas from the editing copy exactly as the render builds it: the crop window (or
+// its path, when it follows someone), the fit layout over its blurred copy, the two panes of a split screen with
+// the line between them, and the captions in the render's font, size, outline and place. The numbers come from
+// the server's plan for the moment (/api/shorts/liveplan, corrections included); drawing them costs nothing, so
+// trimming, cutting and reframing show on the next frame.
+var SH_HL_HEX = {yellow: 'FFD400', green: '39E75F', cyan: '2EDFFF', orange: 'FF8A1F', pink: 'FF4FA3'}
+var SH_CAP_PX = {s: 52, m: 64, l: 78}
+function shWsPlanBody(c){
+  var o = shRenderOptions(), draft = WS.liveDraft !== undefined ? WS.liveDraft : (c.framing || null)
+  return {analysis_id: SH.analysis.analysis_id, start: c.start, end: c.end, reframe: o.reframe, speaker: o.speaker,
+          framing: draft, captions: c.captions || null, subtitles: false}
 }
+function shWsPlanWant(c, now){
+  if(!c || !SH.analysis) return
+  var body = shWsPlanBody(c), key = JSON.stringify(body)
+  if(WS.plan && WS.planKey === key) return
+  clearTimeout(WS.planT)
+  // A new in or out point means a new plan (faces looked for again), so it waits for the dragging to stop; a
+  // correction to the framing is answered from the plan already worked out, so it goes at once.
+  var sameRange = WS.plan && WS.planC === c && Math.abs(WS.plan.c0 - c.start) < 1e-6 && Math.abs(WS.plan.c1 - c.end) < 1e-6
+  WS.planT = setTimeout(function(){
+    if(WS.selC !== c) return
+    var tok = (WS.planTok = (WS.planTok || 0) + 1)
+    shWsPost('/api/shorts/liveplan', body).then(function(r){
+      if(tok !== WS.planTok || WS.selC !== c || !r || !r.ok) return
+      r.c0 = body.start; r.c1 = body.end
+      WS.plan = r; WS.planKey = key; WS.planC = c
+      shWsDraw()
+    }).catch(function(){})
+  }, now ? 0 : (sameRange ? 60 : 500))
+}
+function shWsSegAt(P, n){
+  var S = P.segs, i
+  if(!S.length) return null
+  for(i = 0; i < S.length; i++) if(n >= S[i].a && n <= S[i].b) return S[i]
+  return n < S[0].a ? S[0] : S[S.length - 1]
+}
+function shWsXAt(P, g, n){
+  var mx = Math.max(0, P.disp_w - P.crop_w)
+  var x = g.x
+  if(g.keys && g.keys.length){
+    var K = g.keys, i
+    if(n <= K[0][0]) x = K[0][1]
+    else if(n >= K[K.length - 1][0]) x = K[K.length - 1][1]
+    else for(i = 0; i + 1 < K.length; i++) if(n >= K[i][0] && n < K[i + 1][0]){ x = K[i][1] + (K[i + 1][1] - K[i][1]) * (n - K[i][0]) / (K[i + 1][0] - K[i][0]); break }
+  }
+  if(x == null) x = mx / 2
+  return Math.max(0, Math.min(mx, x))
+}
+function shWsCanvasOn(on){
+  var cv = shEl('ws-canvas'), v = shEl('ws-video')
+  if(!cv) return
+  cv.style.display = on ? '' : 'none'
+  v.style.opacity = on ? '0' : ''
+}
+// Words laid out the way libass does with WrapStyle 0: one line when it fits, else as few lines as needed,
+// as even as they can be, the upper one the longer.
+function shWsWrap(ctx, words, maxW){
+  var sp = ctx.measureText(' ').width, ws = words.map(function(w){ return ctx.measureText(w).width })
+  var total = ws.reduce(function(a, b){ return a + b }, 0) + sp * Math.max(0, words.length - 1)
+  if(total <= maxW || words.length < 2) return [words.map(function(_, i){ return i })]
+  for(var n = 2; n <= words.length; n++){
+    var target = total / n, lines = [], cur = [], w = 0, ok = true
+    for(var i = 0; i < words.length; i++){
+      var add = (cur.length ? sp : 0) + ws[i]
+      if(cur.length && (w + add > maxW || (w >= target && lines.length < n - 1))){ lines.push(cur); cur = []; w = 0; add = ws[i] }
+      cur.push(i); w += add
+    }
+    lines.push(cur)
+    lines.forEach(function(L){ var lw = L.reduce(function(a, k, j){ return a + ws[k] + (j ? sp : 0) }, 0); if(lw > maxW + 0.5 && L.length > 1) ok = false })
+    if(ok && lines.length <= n) return lines
+  }
+  return words.map(function(_, i){ return [i] })
+}
+function shWsCueWords(q){
+  if(q.words && q.words.length) return q.words
+  var toks = String(q.text || '').split(/\s+/).filter(Boolean), total = 0, at = q.start, out = []
+  toks.forEach(function(t){ total += t.length + 1 })
+  toks.forEach(function(t){ var d = (q.end - q.start) * (t.length + 1) / total; out.push([at, at + d, t]); at += d })
+  return out
+}
+function shWsDrawCaption(ctx, W, H, P, tv, n){
+  if(!shEl('sh-captions').checked || shEl('sh-captions').disabled) return
+  var q = null
+  ;(WS.cues || []).forEach(function(x){ if(x.text && x.text.trim() && x.start <= tv + 1e-6 && tv < x.end - 1e-6) q = x })
+  if(!q) return
+  var k = H / 1920, px = SH_CAP_PX[shEl('sh-caption-size').value] || 64
+  var font = (P && P.style && P.style.font) || 'Arial'
+  // ASS sizes a font by its full height (ascent + descent), CSS by its em; measured against libass, 1.12 em.
+  ctx.font = 'bold ' + (px * k / 1.12) + 'px "' + font + '", Arial, Helvetica, sans-serif'
+  ctx.textBaseline = 'alphabetic'
+  var text = String(q.text).replace(/\s+/g, ' ').trim(), words = text.split(' ')
+  var lines = shWsWrap(ctx, words, W - 2 * 80 * k)
+  var asc = px * k * (1854 / 2355), lineH = px * k        // Arial: ascent 1854 of 2355 units of full height
+  // Over a split screen the caption sits on the join, unless it was asked to stay low.
+  var seam = false
+  if(P && shEl('sh-split-cap').value !== 'low'){
+    var mid = n + Math.round(((q.start + q.end) / 2 - tv) * P.fps)        // the frame at the middle of the cue
+    P.segs.forEach(function(g){ if(g.layout === 'split' && g.a <= mid && mid <= g.b) seam = true })
+  }
+  var top = seam ? H / 2 - lines.length * lineH / 2 : H - 1920 * 0.23 * k - lines.length * lineH
+  var hl = shEl('sh-word-hl').checked ? '#' + (SH_HL_HEX[shEl('sh-hl-color').value] || (/^[0-9a-fA-F]{6}$/.test(shEl('sh-hl-color').value) ? shEl('sh-hl-color').value : 'FFD400')) : null
+  var lit = -1
+  if(hl){
+    var W2 = shWsCueWords(q)
+    if(W2.map(function(w){ return w[2] }).join(' ') === text){
+      W2.forEach(function(w, i){ var a = i === 0 ? q.start : Math.max(q.start, w[0]), b = i === W2.length - 1 ? q.end : W2[i + 1][0]; if(tv >= a - 1e-6 && tv < b) lit = i })
+    }
+  }
+  var sp = ctx.measureText(' ').width, ol = Math.max(3, Math.floor(px / 15)) * k
+  var place = []
+  lines.forEach(function(L, li){
+    var lw = L.reduce(function(a, i, j){ return a + ctx.measureText(words[i]).width + (j ? sp : 0) }, 0)
+    var x = (W - lw) / 2, y = top + li * lineH + asc
+    L.forEach(function(i){ place.push([i, x, y]); x += ctx.measureText(words[i]).width + sp })
+  })
+  ctx.lineJoin = 'round'; ctx.miterLimit = 2
+  // Shadow (the outlined text, 2 px down and right, 59 % black), then the outline, then the fill.
+  ctx.strokeStyle = ctx.fillStyle = 'rgba(0,0,0,0.41)'; ctx.lineWidth = 2 * ol
+  place.forEach(function(p){ ctx.strokeText(words[p[0]], p[1] + 2 * k, p[2] + 2 * k); ctx.fillText(words[p[0]], p[1] + 2 * k, p[2] + 2 * k) })
+  ctx.strokeStyle = '#000'
+  place.forEach(function(p){ ctx.strokeText(words[p[0]], p[1], p[2]) })
+  place.forEach(function(p){ ctx.fillStyle = p[0] === lit ? hl : '#fff'; ctx.fillText(words[p[0]], p[1], p[2]) })
+}
+function shWsDraw(mediaTime){
+  var cv = shEl('ws-canvas'), v = shEl('ws-video'), c = WS.selC
+  if(!cv) return
+  if(!WS.live || WS.exact || !c || !v.videoWidth){ shWsCanvasOn(false); return }
+  shWsCanvasOn(true)
+  var dpr = Math.min(2, window.devicePixelRatio || 1), W = Math.round(cv.clientWidth * dpr), H = Math.round(W * 16 / 9)
+  if(!W) return
+  if(cv.width !== W || cv.height !== H){ cv.width = W; cv.height = H }
+  var ctx = cv.getContext('2d'), P = WS.plan && WS.planC === c ? WS.plan : null
+  var vt = mediaTime != null ? mediaTime : v.currentTime, abs = vt + (c.start - WS.lead - WS.base)
+  var vw = v.videoWidth, vh = v.videoHeight
+  var dw = P ? P.disp_w : vw, dh = P ? P.disp_h : vh, kx = vw / dw, ky = vh / dh
+  var n = P ? Math.round((abs - P.start) * P.fps) : null
+  var g = P ? shWsSegAt(P, n) : null, layout = g ? g.layout : 'crop'
+  ctx.filter = 'none'; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H)
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'
+  if(layout === 'fit'){
+    // The render's background: the picture filling the frame, heavily blurred, its brightness (not its colour)
+    // brought down. Drawn a blur's width larger all round, so the blur does not pull black in at the edges.
+    var s = Math.max(W / dw, H / dh), bw = dw * s, bh = dh * s, br = W * 0.035
+    ctx.filter = 'blur(' + br.toFixed(1) + 'px) brightness(0.74) saturate(1.45)'
+    ctx.drawImage(v, 0, 0, vw, vh, (W - bw) / 2 - 2 * br, (H - bh) / 2 - 2 * br, bw + 4 * br, bh + 4 * br)
+    ctx.filter = 'none'
+    var f = Math.min(W / dw, H / dh), fw = dw * f, fh = dh * f
+    ctx.drawImage(v, 0, 0, vw, vh, (W - fw) / 2, (H - fh) / 2, fw, fh)
+  } else if(layout === 'split'){
+    var sw = g.size[0], sh = g.size[1], p0 = g.panes[0], p1 = g.panes[1]
+    ctx.drawImage(v, p0[0] * kx, p0[1] * ky, sw * kx, sh * ky, 0, 0, W, H / 2)
+    ctx.drawImage(v, p1[0] * kx, p1[1] * ky, sw * kx, sh * ky, 0, H / 2, W, H / 2)
+    ctx.fillStyle = 'rgba(0,0,0,0.85)'; ctx.fillRect(0, H / 2 - 3 * H / 1920, W, 6 * H / 1920)
+  } else {
+    // Before the plan arrives: the window in the middle, the size the render uses.
+    var cw = P ? P.crop_w : Math.min(dw, dh * 9 / 16), ch = P ? P.crop_h : dh, cy = P ? P.crop_y : 0
+    var x = g ? shWsXAt(P, g, n) : (dw - cw) / 2
+    ctx.drawImage(v, x * kx, cy * ky, cw * kx, ch * ky, 0, 0, W, H)
+  }
+  shWsDrawCaption(ctx, W, H, P, vt - WS.base, n)
+}
+// Every decoded frame is drawn as it is shown (requestVideoFrameCallback), so the window moves with the picture.
+;(function(){
+  var v = shEl('ws-video')
+  if(!v || !v.requestVideoFrameCallback) return
+  function onFrame(now, meta){ if(WS.live && !WS.exact) shWsDraw(meta && meta.mediaTime); v.requestVideoFrameCallback(onFrame) }
+  v.requestVideoFrameCallback(onFrame)
+  window.addEventListener('resize', function(){ shWsDraw() })
+  ;['sh-reframe', 'sh-speaker'].forEach(function(id){ var el = shEl(id); if(el) el.addEventListener('change', function(){ if(WS.live && WS.selC) shWsPlanWant(WS.selC, true) }) })
+  ;['sh-captions', 'sh-caption-size', 'sh-split-cap', 'sh-word-hl', 'sh-hl-color'].forEach(function(id){ var el = shEl(id); if(el){ el.addEventListener('change', function(){ shWsDraw() }); el.addEventListener('input', function(){ shWsDraw() }) } })
+})()
+function shWsLiveFrame(c, t){ shWsDraw() }
 
 function shWsLoad(delay, raw){
   clearTimeout(WS.loadT)
@@ -10407,7 +10573,7 @@ function shWsLoad(delay, raw){
   var stay = !!(c && a && !raw && WS.live && shWsLiveReady(c))     // an edit in the live view: playing carries on
   if(!stay) shWsStop()
   WS.exact = false; shWsCapVis()
-  if(!c || !a){ WS.live = false; WS.liveUrl = null; shWsVideoFill(false); shWsProxyNote(); v.removeAttribute('src'); shWsMsg('Select a moment'); return }
+  if(!c || !a){ WS.live = false; WS.liveUrl = null; shWsVideoFill(false); shWsCanvasOn(false); shWsProxyNote(); v.removeAttribute('src'); shWsMsg('Select a moment'); return }
   var prevC = WS.loadedC
   WS.loadedC = c
   WS.dur = c.end - c.start
@@ -10415,7 +10581,7 @@ function shWsLoad(delay, raw){
   WS.lead = WS.beyond ? Math.max(0, Math.min(WS_BEYOND, c.start - bnd[0])) : 0
   WS.tail = WS.beyond ? Math.max(0, Math.min(WS_BEYOND, bnd[1] - c.end)) : 0
   if(!raw && shWsLiveReady(c)){ shWsLive(c, tok, prevC !== c); return }
-  WS.live = false; WS.liveUrl = null; shWsVideoFill(false); shWsProxyNote()
+  WS.live = false; WS.liveUrl = null; shWsVideoFill(false); shWsCanvasOn(false); shWsProxyNote()
   WS.cues = []
   shEl('ws-cap').textContent = ''
   // The exact 9:16 copy (framing, corrections and captions in) is what opens, unless it is switched off or the
@@ -10445,6 +10611,7 @@ function shWsPaint(){
   var line = ''
   if(!WS.exact) WS.cues.forEach(function(q){ if(q.text && q.text.trim() && q.start <= tv + 1e-6 && tv < q.end - 1e-6) line = q.text.replace(/\s+/g, ' ').trim() })
   var cap = shEl('ws-cap')
+  if(WS.live && !WS.exact) line = ''          // the live view draws its captions itself, as the render will
   if(cap.textContent !== line) cap.textContent = line
   if(WS.onPaint) WS.onPaint()
   if(WS.live) shWsLiveFrame(c, c.start + t)
@@ -10547,7 +10714,7 @@ function shWsExactBtn(){
   if(WS.selC && shWsLiveReady(WS.selC)){
     b.textContent = 'Exact render'; b.setAttribute('aria-pressed', WS.exact ? 'true' : 'false')
     b.style.borderColor = WS.exact ? 'var(--accent, #34e6c5)' : ''
-    b.title = 'The editing view is live and approximate (captions, split screen, speaker following). This renders the exact 9:16 copy once.'
+    b.title = 'The editing view is drawn live from a small copy of the episode. This renders the real 9:16 file once (the ending, sound and full sharpness included).'
     return
   }
   var on = shWsExactOn()
@@ -10561,10 +10728,10 @@ async function shWsExact(draft, force){
   if(!c || !a) return
   // The framing being worked on is laid over the live copy at once; only "Exact render" makes the real one.
   if(!force && !WS.wantExact && shWsLiveReady(c)){
-    if(WS.live && WS.loadedC === c){ WS.liveDraft = draft; shWsPaint() } else { shWsLoad(0); WS.liveDraft = draft; shWsPaint() }
+    if(WS.live && WS.loadedC === c){ WS.liveDraft = draft; shWsPaint(); shWsPlanWant(c) } else { shWsLoad(0); WS.liveDraft = draft; shWsPaint(); shWsPlanWant(c) }
     return
   }
-  WS.live = false; WS.liveUrl = null; shWsVideoFill(false)
+  WS.live = false; WS.liveUrl = null; shWsVideoFill(false); shWsCanvasOn(false)
   WS.draft = draft; WS.exactTry = !!force
   var tok = ++WS.token
   shWsStop()
@@ -12208,7 +12375,7 @@ function shCreateSync(){
 // it is opened: after a refresh, in another browser, after the server has restarted. A file picked with Browse
 // library is kept by where it lives on the share; one uploaded from the computer cannot be.
 var SH_SEL = {
-  text: {mode: 'sh-mode', count: 'sh-count', language: 'sh-language', focus: 'sh-focus', avoid: 'sh-avoid', leave_out: 'sh-leave-out',
+  text: {mode: 'sh-mode', md_by: 'sh-md-by', episodes: 'sh-episodes', count: 'sh-count', language: 'sh-language', focus: 'sh-focus', avoid: 'sh-avoid', leave_out: 'sh-leave-out',
          stt_prompt: 'sh-stt-prompt', vision_model: 'sh-vision-model', story_model: 'sh-story-model', reframe: 'sh-reframe',
          episode_text: 'sh-ep-text', next_text: 'sh-next-text', split_caption: 'sh-split-cap', subtitle_size: 'sh-caption-size', highlight_color: 'sh-hl-color', cut_join: 'sh-cut-join', ending_look: 'sh-ending-look', ending_motion: 'sh-ending-motion', ending: 'sh-ending', format: 'sh-format', loudness: 'sh-level'},
   num: {min_dur: 'sh-min', max_dur: 'sh-max', vision_frames: 'sh-frames', ending_hold: 'sh-ending-hold', ending_zoom: 'sh-ending-zoom',

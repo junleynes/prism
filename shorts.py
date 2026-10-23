@@ -956,7 +956,7 @@ def _run_analysis(jid, params):
         offset += float(info['duration'])
     duration = offset
     fps = parts[0]['fps']
-    if duration < (5 if listed else min_dur + 5):
+    if duration < (5 if (listed or params.get('episodes')) else min_dur + 5):
         report(error=f'This video is only {duration:.0f}s long -- too short to cut '
                          f'{int(min_dur)}-{int(max_dur)}s shorts from. Lower the minimum length or use a longer source.'
                      if n_parts == 1 else
@@ -1196,12 +1196,13 @@ def _run_analysis(jid, params):
     # their own frames and their sound -- can change which make the list.
     pool = min(SHORTS_MAX_ITEMS * 2, int(math.ceil(limit * 1.5)) + 2)
     minidrama = params.get('mode') == 'minidrama' and not listed
+    episodes = params.get('episodes') if minidrama else None
     if listed:
         cands, edges_moved = _listed_candidates(params['moments'], parts, segments, fps, warnings)
     elif minidrama:
         # The whole drama as consecutive chapters: nothing to rank or refine.
-        cands = sc.plan_chapters(duration, blocked, segments, cuts, visual, words, min_dur, max_dur,
-                                 fps=fps, walls=walls, limit=SHORTS_MAX_ITEMS)
+        cands, min_dur, max_dur = _plan_minidrama(episodes, duration, blocked, segments, cuts, visual, words,
+                                                  min_dur, max_dur, fps, walls)
         edges_moved = 0
         # A part that gave no chapter is said so, with what was left out of it.
         for k, P in enumerate(parts):
@@ -1272,8 +1273,8 @@ def _run_analysis(jid, params):
         blocked = sc.not_story_ranges(skips, segments, visual, shots, editor_out, kinds=params.get('exclude_kinds'), fixed=vo_fixed)
         if minidrama:
             # What the closer look found is out of the programme: the chapters are cut again around it.
-            cands = sc.plan_chapters(duration, blocked, segments, cuts, visual, words, min_dur, max_dur,
-                                     fps=fps, walls=walls, limit=SHORTS_MAX_ITEMS)
+            cands, min_dur, max_dur = _plan_minidrama(episodes, duration, blocked, segments, cuts, visual, words,
+                                                      min_dur, max_dur, fps, walls)
             gone = 0
         else:
             cands, gone = sc.clear_of(cands, blocked + wall_ranges, min_dur, fps)
@@ -1292,6 +1293,9 @@ def _run_analysis(jid, params):
     cands = cands if listed else cands[:SHORTS_MAX_ITEMS] if minidrama else sc.dedupe_windows(cands)[:max(1, int(limit))]
     for n, c in enumerate(cands, 1):
         c['id'] = f'c{n}'
+    if episodes and len(cands) != episodes:
+        warnings.append(f"{episodes} episode{'' if episodes == 1 else 's'} were asked for and {len(cands)} could be cut: "
+                        'chapters end on a spoken line and never run across what was left out as not part of the drama.')
     if lengths.get('too_short'):
         k = lengths['too_short']
         warnings.append(f"{k} moment{'' if k == 1 else 's'} the story model picked could not be brought up to the "
@@ -1330,6 +1334,7 @@ def _run_analysis(jid, params):
         'project_id': params.get('project_id'),
         'candidates': cands, 'warnings': warnings,
         'options': {'min_dur': min_dur, 'max_dur': max_dur, 'count': 'auto' if auto else count,
+                    'episodes': episodes or None,
                     'focus': params.get('focus'), 'avoid': params.get('avoid'),
                     'exclude_kinds': sorted(params.get('exclude_kinds') or []), 'mode': params.get('mode') or 'moments',
                     'language': params.get('language'), 'stt_prompt': params.get('stt_prompt'),
@@ -1354,9 +1359,56 @@ def _run_analysis(jid, params):
     analysis_store(aid, stored)
     for P in parts:
         _touch(P['path'])
+    if SHORTS_PROXY and not params.get('render'):
+        _analysis_proxies(parts, report)
     report(percent=100, step='Done', done=True,
            result={'analysis_id': aid, 'candidates': len(cands)})
     return aid
+
+
+def _analysis_proxies(parts, report):
+    """The editing copy of each part, made as the last step of the analysis -- after the cut detection and the
+    frame rating, never alongside them -- so the moments open straight into the live view, with nothing left to
+    prepare. A copy already there (the same file analysed before) is used as it is."""
+    threads = max(2, (os.cpu_count() or 4) // 2)
+    for k, P in enumerate(parts):
+        name = _proxy_name(P['path'])
+        out_path = os.path.join(app.config['UPLOAD_FOLDER'], name)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            continue
+        with _PROXY_LOCK:
+            if (_PROXY_JOBS.get(name) or {}).get('state') == 'building':
+                continue                 # already being made (the editor asked for it): it will be there
+            _PROXY_JOBS[name] = {'state': 'building', 'error': ''}
+        report(percent=97, step='Making the editing copy' + (f' of part {k + 1}' if len(parts) > 1 else ''))
+        _proxy_build(P['path'], out_path, (P.get('info') or {}).get('audio_take'), name, threads=threads)
+
+
+def _plan_minidrama(episodes, duration, blocked, segments, cuts, visual, words, min_dur, max_dur, fps, walls):
+    """(chapters, min_dur, max_dur). With a length range, the chapters are cut to it. With a number of episodes
+    the length is worked out: the story time left after what is not story, divided by the number wanted, and tried
+    again with the target moved until that many chapters come out (a chapter ends on a spoken line, so the count
+    can be off by one for a first try). The range returned is what the chapters came to."""
+    if not episodes:
+        return sc.plan_chapters(duration, blocked, segments, cuts, visual, words, min_dur, max_dur,
+                                fps=fps, walls=walls, limit=SHORTS_MAX_ITEMS), min_dur, max_dur
+    story = sum(b - a for a, b in sc.story_spans(duration, blocked, walls, min_len=1.0))
+    target = story / float(episodes) if story > 0 else float(duration) / episodes
+    best = None
+    for _ in range(16):
+        lo, hi = max(3.0, target * 0.35), max(6.0, target * 1.4)
+        cands = sc.plan_chapters(duration, blocked, segments, cuts, visual, words, lo, hi, fps=fps, walls=walls,
+                                 target=target, limit=SHORTS_MAX_ITEMS)
+        if best is None or abs(len(cands) - episodes) < abs(len(best) - episodes):
+            best = cands
+        if len(cands) == episodes:
+            break
+        target *= min(2.0, max(0.5, (len(cands) or 0.5 * episodes) / float(episodes)))
+    cands = best or []
+    if cands:
+        lens = [c['duration'] for c in cands]
+        return cands, max(1, int(math.floor(min(lens)))), int(math.ceil(max(lens)))
+    return cands, min_dur, max_dur
 
 
 def _refine_by_part(cands, parts, blocked, min_dur, max_dur):
@@ -2745,6 +2797,14 @@ def api_shorts_options():
                    ending_fade_range=list(sc.FADE_RANGE))
 
 
+def _episodes_wanted():
+    """How many episodes a mini-drama is to be cut into, when the editor chose that instead of a length."""
+    if (request.form.get('mode') or '').strip().lower() != 'minidrama':
+        return None
+    raw = (request.form.get('episodes') or '').strip()
+    return _form_num('episodes', 0, 1, SHORTS_MAX_ITEMS, int) or None if raw else None
+
+
 @app.route('/api/shorts/analyze', methods=['POST'])
 @require_permission('vertical_shorts')
 def api_shorts_analyze():
@@ -2755,7 +2815,7 @@ def api_shorts_analyze():
     # that is about to be refused anyway.
     min_dur = _form_num('min_dur', 120, 5, 240)
     max_dur = _form_num('max_dur', 180, 10, SHORTS_MAX_CLIP)
-    if max_dur < min_dur + 5:
+    if max_dur < min_dur + 5 and not _episodes_wanted():
         return jsonify(error='The maximum length must be at least 5 seconds more than the minimum.'), 400
     # Before the source too, for the same reason: shorts are filed under a
     # project, and without one there is nowhere for them to go.
@@ -2793,6 +2853,7 @@ def api_shorts_analyze():
         'focus': ' '.join((request.form.get('focus') or '').split())[:300] or None,
         'avoid': ' '.join((request.form.get('avoid') or '').split())[:300] or None,
         'exclude_kinds': sc.parse_exclude_kinds(request.form.get('exclude_kinds')),
+        'episodes': _episodes_wanted(),
         'mode': ((request.form.get('mode') or '').strip().lower()
                  if (request.form.get('mode') or '').strip().lower() in ('minidrama', 'highlights') else 'moments'),
         'leave_out': leave_out, 'leave_out_parts': leave_parts,
@@ -3045,7 +3106,7 @@ def _proxy_name(path):
     return 'shproxy_' + hashlib.sha1(key.encode()).hexdigest()[:16] + '.mp4'
 
 
-def _proxy_build(src, out_path, take, name):
+def _proxy_build(src, out_path, take, name, threads=None):
     """Whole-part, browser-playable, keyframe every second: lets the editor seek anywhere at once. Written under
     a private name and renamed into place only when complete, so a half file is never handed out."""
     part = os.path.join(app.config['UPLOAD_FOLDER'], f'shpart_{secrets.token_hex(6)}.mp4')
@@ -3054,9 +3115,10 @@ def _proxy_build(src, out_path, take, name):
         sound = (['-filter_complex', sc.take_to_stereo(take) + '[a]', '-map', '0:v:0', '-map', '[a]']
                  if take else ['-map', '0:v:0', '-map', '0:a:0?'])
         pre, flags = _low_priority()
-        r = subprocess.run([pipeline.FFMPEG, '-y', '-threads', str(_PROXY_THREADS), '-i', src] + sound +
+        threads = int(threads or _PROXY_THREADS)
+        r = subprocess.run([pipeline.FFMPEG, '-y', '-threads', str(threads), '-i', src] + sound +
                            ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-g', '25', '-keyint_min', '25',
-                            '-threads', str(_PROXY_THREADS), '-sc_threshold', '0',
+                            '-threads', str(threads), '-sc_threshold', '0',
                             '-vf', f"scale=-2:'min({SHORTS_PROXY_HEIGHT},ih)'", '-pix_fmt', 'yuv420p',
                             '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-movflags', '+faststart', part],
                            capture_output=True, text=True, timeout=max(pipeline.FFMPEG_TIMEOUT, 7200),
@@ -3815,6 +3877,69 @@ def _overlay_preview_cmd(still, held, n, fps, w, h, overlay, lead_src, out):
         '-movflags', '+faststart', out]
 
 
+@app.route('/api/shorts/liveplan', methods=['POST'])
+@require_permission('vertical_shorts')
+def api_shorts_liveplan():
+    """Everything the editor's live 9:16 view needs to draw a moment exactly as the render will -- the
+    framing of every frame (crop window or its path, fit, the two panes of a split), with the editor's
+    corrections, and the captions with their style -- as numbers, not as a video. The browser draws it from
+    the episode's editing copy, so a change is seen at once and nothing is encoded."""
+    data = request.get_json(silent=True) or {}
+    a, start_f, end_f, err = _moment_request(data)
+    if err:
+        return err
+    opts = _render_options(data)
+    info = a['info']
+    fps = info['fps']
+    off = a.get('_offset', 0.0)
+    duration = float(info['duration']) + off
+    framing, bad = _parse_framing(data.get('framing'), 'This moment', duration)
+    if bad:
+        return jsonify(ok=False, error=bad), 400
+    captions, bad = _parse_captions(data.get('captions'), 'This moment', duration)
+    if bad:
+        return jsonify(ok=False, error=bad), 400
+    local = _localize_item({'start': 0.0, 'end': 0.0, 'framing': framing, 'captions': captions}, off)
+    item = {'framing': local.get('framing'), 'captions': local.get('captions')}
+    segs, shot_starts, _, alt = _cached_plan(a, start_f, end_f, opts['reframe'], opts['speaker'])
+    crop_w, crop_h = sc.crop_geometry(info['disp_w'], info['disp_h'])
+    n_frames = end_f - start_f
+    segs = sc.apply_framing(segs, shot_starts, n_frames, _framing_overrides(item, start_f, fps),
+                            max(0.0, float(info['disp_w'] - crop_w)), splits=alt,
+                            disp=(info['disp_w'], info['disp_h']))
+    size = opts['subtitle_size']
+    cues = []
+    if opts['subtitles']:
+        try:
+            cues, _ = _item_cues(a, item, start_f / fps, end_f / fps, sc.SUBTITLE_SIZES[size][1])
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+        cues = sc.place_cues(cues, segs, fps, opts.get('split_caption'))
+    lit = bool(opts.get('word_highlight')) and bool(a['words'] or a['segments'])
+    font_px = sc.SUBTITLE_SIZES[size][0]
+    out = []
+    for g in segs:
+        d = {'a': int(g['a']), 'b': int(g['b']), 'layout': g['layout']}
+        if g['layout'] == 'crop':
+            d['x'] = None if g.get('x') is None else round(float(g['x']), 1)
+            if g.get('keys'):
+                d['keys'] = [[int(f), round(float(x), 1)] for f, x in g['keys']]
+        elif g['layout'] == 'split':
+            d['size'] = [int(v) for v in g['size']]
+            d['panes'] = [[round(float(v), 1) for v in p] for p in g['panes']]
+        out.append(d)
+    return jsonify(ok=True, start=round(start_f / fps + off, 4), fps=fps, n_frames=n_frames,
+                   disp_w=info['disp_w'], disp_h=info['disp_h'], crop_w=crop_w, crop_h=crop_h,
+                   crop_y=(sc.even((info['disp_h'] - crop_h) / 2.0) if info['disp_h'] > crop_h else 0),
+                   segs=out,
+                   cues=[{'start': round(float(c['start']), 3), 'end': round(float(c['end']), 3), 'text': c['text'],
+                          'seam': bool(c.get('seam')),
+                          'words': (c.get('words') or sc.estimate_words(c)) if lit else None} for c in cues],
+                   style={'font': SHORTS_SUB_FONT, 'font_px': font_px, 'outline': max(3, font_px // 15), 'shadow': 2,
+                          'margin_v': int(sc.OUT_H * 0.23), 'margin_lr': 80, 'out_w': sc.OUT_W, 'out_h': sc.OUT_H,
+                          'highlight': sc.highlight_hex(opts.get('highlight_color')) if lit else None})
+
+
 @app.route('/api/shorts/vpreview', methods=['POST'])
 @require_permission('vertical_shorts')
 def api_shorts_vpreview():
@@ -4209,7 +4334,7 @@ def api_shorts_project(pid):
 # (in its folder, so a refresh, another browser or a restart of the server finds them again).
 # --------------------------------------------------------------------------
 
-_SEL_TEXT = ('split_caption', 'highlight_color', 'cut_join', 'ending_look', 'ending_motion', 'mode', 'language', 'focus', 'avoid', 'leave_out', 'stt_prompt', 'vision_model', 'story_model',
+_SEL_TEXT = ('md_by', 'episodes', 'split_caption', 'highlight_color', 'cut_join', 'ending_look', 'ending_motion', 'mode', 'language', 'focus', 'avoid', 'leave_out', 'stt_prompt', 'vision_model', 'story_model',
              'reframe', 'subtitle_size', 'ending', 'format', 'loudness')
 _SEL_NUM = ('min_dur', 'max_dur', 'count', 'vision_frames', 'ending_hold', 'ending_zoom', 'ending_fade', 'ending_sfx_gain', 'ending_sfx_in', 'ending_sfx_out', 'parts_shown')
 _SEL_BOOL = ('word_highlight', 'speaker', 'subtitles', 'embed_captions', 'episode_labels', 'fade_last', 'caption_drop_sounds', 'caption_drop_speakers')

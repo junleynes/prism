@@ -940,6 +940,9 @@ def test_editing_proxy_waits_for_other_jobs_runs_at_low_priority_and_can_be_swit
     shorts._PROXY_JOBS.clear()
     client, headers = _client()
     aid = _analyze(client, headers, env)['result']['analysis_id']
+    # The analysis made it; gone again (cleared from the upload folder), it is made on request.
+    os.remove(os.path.join(main.app.config['UPLOAD_FOLDER'], shorts._proxy_name(env['path'])))
+    shorts._PROXY_JOBS.clear()
     # Busy server: nothing is started, and it is said to be waiting.
     monkeypatch.setattr(shorts, '_server_busy', lambda: True)
     d = client.post('/api/shorts/proxy', json={'analysis_id': aid}, headers=headers).get_json()
@@ -4461,3 +4464,80 @@ def test_embedding_is_off_unless_asked_and_a_template_keeps_it(env, monkeypatch)
     assert 'embed_captions' in shorts.TEMPLATE_KEYS and 'embed_captions' in shorts._SEL_BOOL
     html = client.get('/').get_data(as_text=True)
     assert 'id=sh-embed' in html and 'Embed captions in the file' in html and 'embed_captions: shEl' in html
+
+
+def test_a_minidrama_can_be_cut_into_a_number_of_episodes_and_the_length_is_worked_out():
+    segs = [{'start': i * 10.0, 'end': i * 10.0 + 8.0, 'text': f'line {i}'} for i in range(60)]
+    blocked = [(100.0, 130.0, ['billboard'])]
+    cuts = [i * 5.0 for i in range(120)]
+    for n in (3, 6, 7, 10):
+        ch, lo, hi = shorts._plan_minidrama(n, 600.0, blocked, segs, cuts, [], [], 120, 180, 25.0, None)
+        assert len(ch) == n, (n, len(ch))
+        assert all(not (c['start'] < 130.0 and c['end'] > 100.0) for c in ch), 'nothing inside the billboard'
+        assert lo <= min(c['duration'] for c in ch) and max(c['duration'] for c in ch) <= hi
+        assert abs(sum(c['duration'] for c in ch) - 570.0) < 25, 'the whole story is still covered'
+    ch, lo, hi = shorts._plan_minidrama(None, 600.0, blocked, segs, cuts, [], [], 60, 120, 25.0, None)
+    assert (lo, hi) == (60, 120), 'a length range is used as it is'
+
+
+def test_the_number_of_episodes_reaches_the_analysis(env, monkeypatch):
+    Services(monkeypatch)
+    client, headers = _client()
+    a = _analysis(client, _analyze(client, headers, env, mode='minidrama', episodes=3, min_dur=120, max_dur=125))
+    assert a['ok'] and a['options']['episodes'] == 3 and len(a['candidates']) == 3
+    assert a['options']['max_dur'] < 60, 'the range sent was ignored: the length came from the number of episodes'
+    # Without the mode, or without the number, nothing changes.
+    plain = _analysis(client, _analyze(client, headers, env, episodes=3))
+    assert plain['options']['episodes'] is None and plain['options']['mode'] == 'moments'
+    html = client.get('/').get_data(as_text=True)
+    assert 'id=sh-md-by' in html and 'Number of episodes' in html and "fd.append('episodes'" in html
+
+
+def test_the_live_view_gets_the_exact_framing_of_every_frame_as_numbers(env, monkeypatch):
+    Services(monkeypatch)
+    client, headers = _client()
+    aid = _analysis(client, _analyze(client, headers, env))['analysis_id']
+
+    def plan(**body):
+        r = client.post('/api/shorts/liveplan', headers=headers, json=dict({'analysis_id': aid, 'start': 2.0, 'end': 8.0}, **body))
+        assert r.status_code == 200, r.get_json()
+        return r.get_json()
+    p = plan()
+    assert p['ok'] and p['start'] == 2.0 and p['fps'] == 25 and p['n_frames'] == 150
+    assert (p['disp_w'], p['disp_h'], p['crop_w'], p['crop_h'], p['crop_y']) == (320, 180, 102, 180, 0)
+    segs = p['segs']
+    assert segs[0]['a'] == 0 and segs[-1]['b'] >= 149 and all(y['a'] == x['b'] + 1 for x, y in zip(segs, segs[1:]))
+    assert all(g['layout'] == 'crop' and g['x'] == 109.0 for g in segs), 'no faces: the middle, as the render frames it'
+    # The editor's corrections are in it: the middle shot shown whole, the last at the left edge, then a split.
+    f = client.post('/api/shorts/framing', headers=headers, json={'analysis_id': aid, 'start': 2.0, 'end': 8.0}).get_json()
+    framing = {'shots': [{'at': f['shots'][1]['at'], 'layout': 'fit'}, {'at': f['shots'][2]['at'], 'layout': 'crop', 'x': 0}]}
+    p = plan(framing=framing)
+    at = lambda n: next(g for g in p['segs'] if g['a'] <= n <= g['b'])      # noqa: E731
+    assert at(10)['layout'] == 'crop' and at(60)['layout'] == 'fit' and at(140) == dict(at(140), layout='crop', x=0.0)
+    p = plan(framing={'shots': [{'at': f['shots'][1]['at'], 'layout': 'split'}]})
+    g = next(g for g in p['segs'] if g['a'] <= 60 <= g['b'])
+    assert g['layout'] == 'split' and len(g['size']) == 2 and len(g['panes']) == 2
+    # The same plan as the render's: what the vertical preview renders comes from the same function.
+    assert client.post('/api/shorts/liveplan', headers=headers, json={'analysis_id': aid, 'start': 2.0, 'end': 2.5}).status_code == 400
+    assert client.post('/api/shorts/liveplan', headers=headers, json={'analysis_id': 'gone', 'start': 2, 'end': 8}).status_code == 404
+    html = client.get('/').get_data(as_text=True)
+    assert 'id=ws-canvas' in html and "'/api/shorts/liveplan'" in html and 'requestVideoFrameCallback' in html
+
+
+def test_the_analysis_makes_the_editing_copy_so_the_moments_open_live(env, monkeypatch):
+    Services(monkeypatch)
+    shorts._PROXY_JOBS.clear()
+    name = shorts._proxy_name(env['path'])
+    path = os.path.join(main.app.config['UPLOAD_FOLDER'], name)
+    if os.path.exists(path):
+        os.remove(path)
+    client, headers = _client()
+    job = _analyze(client, headers, env)
+    assert job.get('error') is None and os.path.exists(path), 'made as the last step of the analysis'
+    d = client.post('/api/shorts/proxy', json={'analysis_id': job['result']['analysis_id']}, headers=headers).get_json()
+    assert d['state'] == 'ready' and d['url'] == f'/uploads/{name}', 'ready on the first ask: nothing to wait for'
+    # "Generate without preview" has no editing step, so it makes none.
+    os.remove(path)
+    shorts._PROXY_JOBS.clear()
+    a = _analyze(client, headers, env, auto_render='1', reframe='fit', subtitles='0')
+    assert a.get('error') is None and not os.path.exists(path)
