@@ -3855,7 +3855,7 @@ def test_cliffhanger_push_in_is_adjustable_and_the_page_has_frame_stepping(env, 
 
 def test_page_offers_a_no_wide_shots_reframe_and_preset(users_db):
     html = _client()[0].get('/').get_data(as_text=True)
-    assert 'option value=nowide>Split or crop' in html and 'option value=nowide>No wide shots' in html
+    assert 'option value=nowide selected>Split or crop' in html and 'option value=nowide>No wide shots' in html
     assert "nowide: ['nowide', true, true]" in html
 
 
@@ -3940,7 +3940,7 @@ def test_the_faces_in_a_moment_are_looked_for_once_whatever_the_reframe_mode(env
 def test_framing_offers_a_centre_crop_and_split_is_the_default_reframe(users_db):
     client, _ = _client()
     html = client.get('/').get_data(as_text=True)
-    assert '<option value=split selected>Auto' in html
+    assert '<option value=nowide selected>Split or crop' in html, 'the default: never the whole frame'
     assert '<option value=center>Centre crop</option>' in html and "sel.value === 'center'" in html
 
 
@@ -4463,7 +4463,7 @@ def test_embedding_is_off_unless_asked_and_a_template_keeps_it(env, monkeypatch)
     assert _sub_streams(os.path.join(shorts.SHORTS_DIR, batch['batch_id'], s['file'])) == []
     assert 'embed_captions' in shorts.TEMPLATE_KEYS and 'embed_captions' in shorts._SEL_BOOL
     html = client.get('/').get_data(as_text=True)
-    assert 'id=sh-embed' in html and 'Embed captions in the file' in html and 'embed_captions: shEl' in html
+    assert 'id=sh-embed' in html and 'Embedded in the file (track)' in html and 'embed_captions: shEl' in html
 
 
 def test_a_minidrama_can_be_cut_into_a_number_of_episodes_and_the_length_is_worked_out():
@@ -4550,5 +4550,5 @@ def test_burned_in_and_embedded_captions_are_one_or_the_other(env, monkeypatch):
     s = batch['shorts'][0]
     assert _sub_streams(os.path.join(shorts.SHORTS_DIR, batch['batch_id'], s['file'])) == []
     html = client.get('/').get_data(as_text=True)
-    assert "onchange=\"shCapModeSync('embed')\"" in html and "onchange=\"shCapModeSync('burn')\"" in html
-    assert 'function shCapModeSync(which)' in html
+    assert 'id=sh-cap-mode' in html and all(f'<option value={v}' in html for v in ('burn', 'embed selected', 'srt'))
+    assert 'function shCapModeSync(which)' in html and html.count('data-burn-only') >= 3
