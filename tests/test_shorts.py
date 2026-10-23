@@ -2208,8 +2208,7 @@ def test_shorts_are_numbered_and_listed_in_the_order_they_happen_in_the_episode(
     batch = _render(client, headers, a['analysis_id'], items, reframe='fit', subtitles=False)['result']['batch']
     assert [(s['number'], s['index'], s['title'], s['start']) for s in batch['shorts']] == [
         (1, 1, 'Short 1', 2.0), (2, 2, 'Middle', 9.0), (3, 3, 'Late', 17.0)]
-    assert [s['file'] for s in batch['shorts']] == ['episode_short_01_Short_1.mp4', 'episode_short_02_Middle.mp4',
-                                                    'episode_short_03_Late.mp4']
+    assert [s['file'] for s in batch['shorts']] == ['episode_S01.mp4', 'episode_S02.mp4', 'episode_S03.mp4']
     bdir = os.path.join(shorts.SHORTS_DIR, batch['batch_id'])
     assert sorted(f for f in os.listdir(bdir) if f.endswith('.mp4')) == [s['file'] for s in batch['shorts']], \
         'sorted by name, the folder is in episode order too'
@@ -2249,8 +2248,8 @@ def test_full_flow_render_save_download_send_delete(env, monkeypatch):
     assert batch['status'] == 'complete' and batch['errors'] == [] and batch['orig_name'] == 'episode.mp4'
     assert batch['options']['reframe'] == 'auto' and batch['options']['face_detector'] in ('haar', 'yunet')
     s1, s2 = batch['shorts']
-    assert s1['file'] == 'episode_short_01_Ang_lihim_ni_Ramon.mp4', 'a safe filename from the title'
-    assert s2['file'] == 'episode_short_02_Short_2.mp4' and s2['title'] == 'Short 2'
+    assert s1['file'] == 'episode_S01.mp4', 'the number, not the title, is in the filename'
+    assert s2['file'] == 'episode_S02.mp4' and s2['title'] == 'Short 2'
     assert batch['options']['speaker'] is False
     assert abs(s2['duration'] - 4.0) < 0.05 and s2['layouts'] == {'crop': 1, 'fit': 0, 'tracked': 0, 'speaker': 0, 'split': 0}, \
         'two faceless shots, both centre-cropped at the same x, merge into one instruction'
@@ -2478,7 +2477,7 @@ def test_one_failed_short_does_not_lose_the_others(env, monkeypatch):
     real = sc.render_short
 
     def flaky(ffmpeg, src, out_path, *a, **k):
-        if '_02_' in os.path.basename(out_path):
+        if '_S02' in os.path.basename(out_path):
             return False, 'Conversion failed!'
         return real(ffmpeg, src, out_path, *a, **k)
     monkeypatch.setattr(sc, 'render_short', flaky)
@@ -3804,7 +3803,7 @@ def test_highlight_reel_joins_the_best_scenes_into_one_short(env, monkeypatch):
     assert len(batch['shorts']) == 1 and len(seen) == len(r['scenes'])
     s = batch['shorts'][0]
     assert abs(s['duration'] - r['duration']) < 1.0
-    assert 'reel' in s['file']
+    assert '_R01' in s['file']
     got = shorts.pipeline.probe_duration(os.path.join(shorts.SHORTS_DIR, batch['batch_id'], s['file']))
     assert abs(got - s['duration']) < 1.0
     # Only the final scene of a reel may carry a cliffhanger ending.
@@ -4401,3 +4400,18 @@ def test_the_render_request_the_page_sends_carries_the_cuts_and_the_replace():
                encoding='utf-8').read()
     body = src[src.index('async function shortsRenderSelected()'):src.index('async function shRunRender')]
     assert 'it.cuts = shCutsClean(c)' in body and 'it.replaces = c.rendered' in body
+
+
+def test_send_all_names_every_file_from_the_prefix_and_the_short_number():
+    assert shorts._name_code({'file': 'ep_S03.mp4', 'index': 9}) == 'S03'
+    assert shorts._name_code({'file': 'ep_R01.mp4'}) == 'R01' and shorts._name_code({'file': 'ep_C12.mp4'}) == 'C12'
+    assert shorts._name_code({'file': 'episode_short_04_Long_old_title_here.mp4'}) == 'S04', 'older names keep their number'
+    assert shorts._name_code({'file': 'weird.mp4', 'index': 5}) == 'S05'
+    assert shorts._send_prefix('  JESSICA 1018/x  ') == ('JESSICA_1018_x', None)
+    assert shorts._send_prefix('') == (None, None)
+    assert shorts._send_prefix('///')[1]
+
+
+def test_send_all_asks_for_a_prefix_in_the_page():
+    html = open(os.path.join(os.path.dirname(shorts.__file__), 'templates', 'index.html'), encoding='utf-8').read()
+    assert "placeholder = 'Filename prefix" in html and 'prefix: pre.value.trim()' in html

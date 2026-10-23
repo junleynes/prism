@@ -11881,15 +11881,38 @@ async function shFillSend(host, bid){
     '</select><label style="font-size:12px;display:inline-flex;gap:4px;align-items:center;font-weight:normal" title="Creates a folder named after the project, Program Title - Episode, and puts the files in it"><input type=checkbox data-send-date> project folder</label><button type=button class="btn-sm">Send all</button><span style="font-size:12px"></span>'
   var sel = host.querySelector('select'), btn = host.querySelector('button'), out = host.querySelector('span')
   var dchk = host.querySelector('[data-send-date]'); shDatedInit(dchk)
+  // Send all asks first for the start of every filename: PREFIX_S01.mp4, PREFIX_S02.mp4 ... (captions alike).
+  // Left empty, the files go under the names they have.
+  var pre = document.createElement('input')
+  pre.type = 'text'; pre.maxLength = 60; pre.spellcheck = false; pre.style.cssText = 'display:none;width:190px;margin:0;padding:4px 8px;font-size:12px'
+  pre.placeholder = 'Filename prefix, e.g. JESSICA_1018'
+  pre.setAttribute('aria-label', 'Filename prefix')
+  pre.title = 'Every file is sent as PREFIX_S01, PREFIX_S02 ... with its captions under the same name. Leave empty to keep the names they have.'
+  try{ pre.value = localStorage.getItem('sh_send_prefix') || '' }catch(e){}
+  btn.parentNode.insertBefore(pre, btn)
+  var asking = false
+  function shAsk(on){
+    asking = on; pre.style.display = on ? '' : 'none'
+    btn.textContent = on ? 'Send' : 'Send all'
+    out.textContent = ''
+    if(on){ pre.focus(); pre.select() }
+  }
+  pre.addEventListener('keydown', function(e){
+    if(e.key === 'Enter'){ e.preventDefault(); btn.click() }
+    else if(e.key === 'Escape'){ shAsk(false) }
+  })
   btn.addEventListener('click', async function(e){
     e.stopPropagation()
+    if(!asking){ shAsk(true); return }
     btn.disabled = true
     out.style.color = ''; out.textContent = 'Sending…'
     try{
+      try{ localStorage.setItem('sh_send_prefix', pre.value.trim()) }catch(e2){}
       var r = await (await fetch('/api/shorts/batches/' + bid + '/send', {method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({destination_id: parseInt(sel.value, 10), include_srt: true, project_folder: dchk.checked})})).json()
-      if(r.ok){ out.style.color = 'var(--phosphor)'; out.textContent = 'Sent ' + r.sent.length + ' file' + (r.sent.length === 1 ? '' : 's') + ' to ' + r.destination + (r.folder ? '\\' + r.folder : '') }
+        body: JSON.stringify({destination_id: parseInt(sel.value, 10), include_srt: true, project_folder: dchk.checked,
+                              prefix: pre.value.trim()})})).json()
+      if(r.ok){ out.style.color = 'var(--phosphor)'; out.textContent = 'Sent ' + r.sent.length + ' file' + (r.sent.length === 1 ? '' : 's') + ' to ' + r.destination + (r.folder ? '\\' + r.folder : ''); var msg = out.textContent; shAsk(false); out.style.color = 'var(--phosphor)'; out.textContent = msg }
       else{ out.style.color = 'var(--tally)'; out.textContent = r.error || 'Send failed' }
     }catch(err){ out.style.color = 'var(--tally)'; out.textContent = 'Send failed: ' + err }
     btn.disabled = false
@@ -14770,7 +14793,7 @@ POST /api/shorts/analyze now also needs project_id</pre>
       <h3>Order and numbering</h3>
       <p>Shorts are numbered in the order their moments happen in the episode, not by score and not by the order they were ticked: <code>&hellip;_short_01_&hellip;</code> is the earliest moment and the highest number the latest, so a folder sorted by name, the zip and a destination all read in story order. Each short in a batch shows that number on its picture and where in the episode it comes from. In the list of moments, <strong>List in</strong> switches between episode order (the default) and best first, and each ticked moment shows the number its short will get (&ldquo;Short 3 of 8&rdquo;); unticking one renumbers the rest. A short that fails to render leaves its number unused. Batches saved before this are also listed in episode order, though their filenames keep the numbers they were given.</p>
       <h3>Sending</h3>
-      <p><strong>Send all</strong> at the top of a batch copies every short (and its captions) to a video destination set up under <strong>Config &gt; Network</strong>, under the names they have. Each short also has its own <strong>Send&hellip;</strong>: it opens a destination and a filename box, filled in with the short&rsquo;s current name, and nothing is sent until you press Send there &mdash; change the name first to rename the file as it goes out. The extension stays the file&rsquo;s own, spaces become underscores, and the short&rsquo;s .srt goes with it under the same name. The saved short keeps its original name, and a file of the same name already at the destination is replaced.</p>
+      <p>Shorts are saved as <code>source_S01.mp4</code>, <code>source_S02.mp4</code> &hellip;: the source&rsquo;s name and the short&rsquo;s number, never its headline. <strong>Send all</strong> at the top of a batch asks for a filename prefix and copies every short (and its captions) to a video destination set up under <strong>Config &gt; Network</strong> as <code>PREFIX_S01.mp4</code>, <code>PREFIX_S02.mp4</code> &hellip; (leave the prefix empty to send them under the names they have). Each short also has its own <strong>Send&hellip;</strong>: it opens a destination and a filename box, filled in with the short&rsquo;s current name, and nothing is sent until you press Send there &mdash; change the name first to rename the file as it goes out. The extension stays the file&rsquo;s own, spaces become underscores, and the short&rsquo;s .srt goes with it under the same name. The saved short keeps its original name, and a file of the same name already at the destination is replaced.</p>
     </div>
 
     <div class="docs-pane" id="docs-schedule">

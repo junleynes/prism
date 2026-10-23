@@ -616,6 +616,37 @@ def _batch_public(m):
             'can_delete': _may_change(m)}
 
 
+# A saved short is named <source>_S03.mp4: the source's name, cut short, and the short's number. The AI's headline
+# stays the short's title in PRISM and is not in the filename, which made names of a hundred characters.
+SHORT_NAME_STEM = 24
+_NAME_CODE = re.compile(r'_([SRC])(\d+)(?:\.|$)')
+_OLD_NAME_CODE = re.compile(r'_(short|reel|cut)_(\d+)(?:_|$)')
+
+
+def _name_code(s):
+    """S03 / R01 / C02: what tells this short from the others of its batch, taken from its own file name
+    (the older long names carry the same number), or from its index."""
+    stem = os.path.splitext(s.get('file') or '')[0]
+    m = _NAME_CODE.search(stem)
+    if m:
+        return f'{m.group(1)}{int(m.group(2)):02d}'
+    m = _OLD_NAME_CODE.search(stem)
+    if m:
+        return f"{m.group(1)[0].upper()}{int(m.group(2)):02d}"
+    return f"S{int(s.get('index') or 0):02d}"
+
+
+def _send_prefix(raw):
+    """(prefix, error) for the name the editor typed to start every file of a send-all with."""
+    text = ' '.join(str(raw or '').split())
+    if not text:
+        return None, None
+    pre = secure_filename(re.sub(r'[\\/]+', ' ', text))[:60].strip('._-')
+    if not pre:
+        return None, 'That prefix has nothing in it that can be used in a filename. Use letters, numbers, spaces, dashes or underscores.'
+    return pre, None
+
+
 def _delivery_name(s):
     return s.get('delivery') or s['file']
 
@@ -1825,7 +1856,7 @@ def _run_render(jid, params):
         except OSError as e:
             ov_kept = None
             warnings.append(f'The transition overlay could not be used ({e}); the endings have none.')
-    stem = sc.slugify(os.path.splitext(a['orig_name'] or '')[0], 40) or 'video'
+    stem = sc.slugify(os.path.splitext(a['orig_name'] or '')[0], SHORT_NAME_STEM) or 'video'
     replaced = []
     manifest = {'batch_id': bid, 'created': time.time(), 'user_id': params.get('user_id'),
                 'username': params.get('username'), 'orig_name': a['orig_name'], 'status': 'rendering',
@@ -1941,7 +1972,7 @@ def _run_render(jid, params):
         plan = {'start_f': start_f, 'n_frames': n_frames, 'segs': segs, 'room': room,
                 'after': after, 'audio_out': audio_out, 'audio_fade': audio_fade}
 
-        name = f"{stem}_short_{n:02d}_{sc.slugify(it['title'], 40) or 'clip'}"
+        name = f"{stem}_S{n:02d}"
         out_path = os.path.join(bdir, name + '.mp4')
         delivery = None if (fmt == 'mp4_high' or reel) else f'{name}.{ext}'
         report(percent=int(base + span * 0.25), step=f'Short {n}/{total}: encoding')
@@ -2133,7 +2164,7 @@ def _build_reels(bdir, manifest, fmt, ext, stem, burn, _unused=False):
         join = float(scenes[0].get('_join', REEL_JOIN))
         title = scenes[0].get('title') or key
         paths = [os.path.join(bdir, e['file']) for e in scenes]
-        name = f"{stem}_{'cut' if cut else 'reel'}_{r:02d}_{sc.slugify(title, 40) or 'highlights'}"
+        name = f"{stem}_{'C' if cut else 'R'}{r:02d}"
         mp4 = os.path.join(bdir, name + '.mp4')
         ok, err = _join_scenes(paths, mp4, SHORTS_CRF if fmt == 'mp4_high' else min(SHORTS_CRF, SHORTS_MASTER_CRF),
                                SHORTS_PRESET, join=join)
@@ -4460,6 +4491,11 @@ def api_shorts_batch_send(bid):
         if not folder:
             return jsonify(ok=False, error='This batch is not filed under a project, so there is no Program Title - '
                            'Episode to name the folder after. Send without the folder.'), 400
+    prefix, bad = _send_prefix(data.get('prefix'))
+    if bad:
+        return jsonify(ok=False, error=bad), 400
+    if prefix and rename:
+        prefix = None       # a name typed for one short wins over a prefix
     bdir, sent = _batch_dir(bid), []
     for s in shorts:
         # The delivery file: the MP4, or the ProRes made from it.
@@ -4468,6 +4504,8 @@ def api_shorts_batch_send(bid):
                 continue
             # A renamed short's captions go with it under the same name.
             name = (os.path.splitext(rename)[0] + os.path.splitext(local)[1]) if rename else local
+            if prefix:      # <prefix>_S03.mp4, and the same for its captions
+                name = f'{prefix}_{_name_code(s)}' + os.path.splitext(local)[1]
             try:
                 pipeline.send_file_to_network_destination(os.path.join(bdir, local), name, dest, **({'subfolder': folder} if folder else {}))
             except ValueError as e:
