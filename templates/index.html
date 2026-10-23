@@ -8598,10 +8598,10 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   <section class="sh-out-card" aria-label="Captions">
     <h4>Captions</h4>
     <div class="sh-chk"><label style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
-      <input type=checkbox id=sh-captions checked> Burn in captions
+      <input type=checkbox id=sh-captions checked onchange="shCapModeSync('burn')"> Burn in captions
     </label></div>
-    <div class="sh-chk"><label title="Also puts the captions into the video file as a subtitle track (MP4 and MOV/ProRes). The picture is untouched; a player or editor can show or hide the captions (some players show the track by default). Works with or without Burn in captions, and is kept up to date when you correct the captions." style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
-      <input type=checkbox id=sh-embed> Embed captions in the file
+    <div class="sh-chk"><label title="Puts the captions into the video file as a subtitle track (MP4 and MOV/ProRes) instead of into the picture. The picture is untouched; a player or editor can show or hide the captions (some players show the track by default). One or the other: ticking this unticks Burn in captions. Kept up to date when you correct the captions." style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
+      <input type=checkbox id=sh-embed onchange="shCapModeSync('embed')"> Embed captions in the file
     </label></div>
     <div class="sh-fld"><span class="sh-fld-l">Size</span><select id=sh-caption-size><option value=s>Small</option><option value=m selected>Medium</option><option value=l>Large</option></select></div>
     <div class="sh-fld"><span class="sh-fld-l" title="Where the caption goes while the screen is split in two">Over split screen</span><select id=sh-split-cap><option value=join selected>On the join between the panes</option><option value=low>Low, as in other shots</option></select></div>
@@ -8896,6 +8896,18 @@ function shFormatNote(){
     tt ? '<b>TikTok upload</b>: MP4, 1080&times;1920 (9:16), 30 fps, H.264 + AAC at up to 12 Mb/s. ' +
     'Each short is still rendered as the usual MP4 for playing here; the TikTok file is what Download, Download all and Send hand over. ' +
     'Pair it with the &minus;14 LUFS audio level.' : ''
+}
+
+// Captions go into the picture (burned in) or into the file as a track (embedded): one or the other, never both.
+// `which` is the box just ticked; without it (settings put back), burned in wins.
+function shCapModeSync(which){
+  var burn = shEl('sh-captions'), emb = shEl('sh-embed')
+  if(!burn || !emb) return
+  if(which === 'embed' && emb.checked){ burn.checked = false }
+  else if(burn.checked && !burn.disabled){ emb.checked = false }
+  if(typeof shWsCapVis === 'function') shWsCapVis()
+  if(typeof shWsDraw === 'function') shWsDraw()
+  if(typeof shWsOutSum === 'function') shWsOutSum()
 }
 
 function shModeSync(){
@@ -9958,6 +9970,7 @@ function shPreset(){
   shSyncSpeaker()
   shEl('sh-speaker').checked = P[1] && !shEl('sh-speaker').disabled
   shEl('sh-captions').checked = P[2]
+  shCapModeSync()
   shWsOutSum(); shWsCapVis()
 }
 ;(function(){
@@ -12423,6 +12436,7 @@ function shSelApplyValues(v){
   }
   if(typeof shWordHlSync === 'function') shWordHlSync()
   if(typeof shModeSync === 'function') shModeSync()
+  if(typeof shCapModeSync === 'function') shCapModeSync()
   if(typeof shEndingChanged === 'function') shEndingChanged()
   if(typeof shSyncSpeaker === 'function') shSyncSpeaker()
   if(typeof shCountNote === 'function') shCountNote()

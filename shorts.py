@@ -2655,7 +2655,9 @@ def _render_options(data):
             'speaker': speaker and reframe != 'fit',
             'subtitles': data.get('subtitles', True) not in (False, 0, '0', 'false', 'off', None),
             # The captions also go into the file as a subtitle track a player can show or hide (off unless asked).
-            'embed_captions': data.get('embed_captions', False) in (True, 1, '1', 'true', 'on', 'yes'),
+            # One or the other: captions in the picture, or in the file as a track. Asked for both, they go in the picture.
+            'embed_captions': (data.get('embed_captions', False) in (True, 1, '1', 'true', 'on', 'yes')
+                               and data.get('subtitles', True) in (False, 0, '0', 'false', 'off', None)),
             'subtitle_size': data.get('subtitle_size') if data.get('subtitle_size') in sc.SUBTITLE_SIZES else 'm',
             # Where a caption goes over a split screen: on the join between the panes, or low as everywhere else.
             'split_caption': 'low' if data.get('split_caption') == 'low' else 'join',

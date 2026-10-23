@@ -4541,3 +4541,14 @@ def test_the_analysis_makes_the_editing_copy_so_the_moments_open_live(env, monke
     shorts._PROXY_JOBS.clear()
     a = _analyze(client, headers, env, auto_render='1', reframe='fit', subtitles='0')
     assert a.get('error') is None and not os.path.exists(path)
+
+
+def test_burned_in_and_embedded_captions_are_one_or_the_other(env, monkeypatch):
+    client, headers = _client(user_id=7, role='user', username='ana')
+    batch = _batch(client, headers, env, monkeypatch, subtitles=True, embed_captions=True)
+    assert batch['options']['subtitles'] is True and batch['options']['embed_captions'] is False, 'both asked: in the picture'
+    s = batch['shorts'][0]
+    assert _sub_streams(os.path.join(shorts.SHORTS_DIR, batch['batch_id'], s['file'])) == []
+    html = client.get('/').get_data(as_text=True)
+    assert "onchange=\"shCapModeSync('embed')\"" in html and "onchange=\"shCapModeSync('burn')\"" in html
+    assert 'function shCapModeSync(which)' in html
