@@ -63,6 +63,7 @@ def index():
                            current_username=session.get('username'),
                            current_role=role,
                            current_permissions=perms,
+                           current_groups=_my_group_names(),
                            default_tab=default_tab,
                            just_logged_in=session.pop('just_logged_in', False),
                            brand_name=brand['name'],
@@ -75,6 +76,16 @@ def index():
                            shorts_auto_min_story=shorts.SHORTS_AUTO_MIN_STORY,
                            upload_ttl_hours=round(pipeline.UPLOAD_TTL / 3600.0, 1),
                            csrf_token=ensure_csrf_token())
+
+def _my_group_names():
+    """The names of the groups the signed-in account is in, for the account menu."""
+    try:
+        from project_routes import _groups
+        members, names = _groups()
+        return sorted((names[g] for g in members.get(session.get('user_id')) or () if g in names), key=str.lower)
+    except Exception:       # noqa: BLE001 -- a menu label is never worth failing the page over
+        return []
+
 
 @app.route('/uploads/<filename>')
 @require_permission(*MEDIA_PERMISSIONS)

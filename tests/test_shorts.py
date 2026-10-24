@@ -3871,7 +3871,7 @@ def test_cliffhanger_look_and_movement_are_offered_and_kept(env, monkeypatch):
 def test_sidebar_does_not_list_the_technologies(users_db):
     html = _client()[0].get('/').get_data(as_text=True)
     assert 'scene · vision · ffmpeg' not in html and 'class="hdr-engines"' not in html
-    assert 'class="rail-user"' in html
+    assert 'class="acct-btn"' in html and 'id=acct-menu' in html
 
 
 def test_custom_templates_are_saved_listed_applied_and_deleted(users_db, tmp_path, monkeypatch):

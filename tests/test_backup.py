@@ -133,5 +133,11 @@ def test_every_user_not_only_admins_can_reach_the_password_change():
     with c.session_transaction() as s:
         s.update(authed=True, user_id=2, username='ana', role='user', csrf_token='t')
     html = c.get('/').get_data(as_text=True)
-    assert 'openPasswordDialog()' in html and 'id=pw-dialog' in html and 'class="rail-pw" onclick="openPasswordDialog()"' in html and "changeOwnPassword('pwd')" in html
+    assert 'openPasswordDialog()' in html and 'id=pw-dialog' in html and "changeOwnPassword('pwd')" in html
+    # In the account menu at the foot of the left menu, with two-factor beside it, for every account.
+    assert 'id=acct-menu' in html and 'Profile &amp; 2FA' in html and 'function pfTwofaBegin()' in html and 'id=pf-2fa' in html
+    # Not on the dashboard any more: no theme switch, no Security card.
+    dash = html[html.index('id="p-dashboard"'):]
+    dash = dash[:dash.index('id=dash-presence')]
+    assert 'theme-toggle' not in dash and 'dash-security' not in html
     assert "onclick=\"switchTab('p-config',this)\"" not in html and 'id="p-config-backup"' not in html, 'Config and Backup stay admin-only'
