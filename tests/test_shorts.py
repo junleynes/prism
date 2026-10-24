@@ -4171,7 +4171,7 @@ def test_moment_in_out_keys_do_not_clash_with_caption_keys():
     c = c[0] if isinstance(c, tuple) else c
     html = c.get('/').get_data(as_text=True)
     assert "k === 'i' || k === '['" not in html and "k === 'o' || k === ']'" not in html
-    assert 'title="Start the moment here (I)"' in html
+    assert 'title="Mark In (I)"' in html and "lk === 'i'" in html
 
 
 def test_one_moment_can_be_looked_at_again(env, monkeypatch):
