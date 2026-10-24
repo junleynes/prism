@@ -887,6 +887,59 @@ input.sh-num[type=number]{width:92px}
 .ws-transport input[type=range]{flex:1;margin:0}
 .ws-clock{font-size:11px;font-family:'JetBrains Mono',monospace;white-space:nowrap}
 .ws-tools{display:flex;gap:6px;flex-wrap:wrap;justify-content:center}
+.pr-transport{display:flex;gap:4px;align-items:center;justify-content:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px 6px}
+.pr-toolbar{display:flex;gap:4px;align-items:center;justify-content:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px 6px}
+.pr-controls{display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;margin:12px 0 8px}
+.pr-ib{width:30px;height:30px;display:inline-grid;place-items:center;padding:0;border-radius:7px;border:1px solid var(--line);background:var(--sunken,var(--panel));color:var(--ink-dim);cursor:pointer;flex:0 0 auto}
+.pr-ib:hover:not(:disabled){color:var(--ink);border-color:color-mix(in srgb,var(--ink) 30%,var(--line))}
+.pr-ib:disabled{opacity:.35;cursor:default}
+.pr-ib.on,.pr-ib[aria-pressed=true]{color:var(--tally,#e5484d);border-color:var(--tally,#e5484d)}
+.pr-ib.big{width:38px;height:36px;border-radius:50%;background:var(--tally,#e5484d);border-color:var(--tally,#e5484d);color:#fff}
+.pr-sep{width:1px;height:20px;background:var(--line);margin:0 3px}
+.pr-tc{width:86px;margin:0;padding:3px 5px;border-radius:6px;border:1px solid var(--line);background:var(--sunken,var(--panel));font:600 11px 'JetBrains Mono',monospace;color:var(--ink);text-align:center}
+.pr-tc.now{width:104px;font-size:13px}
+.pr-tc.in{color:var(--phosphor,#34e6c5)} .pr-tc.out{color:var(--tally,#e5484d)}
+.pr-speed{min-width:34px;font:700 11px 'JetBrains Mono',monospace;color:var(--amber)}
+.pr-trim{position:absolute;left:6px;right:6px;top:6px;z-index:6;display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:6px;border:1px dashed var(--amber);border-radius:8px;background:rgba(0,0,0,.72)}
+.pr-trim > div{position:relative}
+.pr-trim canvas{width:100%;display:block;border-radius:4px;background:#000}
+.pr-tl{position:absolute;left:4px;top:4px;font:600 9px 'JetBrains Mono',monospace;background:rgba(0,0,0,.7);color:#fff;padding:1px 4px;border-radius:4px}
+.pr-td{grid-column:1 / -1;text-align:center;font:700 12px 'JetBrains Mono',monospace;color:var(--amber)}
+.pr-tlbar{display:flex;align-items:center;gap:6px}
+.pr-hint{text-transform:none;letter-spacing:0;font-family:inherit;opacity:.7}
+.pr-tracks{height:auto!important;padding:4px 6px 6px;position:relative;overflow:visible!important}
+.pr-row{display:grid;grid-template-columns:40px 1fr;align-items:center;margin-top:3px}
+.pr-lab{font:600 10px 'JetBrains Mono',monospace;color:var(--ink-dim)}
+.pr-lane{position:relative;height:34px;border-radius:6px;background:var(--sunken,rgba(0,0,0,.2));overflow:hidden}
+.pr-lane.pr-ruler{height:16px;background:none;overflow:visible}
+.pr-lane.pr-v1{height:44px;cursor:text}
+.pr-lane.pr-a1{height:38px}
+.pr-lane.pr-a1 canvas{position:absolute;inset:0;width:100%;height:100%}
+.pr-tick{position:absolute;top:0;font:10px 'JetBrains Mono',monospace;color:var(--ink-dim);border-left:1px solid var(--line);padding-left:3px;white-space:nowrap}
+.pr-grey{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(45deg,transparent,transparent 6px,color-mix(in srgb,var(--ink) 6%,transparent) 6px,color-mix(in srgb,var(--ink) 6%,transparent) 12px)}
+.pr-shot{position:absolute;top:0;bottom:0;border-left:1px dashed color-mix(in srgb,var(--ink) 40%,transparent);z-index:2;pointer-events:none}
+.pr-clip{position:absolute;top:3px;bottom:3px;border-radius:5px;background:linear-gradient(color-mix(in srgb,var(--tally,#e5484d) 55%,#000),color-mix(in srgb,var(--tally,#e5484d) 38%,#000));border:1px solid var(--tally,#e5484d);box-sizing:border-box;overflow:hidden;cursor:pointer}
+.pr-clip span{position:absolute;left:12px;top:3px;font:600 11px Inter,Arial,sans-serif;color:#fff;white-space:nowrap;text-shadow:0 1px 2px #000}
+.pr-clip.sel{border:2px solid #fff;box-shadow:0 0 0 2px color-mix(in srgb,#fff 25%,transparent)}
+.pr-gap{position:absolute;top:3px;bottom:3px;border:1px dashed var(--tally,#e5484d);border-radius:5px;box-sizing:border-box;background:repeating-linear-gradient(-45deg,transparent,transparent 5px,color-mix(in srgb,var(--tally,#e5484d) 18%,transparent) 5px,color-mix(in srgb,var(--tally,#e5484d) 18%,transparent) 10px);cursor:pointer;overflow:visible}
+.pr-gap span{position:absolute;left:4px;top:12px;font:600 10px 'JetBrains Mono',monospace;color:var(--tally,#e5484d);white-space:nowrap;overflow:hidden;right:4px}
+.pr-gap.sel{border:2px solid #fff}
+.pr-ge{position:absolute;top:0;bottom:0;width:8px;cursor:ew-resize;z-index:4}
+.pr-split{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:#fff;z-index:3;pointer-events:none}
+.pr-h{position:absolute;top:1px;bottom:1px;width:10px;margin-left:-5px;border-radius:4px;background:var(--tally,#e5484d);cursor:ew-resize;z-index:5}
+.pr-h::after{content:"";position:absolute;left:4px;top:30%;bottom:30%;width:2px;border-radius:2px;background:rgba(255,255,255,.7)}
+.pr-fr{position:absolute;top:4px;bottom:4px;border-radius:5px;border:1px solid #c084fc;background:color-mix(in srgb,#c084fc 18%,transparent);font:600 10px 'JetBrains Mono',monospace;color:color-mix(in srgb,#c084fc 60%,var(--ink));padding:8px 6px 0;white-space:nowrap;overflow:hidden;box-sizing:border-box;cursor:pointer}
+.pr-cue{position:absolute;top:4px;bottom:4px;border-radius:5px;border:1px solid #4a6aa0;background:color-mix(in srgb,#4a6aa0 35%,transparent);font-size:10px;padding:7px 5px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-sizing:border-box;cursor:pointer;color:var(--ink)}
+.pr-cue.on{border:2px solid #9ec1ff}
+.pr-empty{position:absolute;left:8px;top:10px;font-size:11px;color:var(--ink-dim);opacity:.7}
+.pr-over{position:absolute;left:46px;right:6px;top:0;bottom:6px;pointer-events:none}
+.pr-over .ws-ph{background:var(--amber);width:2px;z-index:7}
+.pr-snapline{position:absolute;top:0;bottom:0;width:0;border-left:2px solid var(--amber);opacity:.9;z-index:6}
+.pr-mk{position:absolute;top:18px;width:9px;height:9px;margin-left:-4px;background:var(--phosphor,#34e6c5);transform:rotate(45deg);z-index:6}
+.pr-keys{border-collapse:collapse;width:100%;font-size:13px}
+.pr-keys td{padding:4px 6px;vertical-align:top;border-bottom:1px solid var(--line)}
+.pr-keys td:first-child{width:170px;white-space:nowrap}
+kbd.pr-k{font:600 11px 'JetBrains Mono',monospace;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 6px;background:var(--sunken,var(--panel))}
 .ws-keys{font-size:11px;color:var(--ink-dim);text-align:center}
 .ws-keys kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:10px;background:var(--panel);font-family:inherit}
 .ws-insp{overflow:hidden}
@@ -1249,6 +1302,13 @@ var CURRENT_USERNAME = {{ current_username|tojson }}
         </div>
       </form>
     </div>
+  </div>
+</div>
+<div class="net-modal-overlay" id=ws-keys-dlg role="dialog" aria-modal="true" aria-labelledby="ws-keys-title" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="net-modal-box" style="max-width:560px">
+    <div class="net-modal-head"><div><strong id=ws-keys-title>Keyboard shortcuts</strong><small>Vertical Shorts editor &middot; Premiere layout</small></div>
+      <span class="net-modal-close" onclick="shEl('ws-keys-dlg').classList.remove('open')" role="button" aria-label="Close">&#10005;</span></div>
+    <div style="padding:12px 18px 18px"><table class="pr-keys"><tr><td><kbd class=pr-k>Space</kbd></td><td>Play / pause</td></tr><tr><td><kbd class=pr-k>J K L</kbd></td><td>Shuttle back / stop / forward (tap again 2× 4× 8×)</td></tr><tr><td><kbd class=pr-k>Hold K + J / L</kbd></td><td>One frame back / forward</td></tr><tr><td><kbd class=pr-k>← →</kbd></td><td>One frame · Shift: 5 frames</td></tr><tr><td><kbd class=pr-k>↑ ↓</kbd></td><td>Previous / next edit point (In, Out, cuts, shots, markers)</td></tr><tr><td><kbd class=pr-k>PgUp PgDn</kbd></td><td>Previous / next moment</td></tr><tr><td><kbd class=pr-k>I  O</kbd></td><td>Mark In / Out at the playhead</td></tr><tr><td><kbd class=pr-k>Shift+I  Shift+O</kbd></td><td>Go to In / Out</td></tr><tr><td><kbd class=pr-k>Q  W</kbd></td><td>Ripple trim start / end to the playhead</td></tr><tr><td><kbd class=pr-k>Ctrl+K</kbd></td><td>Add edit (razor) at the playhead</td></tr><tr><td><kbd class=pr-k>Delete</kbd></td><td>Ripple delete the selected piece · a selected cut: put it back</td></tr><tr><td><kbd class=pr-k>C</kbd></td><td>Cut out a part: at its start, then its end</td></tr><tr><td><kbd class=pr-k>Shift+K</kbd></td><td>Play around the playhead (2 s either side)</td></tr><tr><td><kbd class=pr-k>Ctrl+Shift+Space</kbd></td><td>Loop In to Out</td></tr><tr><td><kbd class=pr-k>M</kbd></td><td>Marker</td></tr><tr><td><kbd class=pr-k>S</kbd></td><td>Snapping on / off</td></tr><tr><td><kbd class=pr-k>+  −  \</kbd></td><td>Zoom the tracks in / out / fit</td></tr><tr><td><kbd class=pr-k>Ctrl+Z  Ctrl+Shift+Z</kbd></td><td>Undo / redo</td></tr><tr><td><kbd class=pr-k>X</kbd></td><td>Tick / untick the moment</td></tr><tr><td><kbd class=pr-k>?</kbd></td><td>This list</td></tr></table></div>
   </div>
 </div>
 <nav class="rail">
@@ -8775,30 +8835,44 @@ document.getElementById('vf').addEventListener('submit', async function(e){
         <div id=ws-cap class="sh-cp-line"></div>
         <div id=ws-msg class="ws-msg">Select a moment</div>
       </div>
-      <div class="ws-transport">
-        <button type=button class="btn-sm" id=ws-play aria-label="Play or pause">&#9654;</button>
-        <input type=range id=ws-scrub min=0 max=1 step=0.01 value=0 aria-label="Position in the moment">
-        <span id=ws-clock class="ws-clock">0:00.0 / 0:00.0</span>
+      <div id=ws-trimview class="pr-trim" style="display:none" aria-hidden="true">
+        <div><canvas id=ws-tv-ca></canvas><span id=ws-tv-la class="pr-tl">BEFORE</span></div>
+        <div><canvas id=ws-tv-cb></canvas><span id=ws-tv-lb class="pr-tl">AFTER</span></div>
+        <span id=ws-tv-d class="pr-td"></span>
+        <video id=ws-tv-a muted playsinline preload=auto style="display:none"></video><video id=ws-tv-b muted playsinline preload=auto style="display:none"></video>
       </div>
       <div id=ws-live-note class="sh-note" style="text-align:center;margin:2px 0 0"></div>
-      <div class="ws-tools">
-        <button type=button class="btn-sm" id=ws-stepb title="Back one frame (, or <)" aria-label="Step back one frame">&#9664;| 1 frame</button>
-        <button type=button class="btn-sm" id=ws-stepf title="Forward one frame (. or >)" aria-label="Step forward one frame">1 frame |&#9654;</button>
-        <button type=button class="btn-sm" id=ws-setin title="Start the moment here (I)">Set In here</button>
-        <button type=button class="btn-sm" id=ws-setout title="End the moment here (O)">Set Out here</button>
-        <button type=button class="btn-sm" id=ws-cut title="Cut a part out of the middle of this moment: press at the start of the part to remove, then again at its end (C)">&#9986; Cut from here</button>
-        <button type=button class="btn-sm" id=ws-exact title="On: the preview is a small exact copy with framing, corrections and captions burned in. Off: the quick unframed clip.">Exact 9:16 preview: on</button>
-        <label class="ws-beyond" title="Play a few seconds before and after the moment too, so In and Out can be set further out than they are now (extend it) as well as closer in"><input type=checkbox id=ws-beyond> show 5 s beyond the ends</label>
-      </div>
-      <div class="ws-keys"><kbd>Space</kbd> play &middot; <kbd>&uarr;</kbd><kbd>&darr;</kbd> moment &middot; <kbd>I</kbd> / <kbd>O</kbd> set in / out &middot; <kbd>C</kbd> cut out a part &middot; <kbd>,</kbd> <kbd>.</kbd> (or <kbd>&lt;</kbd> <kbd>&gt;</kbd>) one frame back / forward &middot; <kbd>X</kbd> tick</div>
     </section>
     <aside class="ws-insp" id=ws-insp aria-label="Edit this moment"></aside>
   </div>
   <div class="ws-tl-wrap">
     <div class="ws-tl-label">Episode <span id=ws-tl-note></span></div>
     <div id=ws-tl class="ws-tl" aria-label="The moments on the episode"></div>
-    <div class="ws-tl-label">Selected moment, with its surroundings: drag the ends to trim</div>
-    <div id=ws-zoom class="ws-zoom"></div>
+    <div class="pr-controls">
+      <div class="ws-transport pr-transport">
+        <input id=ws-tc-in class="pr-tc in" readonly title="In point" aria-label="In point">
+        <button type=button class="pr-ib" id=ws-setin title="Mark In (I)" aria-label="Mark In (I)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4H6v16h3"/><path d="M14 12h6"/></svg></button><button type=button class="pr-ib" id=ws-setout title="Mark Out (O)" aria-label="Mark Out (O)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 4h3v16h-3"/><path d="M4 12h6"/></svg></button><button type=button class="pr-ib" id=ws-goin title="Go to In (Shift+I)" aria-label="Go to In (Shift+I)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4H4v16h3"/><path d="M20 12H9"/><path d="m13 8-4 4 4 4"/></svg></button>
+        <span class=pr-sep></span>
+        <button type=button class="pr-ib" id=ws-stepb title="Step back 1 frame (←, Shift+← 5 frames)" aria-label="Step back 1 frame (←, Shift+← 5 frames)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 5v14"/><path d="M18 5 9 12l9 7z" fill="currentColor"/></svg></button><button type=button class="pr-ib" id=ws-rev title="Shuttle back (J) · tap again 2× 4× 8×" aria-label="Shuttle back (J) · tap again 2× 4× 8×"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 3 12l8 7z" fill="currentColor"/><path d="M21 5l-8 7 8 7z" fill="currentColor"/></svg></button><button type=button class="pr-ib big" id=ws-play title="Play / Pause (Space)" aria-label="Play or pause"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 4 13 8-13 8z" fill="currentColor"/></svg></button><button type=button class="pr-ib" id=ws-ffw title="Shuttle forward (L) · tap again 2× 4× 8× · K stops" aria-label="Shuttle forward (L) · tap again 2× 4× 8× · K stops"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 5 8 7-8 7z" fill="currentColor"/><path d="m13 5 8 7-8 7z" fill="currentColor"/></svg></button><button type=button class="pr-ib" id=ws-stepf title="Step forward 1 frame (→, Shift+→ 5 frames)" aria-label="Step forward 1 frame (→, Shift+→ 5 frames)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 5v14"/><path d="m6 5 9 7-9 7z" fill="currentColor"/></svg></button>
+        <span class=pr-sep></span>
+        <button type=button class="pr-ib" id=ws-goout title="Go to Out (Shift+O)" aria-label="Go to Out (Shift+O)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 4h3v16h-3"/><path d="M4 12h11"/><path d="m11 8 4 4-4 4"/></svg></button><button type=button class="pr-ib" id=ws-loop title="Loop In to Out (Ctrl+Shift+Space)" aria-label="Loop In to Out (Ctrl+Shift+Space)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg></button><button type=button class="pr-ib" id=ws-around title="Play around the playhead (Shift+K)" aria-label="Play around the playhead (Shift+K)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m10 7 6 5-6 5z" fill="currentColor"/><path d="M4 6v12M20 6v12" opacity=".6"/></svg></button>
+        <input id=ws-tc class="pr-tc now" title="Playhead: type a timecode and press Enter to jump" aria-label="Playhead timecode">
+        <span id=ws-speed class=pr-speed></span>
+        <input id=ws-tc-out class="pr-tc out" readonly title="Out point" aria-label="Out point">
+        <input type=range id=ws-scrub min=0 max=1 step=0.01 value=0 aria-label="Position in the moment" hidden>
+        <span id=ws-clock class="ws-clock" hidden></span>
+      </div>
+      <div class="pr-toolbar">
+        <button type=button class="pr-ib" id=ws-rstart title="Ripple trim start to playhead (Q)" aria-label="Ripple trim start to playhead (Q)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4v16"/><path d="M8 12h12"/><path d="m16 8 4 4-4 4"/><path d="M4 7v10" opacity=".5"/></svg></button><button type=button class="pr-ib" id=ws-rend title="Ripple trim end to playhead (W)" aria-label="Ripple trim end to playhead (W)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 4v16"/><path d="M16 12H4"/><path d="m8 8-4 4 4 4"/><path d="M20 7v10" opacity=".5"/></svg></button><button type=button class="pr-ib" id=ws-razor title="Add edit at playhead (Ctrl+K)" aria-label="Add edit at playhead (Ctrl+K)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3 5 20"/><path d="m14 3 5 3-9 15"/><circle cx="7" cy="18" r="1.5"/></svg></button><button type=button class="pr-ib" id=ws-rdel title="Ripple delete the selected piece, or put back a selected cut (Delete)" aria-label="Ripple delete the selected piece, or put back a selected cut (Delete)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="7" width="7" height="10" rx="1"/><rect x="14" y="7" width="7" height="10" rx="1"/><path d="M10 12h4"/><path d="m11 10 2 2-2 2"/></svg></button><button type=button class="pr-ib" id=ws-cut title="Cut out a part: press at its start, then at its end (C)" aria-label="Cut out a part: press at its start, then at its end (C)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12"/></svg></button><button type=button class="pr-ib" id=ws-marker title="Add / remove marker (M)" aria-label="Add / remove marker (M)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 10v11h14V10z"/></svg></button>
+        <span class=pr-sep></span>
+        <button type=button class="pr-ib" id=ws-undo title="Undo (Ctrl+Z)" aria-label="Undo (Ctrl+Z)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg></button><button type=button class="pr-ib" id=ws-redo title="Redo (Ctrl+Shift+Z)" aria-label="Redo (Ctrl+Shift+Z)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 14 5-5-5-5"/><path d="M20 9H10a6 6 0 0 0 0 12h3"/></svg></button>
+        <span class=pr-sep></span>
+        <button type=button class="pr-ib" id=ws-beyondbtn title="Show 5 s beyond the ends, to extend In or Out" aria-label="Show 5 s beyond the ends, to extend In or Out"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6v12M16 6v12"/><path d="M2 12h4M18 12h4"/><path d="m4 10-2 2 2 2M20 10l2 2-2 2"/></svg></button><input type=checkbox id=ws-beyond hidden><button type=button class="pr-ib" id=ws-exact title="Exact render: the real 9:16 file once (ending, sound and full sharpness)" aria-label="Exact render: the real 9:16 file once (ending, sound and full sharpness)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="m10 9 5 3-5 3z" fill="currentColor"/></svg></button><button type=button class="pr-ib" id=ws-keysbtn title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts (?)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg></button>
+      </div>
+    </div>
+    <div class="ws-tl-label pr-tlbar">Selected moment <span class="pr-hint">drag In / Out or a cut's edges to trim &middot; click a piece, then Delete &middot; greyed = the episode around it</span>
+      <span style="flex:1"></span><button type=button class="pr-ib on" id=ws-snapbtn title="Snapping (S)" aria-label="Snapping (S)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3v8a6 6 0 0 0 12 0V3"/><path d="M6 7h4M14 7h4"/></svg></button><button type=button class="pr-ib" id=ws-zout title="Zoom out (−)" aria-label="Zoom out (−)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4M8 11h6"/></svg></button><button type=button class="pr-ib" id=ws-zin title="Zoom in (+)" aria-label="Zoom in (+)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4M8 11h6M11 8v6"/></svg></button><button type=button class="pr-ib" id=ws-zfit title="Fit to the moment (\\)" aria-label="Fit to the moment (\\)"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button></div>
+    <div id=ws-zoom class="ws-zoom pr-tracks" aria-label="The selected moment's tracks"></div>
   </div>
   <div class="ws-bar">
     <div id=sh-review-trt class="ws-trt"></div>
@@ -10134,7 +10208,7 @@ function shWsInspector(){
 // The cuts of the moment being edited, as chips that can be taken back, and the button's state.
 function shWsCuts(){
   var c = WS.selC, host = document.querySelector('#ws-insp [data-cuts]'), btn = shEl('ws-cut')
-  if(btn) btn.innerHTML = WS.cutFrom != null ? '&#9986; Cut to here' : '&#9986; Cut from here'
+  if(btn){ btn.classList.toggle('on', WS.cutFrom != null); btn.title = WS.cutFrom != null ? 'Cut to here: press again where the part ends (C) · Esc cancels' : 'Cut out a part: press at its start, then at its end (C)' }
   if(!c || !host) return
   var cuts = shCutsClean(c), off = shPartOff(c)
   host.innerHTML = (cuts.length || WS.cutFrom != null ? '<div class="sh-note" style="margin:8px 0 4px">Cut out of this moment (left out of the short, the rest joined up):</div>' : '') +
@@ -10154,7 +10228,7 @@ function shWsCutHere(){
     if(t <= c.start + 0.2 || t >= c.end - 0.2){ shWsMsg('Cuts go inside the moment. To shorten its start or end, set In or Out.'); setTimeout(function(){ shWsMsg('') }, 2200); return }
     WS.cutFrom = t; shWsCuts(); return
   }
-  var a = WS.cutFrom, b = t
+  var a = WS.cutFrom, b = t, pre = typeof shSnap === 'function' ? shSnap(c) : null
   if(b - a < 0.1){ shWsMsg('Move the playhead later, then press again to end the cut.'); setTimeout(function(){ shWsMsg('') }, 2200); return }
   b = Math.min(b, c.end)
   var trial = (c.cuts || []).concat([[a, b]]), keep = c.cuts
@@ -10168,6 +10242,7 @@ function shWsCutHere(){
     setTimeout(function(){ shWsMsg('') }, 3000); WS.cutFrom = null; shWsCuts(); return
   }
   c.cuts = cleaned; WS.cutFrom = null
+  if(pre){ WS.undo.push(pre); WS.redo = []; shUndoBtns() }
   shWsCuts(); shPointRefresh(c)
 }
 
@@ -10175,6 +10250,7 @@ document.addEventListener('click', function(e){
   var x = e.target.closest && e.target.closest('[data-cut-x]')
   if(!x || !WS.selC) return
   var k = parseInt(x.getAttribute('data-cut-x'), 10), c = WS.selC, cuts = shCutsClean(c)
+  if(typeof shHist === 'function') shHist(c)
   cuts.splice(k, 1); c.cuts = cuts
   shWsCuts(); shPointRefresh(c)
 })
@@ -10365,7 +10441,7 @@ function shWsStop(){
   var v = shEl('ws-video')
   if(v && !v.paused) v.pause()
   if(WS.raf){ cancelAnimationFrame(WS.raf); WS.raf = null }
-  var b = shEl('ws-play'); if(b) b.innerHTML = '&#9654;'
+  shPlayIcon(false); if(typeof shRevStop === 'function') shRevStop()
 }
 
 function shWsPost(url, body){
@@ -10464,7 +10540,8 @@ function shWsPlanBody(c){
 function shWsPlanWant(c, now){
   if(!c || !SH.analysis) return
   var body = shWsPlanBody(c), key = JSON.stringify(body)
-  if(WS.plan && WS.planKey === key) return
+  if(WS.plan && WS.planKey === key && WS.planC === c) return
+  if(WS.planPend === key && WS.planPendC === c) return
   clearTimeout(WS.planT)
   // A new in or out point means a new plan (faces looked for again), so it waits for the dragging to stop; a
   // correction to the framing is answered from the plan already worked out, so it goes at once.
@@ -10472,12 +10549,14 @@ function shWsPlanWant(c, now){
   WS.planT = setTimeout(function(){
     if(WS.selC !== c) return
     var tok = (WS.planTok = (WS.planTok || 0) + 1)
+    WS.planPend = key; WS.planPendC = c
     shWsPost('/api/shorts/liveplan', body).then(function(r){
+      if(tok === WS.planTok){ WS.planPend = null; WS.planPendC = null }
       if(tok !== WS.planTok || WS.selC !== c || !r || !r.ok) return
       r.c0 = body.start; r.c1 = body.end
       WS.plan = r; WS.planKey = key; WS.planC = c
-      shWsDraw()
-    }).catch(function(){})
+      shWsDraw(); shWsZoom()
+    }).catch(function(){ if(tok === WS.planTok){ WS.planPend = null; WS.planPendC = null } })
   }, now ? 0 : (sameRange ? 60 : 500))
 }
 function shWsSegAt(P, n){
@@ -10678,6 +10757,7 @@ function shWsPaint(){
   if(WS.onPaint) WS.onPaint()
   if(WS.live) shWsLiveFrame(c, c.start + t)
   shWsPlayhead(c.start + t)
+  if(typeof shTcPaint === 'function') shTcPaint()
 }
 
 function shWsTick(){
@@ -10691,7 +10771,9 @@ function shWsTick(){
   // The copy holds the whole part: stop at the moment's end (and do not run on from before its start).
   if(c && WS.live && !v.paused){
     var g = shWsGet(v)
-    if(g >= shWsTotal() - 0.02){ v.pause(); shWsSet(v, shWsTotal()); shWsPaint() }
+    if(WS.around && g >= WS.around.end){ v.pause(); shWsSet(v, WS.around.back); WS.around = null; shWsPaint() }
+    else if(WS.loop && g >= WS.lead + WS.dur - 0.02){ shWsSet(v, WS.lead) }
+    else if(g >= shWsTotal() - 0.02){ v.pause(); shWsSet(v, shWsTotal()); shWsPaint() }
     else if(g < -0.05){ shWsSet(v, 0) }
   }
   WS.raf = (!v.paused && !v.ended) ? requestAnimationFrame(shWsTick) : null
@@ -10708,9 +10790,9 @@ function shWsTick(){
     if(WS.exact && !WS.exactTry){ shWsExact(WS.draft, true); return }
     shWsMsg("This couldn't be played back.")
   })
-  v.addEventListener('play', function(){ b.innerHTML = '&#10074;&#10074;'; if(!WS.raf) WS.raf = requestAnimationFrame(shWsTick) })
-  v.addEventListener('pause', function(){ b.innerHTML = '&#9654;' })
-  v.addEventListener('ended', function(){ b.innerHTML = '&#9654;'; shWsPaint() })
+  v.addEventListener('play', function(){ shPlayIcon(true); if(!WS.raf) WS.raf = requestAnimationFrame(shWsTick) })
+  v.addEventListener('pause', function(){ shPlayIcon(false); shTcPaint() })
+  v.addEventListener('ended', function(){ shPlayIcon(false); shWsPaint(); if(WS.loop && !WS.live){ shWsSet(v, WS.lead); v.play().catch(function(){}) } })
   v.addEventListener('seeked', shWsPaint)
   function toggle(){ if(!v.getAttribute('src')) return; if(v.paused){ if(v.ended || shWsGet(v) >= shWsTotal() - 0.05) shWsSet(v, WS.lead); v.play().catch(function(){}) } else v.pause() }
   b.addEventListener('click', toggle)
@@ -10761,7 +10843,9 @@ function shWsSetHere(which){
   var c = WS.selC, v = shEl('ws-video')
   if(!c || !v.getAttribute('src')) return
   var t = c.start - WS.lead + shWsGet(v)
+  if(typeof shHist === 'function') shHist(c)
   if(!shPointSet(c, which, Math.round(t * 100) / 100)){
+    if(typeof shHist === 'function'){ WS.undo.pop(); shUndoBtns() }
     var tok = WS.token
     shWsMsg(which === 'start' ? 'In must be before the out point.' : 'Out must be after the in point.')
     setTimeout(function(){ if(tok === WS.token) shWsMsg('') }, 1600)
@@ -10774,15 +10858,13 @@ function shWsExactOn(){
 function shWsExactBtn(){
   var b = shEl('ws-exact'); if(!b) return
   if(WS.selC && shWsLiveReady(WS.selC)){
-    b.textContent = 'Exact render'; b.setAttribute('aria-pressed', WS.exact ? 'true' : 'false')
-    b.style.borderColor = WS.exact ? 'var(--accent, #34e6c5)' : ''
-    b.title = 'The editing view is drawn live from a small copy of the episode. This renders the real 9:16 file once (the ending, sound and full sharpness included).'
+    b.setAttribute('aria-pressed', WS.exact ? 'true' : 'false')
+    b.title = 'Exact render: the real 9:16 file once (ending, sound and full sharpness). The editing view is drawn live from a small copy.'
     return
   }
   var on = shWsExactOn()
-  b.textContent = 'Exact 9:16 preview: ' + (on ? 'on' : 'off')
   b.setAttribute('aria-pressed', on ? 'true' : 'false')
-  b.style.borderColor = on ? 'var(--accent, #34e6c5)' : ''
+  b.title = 'Exact 9:16 preview: ' + (on ? 'on' : 'off') + ' (click to switch)'
 }
 // `draft`: a framing being worked on in the Framing tab, shown here before it is kept; left out, the moment's own.
 async function shWsExact(draft, force){
@@ -10861,6 +10943,7 @@ function shWsTimeline(){
 })()
 
 function shWsZoomWin(c){
+  if(WS.zwinC !== c){ WS.zwinC = c; WS.zwin = null; WS.zfixed = false }
   var P = shParts(), a = SH.analysis, k = shPartIdx(c)
   var lo = P ? P[k].offset : 0, hi = P ? lo + P[k].duration : a.duration
   var pad = Math.max(10, (c.end - c.start) * 0.6)
@@ -10870,76 +10953,450 @@ function shWsZoomWin(c){
   return {w: w, lo: lo, hi: hi}
 }
 
+var PR_ICON = {"play": "<svg viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m7 4 13 8-13 8z\" fill=\"currentColor\"/></svg>", "pause": "<svg viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"6\" y=\"5\" width=\"4\" height=\"14\" rx=\"1\" fill=\"currentColor\"/><rect x=\"14\" y=\"5\" width=\"4\" height=\"14\" rx=\"1\" fill=\"currentColor\"/></svg>"}
+// ---- Premiere-style editing: transport, keys, pieces, undo, timeline tracks, trim view ----
+// Times are on the analysis's timeline (source seconds) unless named otherwise.
+WS.loop = false; WS.snap = true; WS.splits = {}; WS.markers = {}; WS.undo = []; WS.redo = []
+WS.selPiece = null; WS.selGap = null; WS.rev = null; WS.kDown = false; WS.around = null; WS.wave = null
+function shPlayIcon(on){ var b = shEl('ws-play'); if(b) b.innerHTML = on ? PR_ICON.pause : PR_ICON.play }
+function shAbsNow(){ var c = WS.selC, v = shEl('ws-video'); return c ? c.start - WS.lead + shWsGet(v) : 0 }
+function shSeekAbs(t){
+  var c = WS.selC, v = shEl('ws-video'); if(!c || !v.getAttribute('src') || !isFinite(t)) return
+  shWsSet(v, Math.max(0, Math.min(shWsTotal(), t - (c.start - WS.lead)))); shWsPaint()
+}
+function shFlash(t){ var tok = WS.token; shWsMsg(t); setTimeout(function(){ if(tok === WS.token) shWsMsg('') }, 2200) }
+// Timecode, HH:MM:SS:FF, in the part's own time.
+function shTc(abs){
+  var c = WS.selC, fps = shWsFps(), base = Math.round(fps), e = Math.max(0, abs - (c ? shPartOff(c) : 0))
+  var n = Math.round(e * fps), ff = n % base, s = Math.floor(n / base)
+  function p(x){ return (x < 10 ? '0' : '') + x }
+  return p(Math.floor(s / 3600)) + ':' + p(Math.floor(s / 60) % 60) + ':' + p(s % 60) + ':' + p(ff)
+}
+function shTcParse(txt){
+  var m = String(txt || '').trim().match(/^(?:(\d+):)?(\d+):(\d+)[:;](\d+)$/), fps = shWsFps()
+  if(m) return (parseInt(m[1] || '0', 10) * 3600 + parseInt(m[2], 10) * 60 + parseInt(m[3], 10)) + parseInt(m[4], 10) / Math.round(fps)
+  return shParse(txt)
+}
+function shTcPaint(){
+  var c = WS.selC; if(!c) return
+  var tc = shEl('ws-tc'); if(tc && document.activeElement !== tc) tc.value = shTc(shAbsNow())
+  var i = shEl('ws-tc-in'), o = shEl('ws-tc-out')
+  if(i) i.value = shTc(c.start); if(o) o.value = shTc(c.end)
+  var sp = shEl('ws-speed')
+  if(sp) sp.textContent = WS.rev ? '◀◀ ' + WS.rev.rate + '×' : (!shEl('ws-video').paused && shEl('ws-video').playbackRate > 1 ? '▶▶ ' + shEl('ws-video').playbackRate + '×' : '')
+}
+
+// ---- Undo / redo: every change to a moment's in, out, cuts, framing or captions ----
+function shSnap(c){
+  return {c: c, start: c.start, end: c.end, cuts: JSON.parse(JSON.stringify(c.cuts || [])),
+          framing: c.framing ? JSON.parse(JSON.stringify(c.framing)) : null, captions: c.captions ? JSON.parse(JSON.stringify(c.captions)) : null,
+          splits: (WS.splits[c.id] || []).slice()}
+}
+function shHist(c){ c = c || WS.selC; if(!c) return; WS.undo.push(shSnap(c)); if(WS.undo.length > 200) WS.undo.shift(); WS.redo = []; shUndoBtns() }
+function shUndoBtns(){ var u = shEl('ws-undo'), r = shEl('ws-redo'); if(u) u.disabled = !WS.undo.length; if(r) r.disabled = !WS.redo.length }
+function shApplySnap(s){
+  var c = s.c, fr = JSON.stringify(c.framing || null) !== JSON.stringify(s.framing), cp = JSON.stringify(c.captions || null) !== JSON.stringify(s.captions)
+  c.start = s.start; c.end = s.end; c.cuts = s.cuts
+  if(s.framing) c.framing = s.framing; else delete c.framing
+  if(s.captions) c.captions = s.captions; else delete c.captions
+  WS.splits[c.id] = s.splits.slice(); WS.selPiece = null; WS.selGap = null
+  if(c !== WS.selC) shWsSelect(c, 'undo')
+  if(fr){ WS.liveDraft = undefined; WS.plan = null }
+  shWsCuts(); shPointRefresh(c)
+  if(fr || cp){ var i = SH.cands.indexOf(c); if(typeof shWsInspector === 'function') shWsInspector() }
+}
+function shUndo(){ var s = WS.undo.pop(); if(!s) return; WS.redo.push(shSnap(s.c)); shApplySnap(s); shUndoBtns() }
+function shRedo(){ var s = WS.redo.pop(); if(!s) return; WS.undo.push(shSnap(s.c)); shApplySnap(s); shUndoBtns() }
+
+// ---- Pieces: what is kept of a moment, split where the editor added an edit ----
+function shSplits(c){
+  var cuts = shCutsClean(c)
+  return (WS.splits[c.id] || []).filter(function(t){
+    return t > c.start + 0.05 && t < c.end - 0.05 && !cuts.some(function(x){ return t >= x[0] - 0.05 && t <= x[1] + 0.05 })
+  }).sort(function(a, b){ return a - b })
+}
+function shPieces(c){
+  var cuts = shCutsClean(c), kept = [], at = c.start
+  cuts.forEach(function(x){ if(x[0] > at) kept.push([at, x[0]]); at = x[1] })
+  if(c.end > at) kept.push([at, c.end])
+  var sp = shSplits(c), out = []
+  kept.forEach(function(k){
+    var a = k[0]
+    sp.forEach(function(t){ if(t > a && t < k[1]){ out.push([a, t]); a = t } })
+    out.push([a, k[1]])
+  })
+  return out
+}
+function shRazor(){
+  var c = WS.selC; if(!c) return
+  var t = Math.round(shAbsNow() * 100) / 100
+  var p = shPieces(c).filter(function(x){ return t > x[0] + 0.25 && t < x[1] - 0.25 })[0]
+  if(!p){ shFlash('Add an edit inside a kept piece, away from its ends.'); return }
+  shHist(c)
+  ;(WS.splits[c.id] = WS.splits[c.id] || []).push(t)
+  WS.selPiece = null; shWsZoom()
+}
+// Ripple delete: the selected piece goes and what is around it closes up. A piece at an end moves In or Out;
+// one in the middle becomes a cut. A selected cut is taken back instead.
+function shRippleDelete(){
+  var c = WS.selC; if(!c) return
+  if(WS.selGap != null){
+    var cuts = shCutsClean(c); if(!cuts[WS.selGap]) return
+    shHist(c); cuts.splice(WS.selGap, 1); c.cuts = cuts; WS.selGap = null
+    shWsCuts(); shPointRefresh(c); return
+  }
+  var p = WS.selPiece
+  if(!p){ shFlash('Click a piece on the V1 track first.'); return }
+  var ps = shPieces(c)
+  if(ps.length < 2){ shFlash('That is the whole moment: nothing would be left.'); return }
+  var keep = shSnap(c)
+  if(Math.abs(p[0] - c.start) < 0.005){ shHist(c); if(!shPointSet(c, 'start', p[1])){ WS.undo.pop(); shFlash('What is left would be too short.'); return } }
+  else if(Math.abs(p[1] - c.end) < 0.005){ shHist(c); if(!shPointSet(c, 'end', p[0])){ WS.undo.pop(); shFlash('What is left would be too short.'); return } }
+  else {
+    shHist(c)
+    c.cuts = shCutsClean({start: c.start, end: c.end, cuts: (c.cuts || []).concat([[p[0], p[1]]])})
+    if(shKept(c) < 3){ shApplySnap(keep); WS.undo.pop(); shFlash('The short would be under 3 s.'); return }
+    shWsCuts(); shPointRefresh(c)
+  }
+  WS.splits[c.id] = (WS.splits[c.id] || []).filter(function(t){ return Math.abs(t - p[0]) > 0.01 && Math.abs(t - p[1]) > 0.01 })
+  WS.selPiece = null; shWsZoom()
+}
+function shMarker(){
+  var c = WS.selC; if(!c) return
+  var t = Math.round(shAbsNow() * 100) / 100, m = WS.markers[c.id] = WS.markers[c.id] || []
+  var near = m.findIndex(function(x){ return Math.abs(x - t) < 0.15 })
+  if(near >= 0) m.splice(near, 1); else m.push(t)
+  shWsZoom()
+}
+// Edit points: In, Out, cut edges, added edits, shot changes and markers.
+function shEditPoints(c){
+  var pts = [c.start, c.end]
+  shCutsClean(c).forEach(function(x){ pts.push(x[0], x[1]) })
+  shSplits(c).forEach(function(t){ pts.push(t) })
+  ;(WS.markers[c.id] || []).forEach(function(t){ pts.push(t) })
+  var P = WS.plan && WS.planC === c ? WS.plan : null
+  if(P) P.segs.forEach(function(g){ if(g.a > 0) pts.push(P.start + g.a / P.fps) })
+  return pts.sort(function(a, b){ return a - b })
+}
+function shJumpEdit(dir){
+  var c = WS.selC; if(!c) return
+  var t = shAbsNow(), pts = shEditPoints(c), fps = shWsFps(), go = null
+  if(dir > 0) go = pts.filter(function(x){ return x > t + 0.5 / fps })[0]
+  else go = pts.filter(function(x){ return x < t - 0.5 / fps }).pop()
+  if(go != null){ shWsStop(); shSeekAbs(go + 0.25 / fps) }
+}
+
+// ---- Transport: J K L shuttle, loop, play around ----
+function shRevStop(){ if(WS.rev){ clearInterval(WS.rev.timer); WS.rev = null; shTcPaint() } }
+function shShuttle(dir){
+  var v = shEl('ws-video'); if(!v || !v.getAttribute('src')) return
+  WS.around = null
+  if(dir > 0){
+    shRevStop()
+    if(!v.paused) v.playbackRate = Math.min(8, (v.playbackRate || 1) * 2)
+    else { v.playbackRate = 1; if(shWsGet(v) >= shWsTotal() - 0.05) shWsSet(v, WS.lead); v.play().catch(function(){}) }
+  } else {
+    if(!v.paused) v.pause()
+    v.playbackRate = 1
+    if(WS.rev){ WS.rev.rate = Math.min(8, WS.rev.rate * 2) }
+    else {
+      WS.rev = {rate: 1, timer: setInterval(function(){
+        var g = shWsGet(v) - 0.04 * (WS.rev ? WS.rev.rate : 1)
+        if(g <= 0){ shWsSet(v, 0); shRevStop(); shWsPaint(); return }
+        shWsSet(v, g); shWsPaint()
+      }, 40)}
+    }
+  }
+  shTcPaint()
+}
+function shShuttleStop(){ var v = shEl('ws-video'); shRevStop(); WS.around = null; if(v){ v.pause(); v.playbackRate = 1 }; shTcPaint() }
+function shPlayAround(){
+  var v = shEl('ws-video'); if(!v || !v.getAttribute('src')) return
+  shRevStop(); var g = shWsGet(v)
+  WS.around = {back: g, end: Math.min(shWsTotal(), g + 2)}
+  shWsSet(v, Math.max(0, g - 2)); v.playbackRate = 1; v.play().catch(function(){})
+}
+function shLoopToggle(){ WS.loop = !WS.loop; var b = shEl('ws-loop'); if(b) b.classList.toggle('on', WS.loop) }
+function shGoEdge(which){ var c = WS.selC; if(!c) return; shWsStop(); shSeekAbs(which === 'start' ? c.start + 0.25 / shWsFps() : c.end - 0.75 / shWsFps()) }
+
+// ---- Timeline zoom ----
+function shZoomBy(f){
+  var c = WS.selC; if(!c) return
+  var g = shWsZoomWin(c), w = g.w, span = Math.max(4, Math.min(g.hi - g.lo, (w[1] - w[0]) * f)), mid = Math.max(w[0], Math.min(w[1], shAbsNow()))
+  var a = Math.max(g.lo, mid - span / 2), b = Math.min(g.hi, a + span); a = Math.max(g.lo, b - span)
+  WS.zwin = [a, b]; WS.zfixed = true; shWsZoom()
+}
+function shZoomFit(){ WS.zwin = null; WS.zfixed = false; shWsZoom() }
+
+// ---- Snapping ----
+function shSnapTargets(c, skip){
+  var pts = shEditPoints(c).filter(function(t){ return skip == null || Math.abs(t - skip) > 1e-3 })
+  pts.push(shAbsNow())
+  var base = c.start - WS.lead
+  ;(WS.cues || []).forEach(function(q){ pts.push(base + q.start, base + q.end) })
+  return pts
+}
+function shSnapTo(c, t, pxPerSec, skip){
+  if(!WS.snap) return {t: t, hit: null}
+  var best = null, lim = 8 / Math.max(pxPerSec, 1e-6)
+  shSnapTargets(c, skip).forEach(function(x){ var d = Math.abs(x - t); if(d <= lim && (best == null || d < Math.abs(best - t))) best = x })
+  return best == null ? {t: t, hit: null} : {t: best, hit: best}
+}
+
+// ---- Waveform of the window shown ----
+function shWaveWant(c, w){
+  var key = (SH.analysis && SH.analysis.analysis_id) + '|' + w[0].toFixed(2) + '|' + w[1].toFixed(2)
+  if(WS.wave && (WS.wave.key === key || WS.wave.pending === key)) return
+  WS.wave = {key: WS.wave && WS.wave.key, peaks: WS.wave && WS.wave.peaks, w: WS.wave && WS.wave.w, pending: key}
+  clearTimeout(WS.waveT)
+  WS.waveT = setTimeout(function(){
+    shWsPost('/api/shorts/waveform', {analysis_id: SH.analysis.analysis_id, start: w[0], end: w[1], bins: 700}).then(function(r){
+      if(!r || !r.ok || !WS.wave || WS.wave.pending !== key) return
+      WS.wave = {key: key, peaks: r.peaks, w: [r.start, r.end]}; shWaveDraw()
+    }).catch(function(){})
+  }, 250)
+}
+function shWaveDraw(){
+  var cv = shEl('ws-wave'), c = WS.selC; if(!cv || !c || !WS.zwin) return
+  var W = cv.clientWidth, H = cv.clientHeight, dpr = Math.min(2, window.devicePixelRatio || 1)
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr)
+  var ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H)
+  var wv = WS.wave; if(!wv || !wv.peaks || !wv.peaks.length || !wv.w) return
+  var w = WS.zwin, span = w[1] - w[0], n = wv.peaks.length, cuts = shCutsClean(c)
+  for(var x = 0; x < W; x++){
+    var t = w[0] + (x + 0.5) / W * span, k = Math.floor((t - wv.w[0]) / (wv.w[1] - wv.w[0]) * n)
+    if(k < 0 || k >= n) continue
+    var h = Math.max(1, wv.peaks[k] * (H - 4)), inside = t >= c.start && t <= c.end && !cuts.some(function(q){ return t > q[0] && t < q[1] })
+    ctx.fillStyle = inside ? '#3dbb8a' : 'rgba(61,187,138,.35)'
+    ctx.fillRect(x, (H - h) / 2, 1, h)
+  }
+}
+
+// ---- Trim view: the frames either side of the edit being dragged ----
+function shTrimShow(on){ var tv = shEl('ws-trimview'); if(tv) tv.style.display = on ? '' : 'none' }
+function shTrimAt(edge, which, orig){
+  var c = WS.selC, px = c && WS.proxy[shWsPartOf(c)]
+  if(!px || px.state !== 'ready'){ shTrimShow(false); return }
+  var fps = shWsFps(), A = shEl('ws-tv-a'), B = shEl('ws-tv-b')
+  if(A.getAttribute('src') !== px.url){ A.src = px.url; B.src = px.url }
+  var off = px.offset || 0
+  WS.trimWant = [edge - 1 / fps - off + 0.25 / fps, edge - off + 0.25 / fps]
+  shEl('ws-tv-la').textContent = which === 'start' ? 'BEFORE IN' : which === 'end' ? 'LAST FRAME' : 'BEFORE'
+  shEl('ws-tv-lb').textContent = which === 'start' ? 'FIRST FRAME' : which === 'end' ? 'AFTER OUT' : 'AFTER'
+  var d = Math.round((edge - orig) * fps)
+  shEl('ws-tv-d').textContent = (d > 0 ? '+' : d < 0 ? '−' : '±') + Math.abs(d) + ' fr'
+  shTrimShow(true)
+  if(!isFinite(WS.trimWant[0]) || !isFinite(WS.trimWant[1])) return
+  if(!WS.trimBusy){ WS.trimBusy = true; A.currentTime = Math.max(0, WS.trimWant[0]); B.currentTime = Math.max(0, WS.trimWant[1]) }
+}
+;(function(){
+  var A = shEl('ws-tv-a'), B = shEl('ws-tv-b'); if(!A) return
+  function draw(v, id){ var cv = shEl(id), ctx = cv.getContext('2d'); if(v.videoWidth){ cv.width = 320; cv.height = Math.round(320 * v.videoHeight / v.videoWidth); ctx.drawImage(v, 0, 0, cv.width, cv.height) } }
+  var done = 0
+  function seeked(){
+    draw(A, 'ws-tv-ca'); draw(B, 'ws-tv-cb')
+    if(++done < 2) return
+    done = 0; WS.trimBusy = false
+    if(WS.trimWant && (Math.abs(A.currentTime - Math.max(0, WS.trimWant[0])) > 0.02 || Math.abs(B.currentTime - Math.max(0, WS.trimWant[1])) > 0.02)){
+      WS.trimBusy = true; A.currentTime = Math.max(0, WS.trimWant[0]); B.currentTime = Math.max(0, WS.trimWant[1])
+    }
+  }
+  A.addEventListener('seeked', seeked); B.addEventListener('seeked', seeked)
+})()
+
+// ---- The tracks of the selected moment: V1 picture, 9:16 framing, CAP captions, A1 sound ----
 function shWsZoom(){
   var z = shEl('ws-zoom'), c = WS.selC
-  if(!z || !c || !SH.analysis) { if(z) z.innerHTML = ''; return }
+  if(!z || !c || !SH.analysis){ if(z) z.innerHTML = ''; return }
   var g = shWsZoomWin(c), w = g.w, span = w[1] - w[0], off = shPartOff(c)
-  function x(t){ return (t - w[0]) / span * 100 }
-  if(WS.drag){
-    var r = z.querySelector('.zr'), hs = z.querySelectorAll('.zh')
-    r.style.left = x(c.start) + '%'; r.style.width = (x(c.end) - x(c.start)) + '%'
-    hs[0].style.left = x(c.start) + '%'; hs[1].style.left = x(c.end) + '%'
-    return
-  }
-  var step = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600].filter(function(s){ return span / s <= 8 })[0] || 600
-  var h = ''
-  for(var t = Math.ceil(w[0] / step) * step; t <= w[1]; t += step)
-    h += '<div class="tick" style="left:' + x(t) + '%"></div><div class="zt" style="left:' + x(t) + '%">' + shFmt(t - off) + '</div>'
-  h += '<div class="zr" style="left:' + x(c.start) + '%;width:' + (x(c.end) - x(c.start)) + '%"></div>' +
-       '<div class="zh" data-h="start" style="left:' + x(c.start) + '%" title="In"></div>' +
-       '<div class="zh" data-h="end" style="left:' + x(c.end) + '%" title="Out"></div>' +
-       '<div class="ws-ph" id="ws-ph-b" style="display:none"></div>'
-  z.innerHTML = h
+  function x(t){ return ((t - w[0]) / span * 100).toFixed(3) }
+  function wd(a, b){ return ((b - a) / span * 100).toFixed(3) }
+  var step = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600].filter(function(s){ return span / s <= 10 })[0] || 600
+  var ruler = ''
+  for(var t = Math.ceil(w[0] / step) * step; t <= w[1]; t += step) ruler += '<span class="pr-tick" style="left:' + x(t) + '%">' + shTc(t).slice(3, 8) + '</span>'
+  // V1
+  var v1 = '<div class="pr-grey" style="left:0;width:' + x(c.start) + '%"></div><div class="pr-grey" style="left:' + x(c.end) + '%;right:0"></div>'
+ var P = WS.plan && WS.planC === c ? WS.plan : null
+  if(!P && WS.live) shWsPlanWant(c, true)
+  if(P) P.segs.forEach(function(s){ if(s.a > 0) v1 += '<div class="pr-shot" style="left:' + x(P.start + s.a / P.fps) + '%" title="Shot change"></div>' })
+  var ps = shPieces(c), cuts = shCutsClean(c)
+  ps.forEach(function(p, k){
+    var sel = WS.selPiece && Math.abs(WS.selPiece[0] - p[0]) < 1e-3 && Math.abs(WS.selPiece[1] - p[1]) < 1e-3
+    v1 += '<div class="pr-clip' + (sel ? ' sel' : '') + '" data-piece="' + k + '" style="left:' + x(p[0]) + '%;width:' + wd(p[0], p[1]) + '%" title="' +
+      escapeHtmlLite((c.title || 'Moment') + ' · ' + shTc(p[0]) + ' → ' + shTc(p[1])) + '"><span>' + (k ? '' : escapeHtmlLite(c.title || 'Moment')) + '</span></div>'
+  })
+  cuts.forEach(function(q, k){
+    v1 += '<div class="pr-gap' + (WS.selGap === k ? ' sel' : '') + '" data-gap="' + k + '" style="left:' + x(q[0]) + '%;width:' + wd(q[0], q[1]) + '%" title="Cut out: ' + (q[1] - q[0]).toFixed(1) + ' s (select and Delete to put it back)"><span>' + (q[1] - q[0]).toFixed(1) + ' s</span>' +
+      '<i class="pr-ge" data-ge="' + k + ':0" style="left:-4px"></i><i class="pr-ge" data-ge="' + k + ':1" style="right:-4px"></i></div>'
+  })
+  shSplits(c).forEach(function(t){ v1 += '<div class="pr-split" style="left:' + x(t) + '%" title="Added edit"></div>' })
+  v1 += '<i class="pr-h" data-h="start" style="left:' + x(c.start) + '%" title="In: drag to trim"></i><i class="pr-h" data-h="end" style="left:' + x(c.end) + '%" title="Out: drag to trim"></i>'
+  // 9:16
+  var fr = ''
+  if(P) P.segs.forEach(function(s){
+    var a = P.start + s.a / P.fps, b = P.start + (s.b + 1) / P.fps
+    var lab = s.layout === 'split' ? 'SPLIT' : s.layout === 'fit' ? 'FIT' : s.keys ? 'FOLLOW' : 'CROP x ' + Math.round(s.x || 0)
+    fr += '<div class="pr-fr" data-at="' + ((a + b) / 2).toFixed(3) + '" style="left:' + x(a) + '%;width:' + wd(a, b) + '%" title="' + lab + ' (open Framing)">' + lab + '</div>'
+  })
+  // CAP
+  var cap = '', base = c.start - WS.lead, now = shAbsNow()
+  ;(WS.cues || []).forEach(function(q, k){
+    if(!q.text || !q.text.trim()) return
+    var a = base + q.start, b = base + q.end, on = now >= a && now < b
+    cap += '<div class="pr-cue' + (on ? ' on' : '') + '" data-at="' + (a + 0.01).toFixed(3) + '" style="left:' + x(a) + '%;width:' + wd(a, b) + '%" title="' + escapeHtmlLite(q.text) + ' (open Captions)">' + escapeHtmlLite(q.text) + '</div>'
+  })
+  var mk = (WS.markers[c.id] || []).map(function(t){ return '<i class="pr-mk" style="left:' + x(t) + '%" title="Marker ' + shTc(t) + '"></i>' }).join('')
+  z.innerHTML =
+    '<div class="pr-row"><span class="pr-lab"></span><div class="pr-lane pr-ruler" data-lane="ruler">' + ruler + '</div></div>' +
+    '<div class="pr-row"><span class="pr-lab">V1</span><div class="pr-lane pr-v1" data-lane="v1">' + v1 + '</div></div>' +
+    '<div class="pr-row"><span class="pr-lab">9:16</span><div class="pr-lane pr-frl" data-lane="fr">' + (fr || '<span class="pr-empty">framing appears when the plan is ready</span>') + '</div></div>' +
+    '<div class="pr-row"><span class="pr-lab">CAP</span><div class="pr-lane pr-capl" data-lane="cap">' + cap + '</div></div>' +
+    '<div class="pr-row"><span class="pr-lab">A1</span><div class="pr-lane pr-a1" data-lane="a1"><canvas id=ws-wave></canvas></div></div>' +
+    '<div class="pr-over">' + mk + '<div class="ws-ph" id="ws-ph-b" style="display:none"></div><div class="pr-snapline" id="ws-snapline" style="display:none"></div></div>'
+  shWaveWant(c, w); shWaveDraw()
+  if(WS.selC) shWsPlayhead(shAbsNow())
 }
 
 ;(function(){
-  var z = shEl('ws-zoom')
-  if(!z) return
+  var z = shEl('ws-zoom'); if(!z) return
+  var drag = null
+  function tAt(e){
+    var lane = z.querySelector('.pr-v1'), r = lane.getBoundingClientRect(), w = WS.zwin
+    if(!r.width) return {t: w[0], pps: 1}
+    return {t: w[0] + Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * (w[1] - w[0]), pps: r.width / (w[1] - w[0])}
+  }
+  function snapLine(t){
+    var s = shEl('ws-snapline'); if(!s) return
+    if(t == null){ s.style.display = 'none'; return }
+    var w = WS.zwin; s.style.left = ((t - w[0]) / (w[1] - w[0]) * 100) + '%'; s.style.display = ''
+  }
   z.addEventListener('pointerdown', function(e){
-    var h = e.target.closest('.zh')
-    if(!h || !WS.selC) return
-    e.preventDefault()
-    WS.drag = h.getAttribute('data-h')
+    var c = WS.selC; if(!c || !WS.zwin) return
+    var h = e.target.closest('.pr-h'), ge = e.target.closest('.pr-ge')
+    if(h || ge){
+      e.preventDefault(); e.stopPropagation()
+      shHist(c)
+      drag = h ? {kind: h.getAttribute('data-h'), orig: c[h.getAttribute('data-h')]} : {kind: 'gap', k: parseInt(ge.getAttribute('data-ge'), 10), side: parseInt(ge.getAttribute('data-ge').split(':')[1], 10)}
+      if(drag.kind === 'gap'){ var q = shCutsClean(c)[drag.k]; drag.orig = q[drag.side] }
+      WS.drag = drag.kind
+      try{ z.setPointerCapture(e.pointerId) }catch(err){}
+      shWsStop()
+      return
+    }
+    var p = e.target.closest('.pr-clip'), gp = e.target.closest('.pr-gap'), fr = e.target.closest('.pr-fr'), cu = e.target.closest('.pr-cue')
+    var at = tAt(e).t
+    if(p){ var ps = shPieces(c)[parseInt(p.getAttribute('data-piece'), 10)]; WS.selPiece = ps; WS.selGap = null; shWsStop(); shSeekAbs(at); shWsZoom(); return }
+    if(gp){ WS.selGap = parseInt(gp.getAttribute('data-gap'), 10); WS.selPiece = null; shWsZoom(); return }
+    if(fr){ shWsStop(); shSeekAbs(parseFloat(fr.getAttribute('data-at'))); shWsTab('framing'); return }
+    if(cu){ shWsStop(); shSeekAbs(parseFloat(cu.getAttribute('data-at'))); shWsTab('captions'); return }
+    // Anywhere else: the playhead goes there, and follows while the button is held.
+    WS.selPiece = null; WS.selGap = null
+    shWsStop(); shSeekAbs(at); drag = {kind: 'scrub'}
     try{ z.setPointerCapture(e.pointerId) }catch(err){}
   })
   z.addEventListener('pointermove', function(e){
-    if(!WS.drag || !WS.selC || !WS.zwin) return
-    var rect = z.getBoundingClientRect(), w = WS.zwin
-    var t = w[0] + Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * (w[1] - w[0])
-    t = Math.round(t * 10) / 10
-    shPointSet(WS.selC, WS.drag, t)
+    var c = WS.selC; if(!drag || !c || !WS.zwin) return
+    var q = tAt(e)
+    if(drag.kind === 'scrub'){ shSeekAbs(q.t); return }
+    var s = shSnapTo(c, q.t, q.pps, drag.orig), t = Math.round(s.t * 100) / 100
+    snapLine(s.hit)
+    if(drag.kind === 'start' || drag.kind === 'end'){
+      if(shPointSet(c, drag.kind, t)) shTrimAt(c[drag.kind], drag.kind, drag.orig)
+      shWsZoom(); snapLine(s.hit)
+    } else {
+      var cuts = shCutsClean(c), k = drag.k, cut = cuts[k]; if(!cut) return
+      var lo = drag.side ? cut[0] + 0.1 : (k ? cuts[k - 1][1] + 0.5 : c.start + 0.5)
+      var hi = drag.side ? (k < cuts.length - 1 ? cuts[k + 1][0] - 0.5 : c.end - 0.5) : cut[1] - 0.1
+      cut[drag.side] = Math.max(lo, Math.min(hi, t)); c.cuts = cuts
+      shTrimAt(cut[drag.side], 'cut', drag.orig)
+      shWsCuts(); shPointRefresh(c); snapLine(s.hit)
+    }
   })
-  function end(){ if(WS.drag){ WS.drag = null; shWsZoom() } }
-  z.addEventListener('pointerup', end)
-  z.addEventListener('pointercancel', end)
+  function end(){
+    if(!drag) return
+    var c = WS.selC
+    if(drag.kind !== 'scrub' && c){
+      var s = WS.undo[WS.undo.length - 1]
+      if(s && s.c === c && s.start === c.start && s.end === c.end && JSON.stringify(s.cuts) === JSON.stringify(shCutsClean(c))) WS.undo.pop()     // nothing changed
+      shUndoBtns()
+    }
+    drag = null; WS.drag = null; shTrimShow(false); snapLine(null); shWsZoom()
+  }
+  z.addEventListener('pointerup', end); z.addEventListener('pointercancel', end)
+  window.addEventListener('resize', function(){ shWaveDraw() })
 })()
 
-// ---- Keyboard ----
+// ---- Buttons ----
+;(function(){
+  function on(id, fn){ var b = shEl(id); if(b) b.addEventListener('click', fn) }
+  on('ws-goin', function(){ shGoEdge('start') }); on('ws-goout', function(){ shGoEdge('end') })
+  on('ws-rev', function(){ shShuttle(-1) }); on('ws-ffw', function(){ shShuttle(1) })
+  on('ws-loop', shLoopToggle); on('ws-around', shPlayAround)
+  on('ws-rstart', function(){ shWsSetHere('start') }); on('ws-rend', function(){ shWsSetHere('end') })
+  on('ws-razor', shRazor); on('ws-rdel', shRippleDelete); on('ws-marker', shMarker)
+  on('ws-undo', shUndo); on('ws-redo', shRedo)
+  on('ws-keysbtn', function(){ shEl('ws-keys-dlg').classList.add('open') })
+  on('ws-snapbtn', function(){ WS.snap = !WS.snap; this.classList.toggle('on', WS.snap) })
+  on('ws-zin', function(){ shZoomBy(0.5) }); on('ws-zout', function(){ shZoomBy(2) }); on('ws-zfit', shZoomFit)
+  on('ws-beyondbtn', function(){ var cb = shEl('ws-beyond'); cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); this.classList.toggle('on', cb.checked) })
+  var tc = shEl('ws-tc')
+  if(tc) tc.addEventListener('keydown', function(e){
+    if(e.key !== 'Enter') return
+    e.preventDefault()
+    var t = shTcParse(tc.value), c = WS.selC
+    if(t != null && c){ shWsStop(); shSeekAbs(t + shPartOff(c)) }
+    tc.blur()
+  })
+  shUndoBtns()
+})()
+
+// ---- Keyboard: Premiere layout ----
 document.addEventListener('keydown', function(e){
-  if(WS.screen !== 'moments' || !SH.analysis || e.ctrlKey || e.metaKey || e.altKey) return
+  if(WS.screen !== 'moments' || !SH.analysis) return
   var rv = shEl('sh-review')
   if(!rv || rv.offsetParent === null) return
+  if(shEl('ws-keys-dlg').classList.contains('open')){ if(e.key === 'Escape' || e.key === '?') shEl('ws-keys-dlg').classList.remove('open'); return }
   var tg = e.target, tag = tg && tg.tagName, type = tg && tg.type
   if(tag === 'TEXTAREA' || tag === 'SELECT' || (tag === 'INPUT' && type !== 'checkbox' && type !== 'range')) return
   if((tag === 'BUTTON' || tag === 'INPUT') && (e.key === ' ' || e.key === 'Enter')) return
-  var i = shWsIndex(), k = e.key.toLowerCase()
-  if(e.key === ' '){ e.preventDefault(); if(window.shWsToggle) window.shWsToggle() }
-  else if(e.key === 'ArrowDown' || e.key === 'ArrowUp'){
+  var i = shWsIndex(), k = e.key, lk = k.toLowerCase(), mod = e.ctrlKey || e.metaKey
+  if(mod && lk === 'z'){ e.preventDefault(); if(e.shiftKey) shRedo(); else shUndo(); return }
+  if(mod && lk === 'y'){ e.preventDefault(); shRedo(); return }
+  if(mod && lk === 'k'){ e.preventDefault(); shRazor(); return }
+  if(mod && e.shiftKey && k === ' '){ e.preventDefault(); shLoopToggle(); return }
+  if(mod || e.altKey) return
+  if(k === ' '){ e.preventDefault(); shRevStop(); if(window.shWsToggle) window.shWsToggle() }
+  else if(lk === 'j'){ if(WS.kDown) shWsStep(-1); else shShuttle(-1) }
+  else if(lk === 'l'){ if(WS.kDown) shWsStep(1); else shShuttle(1) }
+  else if(lk === 'k'){ if(e.shiftKey) shPlayAround(); else if(!e.repeat){ WS.kDown = true; shShuttleStop() } }
+  else if(lk === 'i'){ if(e.shiftKey) shGoEdge('start'); else shWsSetHere('start') }
+  else if(lk === 'o'){ if(e.shiftKey) shGoEdge('end'); else shWsSetHere('end') }
+  else if(lk === 'q') shWsSetHere('start')
+  else if(lk === 'w') shWsSetHere('end')
+  else if(k === 'ArrowLeft' || k === 'ArrowRight'){ e.preventDefault(); shWsStep((k === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 5 : 1)) }
+  else if(k === 'ArrowUp' || k === 'ArrowDown'){ e.preventDefault(); shJumpEdit(k === 'ArrowUp' ? -1 : 1) }
+  else if(k === 'PageUp' || k === 'PageDown'){
     e.preventDefault()
-    var n = SH.cands[i + (e.key === 'ArrowDown' ? 1 : -1)]
+    var n = SH.cands[i + (k === 'PageDown' ? 1 : -1)]
     if(n) shWsSelect(n, 'key')
   }
-  else if(k === 'i') shWsSetHere('start')
-  else if(k === 'o') shWsSetHere('end')
-  else if(k === 'c' && !e.ctrlKey && !e.metaKey) shWsCutHere()
-  else if(e.key === 'Escape' && WS.cutFrom != null){ WS.cutFrom = null; shWsCuts() }
+  else if(k === 'Delete' || k === 'Backspace'){ e.preventDefault(); shRippleDelete() }
+  else if(lk === 'm') shMarker()
+  else if(lk === 's'){ WS.snap = !WS.snap; var sb = shEl('ws-snapbtn'); if(sb) sb.classList.toggle('on', WS.snap) }
+  else if(k === '+' || k === '=') shZoomBy(0.5)
+  else if(k === '-' || k === '_') shZoomBy(2)
+  else if(k === '\\') shZoomFit()
+  else if(k === '?'){ shEl('ws-keys-dlg').classList.add('open') }
+  else if(lk === 'c') shWsCutHere()
+  else if(k === 'Escape'){ if(WS.cutFrom != null){ WS.cutFrom = null; shWsCuts() } WS.selPiece = null; WS.selGap = null; shWsZoom() }
   else if(k === ',' || k === '<') shWsStep(-1)
   else if(k === '.' || k === '>') shWsStep(1)
-  else if(k === 'x' && WS.selC){
+  else if(lk === 'x' && WS.selC){
     var cb = document.querySelector('#sh-cands [data-act="keep"][data-i="' + i + '"]')
     if(cb){ cb.checked = !cb.checked; shCandChange({target: cb}) }
   }
 })
+document.addEventListener('keyup', function(e){ if(e.key && e.key.toLowerCase() === 'k') WS.kDown = false })
 
 function shortsAddCustom(){
   var note = shEl('sh-add-note'), a = SH.analysis
@@ -11492,6 +11949,7 @@ async function shCandCaptions(i){
       // Checked by the server (which also tidies overlaps), then kept with the moment.
       var v = await ask({start: r.start, end: r.end, cues: cues})
       if(!v.ok) return v.error || 'Those captions could not be used.'
+      if(typeof shHist === 'function') shHist(c)
       c.captions = {start: v.start, end: v.end, cues: v.cues}
       shDialogueRefresh(c)
       chip()
@@ -11785,6 +12243,7 @@ async function shCandFraming(i){
   setTimeout(startPv, 10000)          // a still that never comes does not hold the preview back for good
   host.querySelector('[data-fr-save]').addEventListener('click', function(){
     var f = current()
+    if(typeof shHist === 'function' && JSON.stringify(c.framing || null) !== JSON.stringify(f || null)) shHist(c)
     if(f) c.framing = f; else delete c.framing
     chip()
     shReviewChanged()

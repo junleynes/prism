@@ -4598,3 +4598,23 @@ def test_an_ending_sound_and_overlay_can_come_from_the_editors_computer(env, mon
     assert not [n for n in os.listdir(main.app.config['UPLOAD_FOLDER']) if n.endswith('.part')]
     html = client.get('/').get_data(as_text=True)
     assert "shAssetUpload('sfx', this)" in html and "shAssetUpload('overlay', this)" in html
+
+
+def test_the_editor_has_premiere_style_controls_tracks_and_undo(env, monkeypatch):
+    Services(monkeypatch)
+    client, headers = _client()
+    aid = _analysis(client, _analyze(client, headers, env))['analysis_id']
+    w = client.post('/api/shorts/waveform', headers=headers, json={'analysis_id': aid, 'start': 2.0, 'end': 8.0, 'bins': 120}).get_json()
+    assert w['ok'] and len(w['peaks']) == 120 and all(0.0 <= x <= 1.0 for x in w['peaks']) and max(w['peaks']) == 1.0
+    assert client.post('/api/shorts/waveform', headers=headers, json={'analysis_id': aid, 'start': 8, 'end': 2}).status_code == 400
+    assert client.post('/api/shorts/waveform', headers=headers, json={'analysis_id': 'gone', 'start': 0, 'end': 2}).status_code == 404
+    html = client.get('/').get_data(as_text=True)
+    # Icon buttons, the name and shortcut in the tooltip.
+    for ident, tip in (('ws-setin', 'Mark In (I)'), ('ws-rev', 'Shuttle back (J)'), ('ws-ffw', 'Shuttle forward (L)'), ('ws-razor', 'Add edit at playhead (Ctrl+K)'),
+                       ('ws-rdel', 'Ripple delete'), ('ws-undo', 'Undo (Ctrl+Z)'), ('ws-loop', 'Loop In to Out'), ('ws-around', 'Play around'), ('ws-snapbtn', 'Snapping (S)')):
+        i = html.index(f'id={ident} ')
+        assert f'title="{tip}' in html[i:i + 200], ident
+    for fn in ('function shShuttle(dir)', 'function shRazor()', 'function shRippleDelete()', 'function shUndo()', 'function shJumpEdit(dir)',
+               'function shTrimAt(', 'function shSnapTo(', "'/api/shorts/waveform'", "lk === 'j'", "mod && lk === 'k'", "k === 'PageDown'"):
+        assert fn in html, fn
+    assert 'id=ws-keys-dlg' in html and 'id=ws-trimview' in html and 'data-lane="v1"' in html and 'data-lane="cap"' in html

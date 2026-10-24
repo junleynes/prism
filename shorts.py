@@ -4001,6 +4001,61 @@ def _overlay_preview_cmd(still, held, n, fps, w, h, overlay, lead_src, out):
         '-movflags', '+faststart', out]
 
 
+_WAVE_CACHE = {}
+
+
+@app.route('/api/shorts/waveform', methods=['POST'])
+@require_permission('vertical_shorts')
+def api_shorts_waveform():
+    """The sound of a stretch of the episode as peaks (0..1), `bins` of them, for the editor's audio track: where
+    the lines and the pauses are, to cut on. Read from the episode's editing copy when there is one (small and
+    quick), else from the episode itself."""
+    data = request.get_json(silent=True) or {}
+    a, err = _analysis_or_error(str(data.get('analysis_id') or '').strip())
+    if err:
+        return err
+    try:
+        start, end = float(data.get('start')), float(data.get('end'))
+        bins = max(50, min(4000, int(data.get('bins') or 800)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error='Invalid range.'), 400
+    start = max(0.0, start)
+    if not end > start or end - start > 1800:
+        return jsonify(ok=False, error='Invalid range.'), 400
+    k, _ = _locate(a, start, start)
+    v = _part_view(a, k)
+    off = v.get('_offset', 0.0)
+    src = v['path']
+    proxy = os.path.join(app.config['UPLOAD_FOLDER'], _proxy_name(v['path']))
+    if os.path.exists(proxy) and os.path.getsize(proxy) > 0:
+        src = proxy
+    if not os.path.exists(src):
+        return _source_gone(v)
+    s0, dur = start - off, min(end, off + float(v['info']['duration'])) - start
+    if dur <= 0:
+        return jsonify(ok=True, peaks=[])
+    key = (src, round(s0, 2), round(dur, 2), bins)
+    if key not in _WAVE_CACHE:
+        rate = 4000
+        try:
+            r = subprocess.run([pipeline.FFMPEG, '-v', 'error', '-ss', f'{s0:.3f}', '-t', f'{dur:.3f}', '-i', src, '-vn',
+                                '-ac', '1', '-ar', str(rate), '-f', 's16le', '-'], capture_output=True, timeout=60)
+            pcm = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        except (OSError, subprocess.SubprocessError):
+            pcm = np.zeros(0, dtype=np.float32)
+        if pcm.size:
+            edges = np.linspace(0, pcm.size, bins + 1).astype(int)
+            peaks = [float(np.abs(pcm[a_:b_]).max()) if b_ > a_ else 0.0 for a_, b_ in zip(edges, edges[1:])]
+            top = max(peaks) or 1.0
+            peaks = [round(min(1.0, (p_ / top) ** 0.6), 3) for p_ in peaks]
+        else:
+            peaks = []
+        if len(_WAVE_CACHE) > 64:
+            _WAVE_CACHE.clear()
+        _WAVE_CACHE[key] = peaks
+    return jsonify(ok=True, start=start, end=start + dur, peaks=_WAVE_CACHE[key])
+
+
 @app.route('/api/shorts/liveplan', methods=['POST'])
 @require_permission('vertical_shorts')
 def api_shorts_liveplan():
