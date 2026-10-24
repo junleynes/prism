@@ -2620,6 +2620,40 @@ def _resolve_ending_sfx(opts):
 _OVERLAY_EXTS = {'mov', 'webm', 'mp4', 'mkv', 'avi'}
 
 
+_ALPHA_PIX = re.compile(r'^(yuva|gbrap|rgba|bgra|argb|abgr|ya\d|pal8$)')
+_ALPHA_SEEN = {}
+
+
+def _has_alpha(path):
+    """True when the first picture stream carries transparency: an alpha pixel format (ProRes 4444 with alpha,
+    QuickTime Animation, PNG in a .mov, FFV1 RGBA...) or VP9/VP8 in WebM flagged alpha_mode=1 (ffprobe reports
+    those as plain yuv420p; the alpha is a side channel)."""
+    try:
+        st = os.stat(path)
+        key = (path, st.st_size, st.st_mtime)
+    except OSError:
+        return False
+    if key in _ALPHA_SEEN:
+        return _ALPHA_SEEN[key]
+    try:
+        r = subprocess.run([pipeline.FFPROBE, '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                            'stream=codec_name,pix_fmt:stream_tags', '-of', 'json', path],
+                           capture_output=True, text=True, timeout=30)
+        v = (json.loads(r.stdout or '{}').get('streams') or [{}])[0]
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return False
+    tags = {str(k).lower(): str(x) for k, x in (v.get('tags') or {}).items()}
+    ok = bool(_ALPHA_PIX.match(str(v.get('pix_fmt') or ''))) or tags.get('alpha_mode') == '1'
+    if len(_ALPHA_SEEN) > 200:
+        _ALPHA_SEEN.clear()
+    _ALPHA_SEEN[key] = ok
+    return ok
+
+
+_NO_ALPHA = ('{name} has no transparency (alpha channel), so it would cover the whole picture. A transition overlay '
+             'has to be a video with alpha: ProRes 4444 or QuickTime Animation (.mov), or VP9 with alpha (.webm).')
+
+
 def _overlay_facts(path):
     """{'dur', 'audio'} of an overlay video, as the render needs them."""
     info = pipeline.probe_media_info(path) or {}
@@ -2639,6 +2673,8 @@ def _resolve_ending_overlay(opts):
         path = pipeline.restage(name)[0] or path
     if not name.startswith('net_') or ext not in _OVERLAY_EXTS or not os.path.isfile(path):
         return None, 'The transition overlay is no longer available -- pick it again.'
+    if not _has_alpha(path):
+        return None, _NO_ALPHA.format(name=re.sub(r'^net_\d+_', '', name))
     _touch(path)
     return dict(_overlay_facts(path), path=path, name=re.sub(r'^net_\d+_', '', name)), None
 
@@ -2662,6 +2698,16 @@ def _asset_streams(path):
     except (TypeError, ValueError):
         dur = 0.0
     return {x.get('codec_type') for x in d.get('streams') or []}, dur
+
+
+@app.route('/api/shorts/overlay-check', methods=['POST'])
+@require_permission('vertical_shorts')
+def api_shorts_overlay_check():
+    """Whether a transition overlay just picked can be used (it must have transparency), said at once rather
+    than when the preview or the render reaches it."""
+    name = str((request.get_json(silent=True) or {}).get('name') or '')
+    _, err = _resolve_ending_overlay({'ending': 'cliffhanger', 'ending_overlay_name': name})
+    return jsonify(ok=err is None, error=err)
 
 
 @app.route('/api/shorts/asset-upload', methods=['POST'])
@@ -2703,6 +2749,8 @@ def api_shorts_asset_upload():
         if need not in kinds or dur <= 0:
             raise ValueError('That file has no sound in it that can be read.' if kind == 'sfx'
                              else 'That file has no picture in it that can be read.')
+        if kind == 'overlay' and not _has_alpha(part):
+            raise ValueError(_NO_ALPHA.format(name=base))
         os.replace(part, path)
     except ValueError as e:
         return jsonify(ok=False, error=str(e)), 400

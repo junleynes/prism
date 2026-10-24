@@ -3144,12 +3144,11 @@ def test_a_cliffhanger_transition_overlay_is_rendered_and_kept_with_the_batch(en
     plain = _render(client, headers, a['analysis_id'], item, reframe='fit', subtitles=False,
                     ending_overlay=staged)['result']['batch']
     assert plain['options']['ending_overlay'] is None
-    # An overlay ffmpeg cannot read costs the short nothing: it is made without it.
+    # An overlay that is not a video with transparency is refused before anything is rendered.
     open(os.path.join(main.app.config['UPLOAD_FOLDER'], staged), 'wb').write(b'not a video')
-    monkeypatch.setattr(shorts, '_overlay_facts', lambda p: {'dur': 0.6, 'audio': False})
-    bad = _render(client, headers, a['analysis_id'], item, reframe='fit', subtitles=False, ending='cliffhanger',
-                  ending_overlay=staged)['result']['batch']
-    assert len(bad['shorts']) == 1 and not bad['errors']
+    r = client.post('/api/shorts/render', headers=headers, json={'analysis_id': a['analysis_id'], 'items': item, 'reframe': 'fit',
+                                                                 'subtitles': False, 'ending': 'cliffhanger', 'ending_overlay': staged})
+    assert r.status_code == 400 and 'transparency' in r.get_json()['error']
 
 
 def test_a_render_takes_the_cliffhanger_hold_and_sound_effect_and_keeps_the_effect_with_the_batch(env, monkeypatch, tmp_path):
@@ -4559,7 +4558,11 @@ def test_an_ending_sound_and_overlay_can_come_from_the_editors_computer(env, mon
     client, headers = _client(user_id=7, role='user', username='ana')
     wav, mov, txt = tmp_path / 'boom.wav', tmp_path / 'swoosh.mov', tmp_path / 'fake.wav'
     subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'sine=d=1', str(wav)], check=True)
-    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=64x64:d=1', '-c:v', 'qtrle', str(mov)], check=True)
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=64x64:d=1,format=rgba', '-c:v', 'qtrle', str(mov)], check=True)
+    flat, webm = tmp_path / 'flat.mov', tmp_path / 'glow.webm'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=64x64:d=1', '-c:v', 'qtrle', '-pix_fmt', 'rgb24', str(flat)], check=True)
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red@0.5:s=64x64:d=1,format=yuva420p',
+                    '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-deadline', 'realtime', str(webm)], check=True)
     txt.write_text('not a sound at all')
 
     def up(kind, path, name=None):
@@ -4578,6 +4581,17 @@ def test_an_ending_sound_and_overlay_can_come_from_the_editors_computer(env, mon
     assert up('sfx', txt).status_code == 400 and 'no sound' in up('sfx', txt).get_json()['error']
     assert up('sfx', mov).status_code == 400, 'a video is not a sound effect'
     assert up('overlay', wav, 'boom.mov').status_code == 400, 'no picture in it'
+    # Transparency or nothing: a plain picture would cover the whole short.
+    r = up('overlay', flat)
+    assert r.status_code == 400 and 'transparency' in r.get_json()['error']
+    assert up('overlay', webm).get_json()['ok'], 'VP9 with alpha in WebM'
+    # Picked from the library, one without alpha is turned away at once.
+    staged = 'net_1_flat.mov'
+    import shutil as _sh
+    _sh.copy(flat, os.path.join(main.app.config['UPLOAD_FOLDER'], staged))
+    c = client.post('/api/shorts/overlay-check', headers=headers, json={'name': staged}).get_json()
+    assert c['ok'] is False and 'transparency' in c['error']
+    assert client.post('/api/shorts/overlay-check', headers=headers, json={'name': o['filename']}).get_json()['ok']
     assert up('script', wav).status_code == 400
     monkeypatch.setitem(shorts.SHORTS_ASSET_MAX_MB, 'sfx', 0)
     assert 'larger than' in up('sfx', wav).get_json()['error']

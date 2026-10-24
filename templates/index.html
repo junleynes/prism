@@ -8699,12 +8699,12 @@ document.getElementById('vf').addEventListener('submit', async function(e){
              title="How far the picture creeps in over the hold, as a percentage of its size. 0 keeps it still."> %
     </span>
     <span class="sh-overlay" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap" title="A video with transparency (ProRes 4444 or QuickTime Animation .mov, or VP9 .webm) from the Transitions folder, played over the ending">Transition overlay
-      <input type=file id=sh-overlay-up accept=".mov,.webm,.mp4,.mkv,.avi" onchange="shAssetUpload('overlay', this)" title="A transition overlay from your computer">
+      <input type=file id=sh-overlay-up accept=".mov,.webm,.mkv" onchange="shAssetUpload('overlay', this)" title="A transition overlay from your computer">
       <button type=button class="browse-btn" onclick="openNetworkBrowser('shorts_overlay','transitions','Transition overlay for the ending')">Browse library</button>
       <input type=hidden id=shorts_overlay_network name=shorts_overlay_network value="">
       <span class="net-file-chip" id=shorts_overlay_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('shorts_overlay')">&#10005;</span></span>
     </span>
-    <div class="sh-note" style="margin:0">Optional. A video with transparency (ProRes 4444 or QuickTime Animation .mov, or VP9 .webm) from the <b>Transitions</b> folder, played over the picture centred on the instant it freezes; its sound, if any, is mixed in. Cut off at the black.</div>
+    <div class="sh-note" style="margin:0">Optional. A video with transparency (ProRes 4444 or QuickTime Animation .mov, or VP9 with alpha .webm) from the <b>Transitions</b> folder or your computer, played over the picture centred on the instant it freezes; its sound, if any, is mixed in. Cut off at the black. A video without an alpha channel is refused: it would cover the whole picture.</div>
     <span class="sh-sfx" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">Sound effect
       <input type=file id=sh-sfx-up accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.wma" onchange="shAssetUpload('sfx', this)" title="A sound effect from your computer">
       <button type=button class="browse-btn" onclick="openNetworkBrowser('shorts_sfx','sfx','Sound effect for the ending')">Browse library</button>
@@ -12107,11 +12107,24 @@ function shAssetUpload(kind, input){
   fetch('/api/shorts/asset-upload', {method: 'POST', body: fd}).then(function(r){ return r.json() }).then(function(d){
     input.value = ''
     if(!d.ok){ chip.querySelector('.chip-name').textContent = d.error || 'Could not upload it.'; chip.style.color = 'var(--tally)'; shEl(field + '_network').value = ''; return }
+    if(kind === 'overlay') chip.style.color = ''
     chip.style.color = ''
     shEl(field + '_network').value = d.filename
     setChip(field, d.orig_name + ' \u2014 from your computer', d.size)
     if(kind === 'overlay' && typeof shEndingPreviewSoon === 'function') shEndingPreviewSoon()
   }).catch(function(e){ input.value = ''; chip.querySelector('.chip-name').textContent = 'Could not upload it: ' + e; chip.style.color = 'var(--tally)' })
+}
+
+// A transition overlay has to have transparency: one without is refused as soon as it is picked.
+window.shOverlayCheck = function(){
+  var name = shEl('shorts_overlay_network').value, chip = shEl('shorts_overlay_chip')
+  if(!name) return
+  shWsPost('/api/shorts/overlay-check', {name: name}).then(function(r){
+    if(r.ok || shEl('shorts_overlay_network').value !== name) return
+    shEl('shorts_overlay_network').value = ''
+    chip.style.display = 'inline-flex'; chip.style.color = 'var(--tally)'
+    chip.querySelector('.chip-name').textContent = r.error || 'This overlay cannot be used.'
+  }).catch(function(){})
 }
 
 // The same destinations the promo generator sends to (Config > Network),
@@ -17360,6 +17373,7 @@ document.addEventListener('DOMContentLoaded', function(){
     chip.querySelector('.chip-name').textContent = name + (size != null ? ' (' + humanSize(size) + ')' : '')
     refreshAllAssetSummaries()
     if(/^shorts_/.test(fieldName)){ if(window.shSfxSync) setTimeout(window.shSfxSync, 0); if(window.shSelSchedule) window.shSelSchedule() }
+    if(fieldName === 'shorts_overlay' && window.shOverlayCheck) window.shOverlayCheck()
     if(/^schedule_/.test(fieldName) && window.spSelSchedule) window.spSelSchedule()
   }
   window.setChip = setChip
@@ -17402,6 +17416,7 @@ document.addEventListener('DOMContentLoaded', function(){
     }
     refreshAllAssetSummaries()
     if(/^shorts_/.test(fieldName)){ if(window.shSfxSync) setTimeout(window.shSfxSync, 0); if(window.shSelSchedule) window.shSelSchedule() }
+    if(fieldName === 'shorts_overlay' && window.shOverlayCheck) window.shOverlayCheck()
     if(/^schedule_/.test(fieldName) && window.spSelSchedule) window.spSelSchedule()
   }
   window.clearNetworkField = clearChip
