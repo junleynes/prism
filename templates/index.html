@@ -8449,8 +8449,8 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   <div>
     <label for=sh-mode>What to make</label>
     <select id=sh-mode onchange="shModeSync()">
-      <option value=moments selected>Best moments</option>
-      <option value=minidrama>Mini-drama</option>
+      <option value=moments>Best moments</option>
+      <option value=minidrama selected>Mini-drama</option>
       <option value=highlights>Highlight reel</option>
     </select>
   </div>
@@ -8464,9 +8464,9 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   <div id=sh-len-wrap>
     <label>Length of each short (seconds)</label>
     <div style="display:flex;gap:8px;align-items:center">
-      <input type=number id=sh-min class=sh-num value=120 min=5 max=240 step=5>
+      <input type=number id=sh-min class=sh-num value=90 min=5 max=240 step=5>
       <span style="font-size:12px;opacity:.7">to</span>
-      <input type=number id=sh-max class=sh-num value=180 min=10 max=300 step=5>
+      <input type=number id=sh-max class=sh-num value=100 min=10 max=300 step=5>
     </div>
   </div>
   <div id=sh-ep-wrap style="display:none">
@@ -8481,10 +8481,10 @@ document.getElementById('vf').addEventListener('submit', async function(e){
     <label for=sh-count id=sh-count-label>Moments to find</label>
     <select id=sh-count onchange="shCountNote()">
       <option value=1>Up to 1</option><option value=2>Up to 2</option><option value=3>Up to 3</option>
-      <option value=5>Up to 5</option><option value=8 selected>Up to 8</option>
+      <option value=5>Up to 5</option><option value=8>Up to 8</option>
       <option value=12>Up to 12</option><option value=20>Up to 20</option>
       <option value=50>Up to 50</option><option value=100>Up to 100</option>
-      <option value=auto>Auto &mdash; every strong moment</option>
+      <option value=auto selected>Auto &mdash; every strong moment</option>
     </select>
   </div>
   <div>
@@ -8553,7 +8553,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
     </div>
     <div>
       <label>Frames to rate:</label>
-      <input type=number id=sh-frames class=sh-num value=90 min=10 max=300 step=10>
+      <input type=number id=sh-frames class=sh-num value=120 min=10 max=300 step=10>
     </div>
   </div>
   <p class="sh-note">One model for both jobs keeps a single model on the GPU. Pick a separate story model only if you have a stronger text model pulled and the memory for both. Frames to rate is the number of vision calls for the whole video, however long it is &mdash; more is slower, not always better.</p>
@@ -8593,7 +8593,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   </section>
   <section class="sh-out-card" aria-label="Cuts">
     <h4>Cuts</h4>
-    <div class="sh-fld"><span class="sh-fld-l">Where pieces join</span><select id=sh-cut-join title="How the two sides of a part cut out of the middle of a moment meet, and the scenes of a highlight reel"><option value=fade selected>Short crossfade (0.3 s)</option><option value=cut>Hard cut</option></select></div>
+    <div class="sh-fld"><span class="sh-fld-l">Where pieces join</span><select id=sh-cut-join title="How the two sides of a part cut out of the middle of a moment meet, and the scenes of a highlight reel"><option value=fade>Short crossfade (0.3 s)</option><option value=cut selected>Hard cut</option></select></div>
   </section>
   <section class="sh-out-card" aria-label="Captions">
     <h4>Captions</h4>
@@ -8612,7 +8612,7 @@ document.getElementById('vf').addEventListener('submit', async function(e){
       <span id=sh-hl-pal style="display:none;align-items:center;gap:4px" title="The colour of the word being said"><button type=button class=sh-sw data-c=yellow title="Yellow" style="background:#FFD400" onclick="shHlPick('yellow')"></button><button type=button class=sh-sw data-c=green title="Green" style="background:#39E75F" onclick="shHlPick('green')"></button><button type=button class=sh-sw data-c=cyan title="Cyan" style="background:#2EDFFF" onclick="shHlPick('cyan')"></button><button type=button class=sh-sw data-c=orange title="Orange" style="background:#FF8A1F" onclick="shHlPick('orange')"></button><button type=button class=sh-sw data-c=pink title="Pink" style="background:#FF4FA3" onclick="shHlPick('pink')"></button><button type=button class=sh-sw data-c=red title="Red" style="background:#FF3B3B" onclick="shHlPick('red')"></button><button type=button class=sh-sw data-c=purple title="Purple" style="background:#B07CFF" onclick="shHlPick('purple')"></button><button type=button class=sh-sw data-c=white title="White" style="background:#FFFFFF" onclick="shHlPick('white')"></button><input type=color id=sh-hl-custom value="#ffd400" title="Pick any colour" oninput="shHlPick(this.value)" style="width:26px;height:22px;padding:0;border:1px solid var(--line);background:none;cursor:pointer"></span>
     </label></div>
     <div class="sh-chk"><label title="Mini-drama only: burn EP 1, EP 2&hellip; into each chapter, and NEXT: EP n+1 at its end" style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;text-transform:none;letter-spacing:0;font-size:12px;font-family:inherit;color:var(--ink)">
-      <input type=checkbox id=sh-ep-labels checked> Burn in EP labels
+      <input type=checkbox id=sh-ep-labels> Burn in EP labels
     </label></div>
     <div class="sh-chk" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
       <label style="font-size:12px;text-transform:none;letter-spacing:0">Opening label <input type=text id=sh-ep-text class=input-box maxlength=40 placeholder="EP {n}" value="EP {n}" style="width:130px" title="{n} is the chapter number, e.g. Episode {n}"></label>
@@ -8622,7 +8622,8 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   <section class="sh-out-card" aria-label="Delivery">
     <h4>Delivery</h4>
     <div class="sh-fld"><span class="sh-fld-l">Format</span><select id=sh-format title="The file each short is delivered as" onchange="shFormatNote()">
-        <option value=mp4_high selected>MP4 (H.264 High Profile)</option>
+        <option value=mp4_high>MP4 (H.264 High Profile)</option>
+        <option value=tiktok selected>TikTok upload (MP4 1080x1920, 30 fps, H.264 + AAC)</option>
       </select></div>
     <div class="sh-fld"><span class="sh-fld-l">Audio level</span><select id=sh-level title="How loud each short is, overall (integrated loudness). Online video is levelled to about &minus;14 LUFS; broadcast to &minus;23 or &minus;24.">
         <option value="" selected>&minus;14 LUFS &mdash; online video</option>
@@ -8631,8 +8632,8 @@ document.getElementById('vf').addEventListener('submit', async function(e){
   <section class="sh-out-card sh-out-wide" aria-label="Ending">
     <h4>Ending</h4>
     <div class="sh-fld"><span class="sh-fld-l">Ending</span><select id=sh-ending title="How every short in this render finishes" onchange="shEndingChanged()">
-        <option value=none selected>Cut on the last frame</option>
-        <option value=cliffhanger id=sh-ending-cliff>Cliffhanger &mdash; freeze, slow push-in, cut to black (+3.4 s)</option>
+        <option value=none>Cut on the last frame</option>
+        <option value=cliffhanger id=sh-ending-cliff selected>Cliffhanger &mdash; freeze, slow push-in, cut to black (+3.4 s)</option>
       </select></div>
     <div class="sh-chk sh-fade">
     <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;margin:0;cursor:pointer"
@@ -8918,7 +8919,7 @@ function shCapModeSync(which){
   if(typeof shWsDraw === 'function') shWsDraw()
   if(typeof shWsOutSum === 'function') shWsOutSum()
 }
-setTimeout(function(){ shCapModeSync() }, 0)
+setTimeout(function(){ shCapModeSync(); if(typeof shModeSync === 'function') shModeSync(); if(typeof shEndingChanged === 'function') shEndingChanged(); if(typeof shCountNote === 'function') shCountNote() }, 0)
 function shModeSync(){
   var mini = shEl('sh-mode').value === 'minidrama'
   shEl('sh-mode-note').style.display = mini ? 'block' : 'none'

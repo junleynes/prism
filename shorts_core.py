@@ -2843,7 +2843,7 @@ CLIFF_MOTIONS = {
     'drift': 'Push in and drift sideways',
     'float': 'Float (in, then back out)',
 }
-DEFAULT_LOOK, DEFAULT_MOTION = 'drama', 'push'
+DEFAULT_LOOK, DEFAULT_MOTION = 'drama', 'drift'
 
 
 def clamp_choice(v, table, default):

@@ -81,7 +81,7 @@ SHORTS_PROJECTS_DIR = os.path.abspath(os.environ.get('SHORTS_PROJECTS_DIR')
 SHORTS_ANALYSES_DIR = os.path.abspath(os.environ.get('SHORTS_ANALYSES_DIR')
                                       or os.path.join(LIBRARY_DIR, 'shorts_analyses'))
 
-SHORTS_VISION_FRAMES = _env_num('SHORTS_VISION_FRAMES', 90, int)       # vision calls per analysis, whatever the source length
+SHORTS_VISION_FRAMES = _env_num('SHORTS_VISION_FRAMES', 120, int)       # vision calls per analysis, whatever the source length
 SHORTS_STORY_CHUNK_SEC = _env_num('SHORTS_STORY_CHUNK_SEC', 300)       # transcript handed to the story model per call
 SHORTS_STORY_OVERLAP_SEC = _env_num('SHORTS_STORY_OVERLAP_SEC', 60)
 SHORTS_STORY_NUM_CTX = _env_num('SHORTS_STORY_NUM_CTX', 8192, int)
@@ -98,7 +98,7 @@ SHORTS_FADE = sc.clamp_fade(_env_num('SHORTS_FADE', 1.0)) or 1.0      # the fade
 # The language the dialogue is in, when it is nearly always the same one
 # (a station's own programmes): the form starts on it. Empty: Whisper decides.
 SHORTS_LANGUAGE = pipeline.normalize_language(os.environ.get('SHORTS_LANGUAGE'))
-SHORTS_CLIFF_HOLD = sc.clamp_hold(_env_num('SHORTS_CLIFF_HOLD', 3.0)) or 3.0
+SHORTS_CLIFF_HOLD = sc.clamp_hold(_env_num('SHORTS_CLIFF_HOLD', 5.0)) or 5.0
 SHORTS_TRUE_PEAK = _env_num('SHORTS_TRUE_PEAK', -1.5)
 SHORTS_SUB_FONT = os.environ.get('SHORTS_SUB_FONT', 'Arial')
 SHORTS_FACE_MODEL = os.environ.get('SHORTS_FACE_MODEL', '')

@@ -1068,7 +1068,7 @@ def test_the_cliffhanger_ending_stops_dead_holds_and_cuts_to_black(env, monkeypa
                   ending='freeze')['result']['batch']
     assert plain['options']['ending'] == 'none' and ended['options']['ending'] == 'cliffhanger'
     assert old['options']['ending'] == 'none', 'an ending this version does not have is no ending'
-    assert client.get('/api/shorts/options').get_json()['ending_seconds'] == 3.4
+    assert client.get('/api/shorts/options').get_json()['ending_seconds'] == 5.4
     p, e = plain['shorts'][0], ended['shorts'][0]
     assert abs(p['duration'] - 4.0) < 0.05 and abs(e['duration'] - 6.24) < 0.05
     plain_path = os.path.join(shorts.SHORTS_DIR, plain['batch_id'], p['file'])
@@ -1507,11 +1507,12 @@ def test_lengths_default_to_120_to_180_seconds_and_a_hundred_moments_can_be_aske
         [50, 100, 100, 'auto', 'auto', 8]
 
     html = client.get('/').get_data(as_text=True)
-    assert 'id=sh-min class=sh-num value=120 ' in html and 'id=sh-max class=sh-num value=180 ' in html
+    # The page's own defaults (a script that sends nothing still gets 120-180 and up to 8).
+    assert 'id=sh-min class=sh-num value=90 ' in html and 'id=sh-max class=sh-num value=100 ' in html
     menu = html[html.index('<select id=sh-count'):]
     menu = menu[:menu.index('</select>')]
     assert re.findall(r'<option value=(\w+)( selected)?>', menu) == [
-        ('1', ''), ('2', ''), ('3', ''), ('5', ''), ('8', ' selected'), ('12', ''), ('20', ''), ('50', ''), ('100', ''), ('auto', '')]
+        ('1', ''), ('2', ''), ('3', ''), ('5', ''), ('8', ''), ('12', ''), ('20', ''), ('50', ''), ('100', ''), ('auto', ' selected')]
 
 
 def test_a_moment_that_cannot_reach_the_minimum_length_is_left_out_and_the_editor_is_told(env, monkeypatch):
@@ -3155,7 +3156,7 @@ def test_a_render_takes_the_cliffhanger_hold_and_sound_effect_and_keeps_the_effe
     Services(monkeypatch)
     client, headers = _client()
     opts = client.get('/api/shorts/options').get_json()
-    assert opts['ending_hold'] == 3.0 and opts['ending_hold_range'] == [0.5, 8.0] and opts['ending_black'] == 0.4
+    assert opts['ending_hold'] == 5.0 and opts['ending_hold_range'] == [0.5, 8.0] and opts['ending_black'] == 0.4
     a = _analysis(client, _analyze(client, headers, env))
     item = [{'start': 2.0, 'end': 6.0, 'title': 'Moment'}]
     staged = _stage_sfx(tmp_path)
@@ -3700,7 +3701,7 @@ def test_what_was_chosen_is_kept_with_the_project_and_comes_back(env, monkeypatc
 def test_the_page_saves_restores_and_retries(users_db):
     client, _ = _client()
     html = client.get('/').get_data(as_text=True)
-    for needle in ('id=sh-ep-labels checked', 'episode_labels: shEl', 'shSelCapture', 'shSelRestore(here)', 'shSelDefaults()',
+    for needle in ('id=sh-ep-labels>', 'episode_labels: shEl', 'shSelCapture', 'shSelRestore(here)', 'shSelDefaults()',
                    "clearNetworkField('shorts_sfx')", "/selections'", 'e.retry = function', "add('Retry'", 'shRunRender', 'shRunAnalyze'):
         assert needle in html, needle
 
@@ -3862,7 +3863,7 @@ def test_page_offers_a_no_wide_shots_reframe_and_preset(users_db):
 def test_cliffhanger_look_and_movement_are_offered_and_kept(env, monkeypatch):
     client, headers = _client()
     o = client.get('/api/shorts/options').get_json()
-    assert o['ending_look'] == 'drama' and 'bw' in o['ending_looks'] and o['ending_motion'] == 'push' and 'float' in o['ending_motions']
+    assert o['ending_look'] == 'drama' and 'bw' in o['ending_looks'] and o['ending_motion'] == 'drift' and 'float' in o['ending_motions']
     html = client.get('/').get_data(as_text=True)
     assert 'id=sh-ending-look' in html and 'id=sh-ending-motion' in html and 'ending_look: shEl' in html
 
