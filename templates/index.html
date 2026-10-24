@@ -8699,12 +8699,14 @@ document.getElementById('vf').addEventListener('submit', async function(e){
              title="How far the picture creeps in over the hold, as a percentage of its size. 0 keeps it still."> %
     </span>
     <span class="sh-overlay" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap" title="A video with transparency (ProRes 4444 or QuickTime Animation .mov, or VP9 .webm) from the Transitions folder, played over the ending">Transition overlay
+      <input type=file id=sh-overlay-up accept=".mov,.webm,.mp4,.mkv,.avi" onchange="shAssetUpload('overlay', this)" title="A transition overlay from your computer">
       <button type=button class="browse-btn" onclick="openNetworkBrowser('shorts_overlay','transitions','Transition overlay for the ending')">Browse library</button>
       <input type=hidden id=shorts_overlay_network name=shorts_overlay_network value="">
       <span class="net-file-chip" id=shorts_overlay_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('shorts_overlay')">&#10005;</span></span>
     </span>
     <div class="sh-note" style="margin:0">Optional. A video with transparency (ProRes 4444 or QuickTime Animation .mov, or VP9 .webm) from the <b>Transitions</b> folder, played over the picture centred on the instant it freezes; its sound, if any, is mixed in. Cut off at the black.</div>
     <span class="sh-sfx" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">Sound effect
+      <input type=file id=sh-sfx-up accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.wma" onchange="shAssetUpload('sfx', this)" title="A sound effect from your computer">
       <button type=button class="browse-btn" onclick="openNetworkBrowser('shorts_sfx','sfx','Sound effect for the ending')">Browse library</button>
       <input type=hidden id=shorts_sfx_network name=shorts_sfx_network value="">
       <span class="net-file-chip" id=shorts_sfx_chip><span class=chip-name></span><span class=chip-x onclick="clearNetworkField('shorts_sfx')">&#10005;</span></span>
@@ -12093,6 +12095,24 @@ function shDatedInit(chk){
   chk.addEventListener('change', function(){ try{ localStorage.setItem('sh_project_folder', chk.checked ? '1' : '0') }catch(e){} })
 }
 function shDatedGet(chk){ return !!(chk && chk.checked) }
+
+// An ending sound effect or transition overlay from this computer, like a caption file: sent to the server
+// when chosen and then used exactly like one picked with Browse library.
+function shAssetUpload(kind, input){
+  var f = input.files && input.files[0]; if(!f) return
+  var field = kind === 'sfx' ? 'shorts_sfx' : 'shorts_overlay'
+  var chip = shEl(field + '_chip')
+  chip.style.display = 'inline-flex'; chip.querySelector('.chip-name').textContent = 'Uploading ' + f.name + '\u2026'
+  var fd = new FormData(); fd.append('kind', kind); fd.append('file', f)
+  fetch('/api/shorts/asset-upload', {method: 'POST', body: fd}).then(function(r){ return r.json() }).then(function(d){
+    input.value = ''
+    if(!d.ok){ chip.querySelector('.chip-name').textContent = d.error || 'Could not upload it.'; chip.style.color = 'var(--tally)'; shEl(field + '_network').value = ''; return }
+    chip.style.color = ''
+    shEl(field + '_network').value = d.filename
+    setChip(field, d.orig_name + ' \u2014 from your computer', d.size)
+    if(kind === 'overlay' && typeof shEndingPreviewSoon === 'function') shEndingPreviewSoon()
+  }).catch(function(e){ input.value = ''; chip.querySelector('.chip-name').textContent = 'Could not upload it: ' + e; chip.style.color = 'var(--tally)' })
+}
 
 // The same destinations the promo generator sends to (Config > Network),
 // limited to the ones set up to receive finished video.

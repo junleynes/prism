@@ -4553,3 +4553,34 @@ def test_burned_in_and_embedded_captions_are_one_or_the_other(env, monkeypatch):
     html = client.get('/').get_data(as_text=True)
     assert 'id=sh-cap-mode' in html and all(f'<option value={v}' in html for v in ('burn', 'embed selected', 'srt'))
     assert 'function shCapModeSync(which)' in html and html.count('data-burn-only') >= 3
+
+
+def test_an_ending_sound_and_overlay_can_come_from_the_editors_computer(env, monkeypatch, tmp_path):
+    client, headers = _client(user_id=7, role='user', username='ana')
+    wav, mov, txt = tmp_path / 'boom.wav', tmp_path / 'swoosh.mov', tmp_path / 'fake.wav'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'sine=d=1', str(wav)], check=True)
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=64x64:d=1', '-c:v', 'qtrle', str(mov)], check=True)
+    txt.write_text('not a sound at all')
+
+    def up(kind, path, name=None):
+        with open(path, 'rb') as fh:
+            return client.post('/api/shorts/asset-upload', headers=headers, data={'kind': kind, 'file': (fh, name or path.name)},
+                               content_type='multipart/form-data')
+    r = up('sfx', wav)
+    d = r.get_json()
+    assert r.status_code == 200 and d['ok'] and d['filename'].startswith('net_') and d['orig_name'] == 'boom.wav'
+    sfx, err = shorts._resolve_ending_sfx({'ending': 'cliffhanger', 'ending_sfx_name': d['filename']})
+    assert err is None and sfx['name'] == 'boom.wav', 'used exactly like one picked with Browse library'
+    o = up('overlay', mov).get_json()
+    ov, err = shorts._resolve_ending_overlay({'ending': 'cliffhanger', 'ending_overlay_name': o['filename']})
+    assert err is None and ov['name'] == 'swoosh.mov' and ov['dur'] > 0
+    # Only real media of the right kind, of a sane size.
+    assert up('sfx', txt).status_code == 400 and 'no sound' in up('sfx', txt).get_json()['error']
+    assert up('sfx', mov).status_code == 400, 'a video is not a sound effect'
+    assert up('overlay', wav, 'boom.mov').status_code == 400, 'no picture in it'
+    assert up('script', wav).status_code == 400
+    monkeypatch.setitem(shorts.SHORTS_ASSET_MAX_MB, 'sfx', 0)
+    assert 'larger than' in up('sfx', wav).get_json()['error']
+    assert not [n for n in os.listdir(main.app.config['UPLOAD_FOLDER']) if n.endswith('.part')]
+    html = client.get('/').get_data(as_text=True)
+    assert "shAssetUpload('sfx', this)" in html and "shAssetUpload('overlay', this)" in html

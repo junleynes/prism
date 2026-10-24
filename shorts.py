@@ -2643,6 +2643,80 @@ def _resolve_ending_overlay(opts):
     return dict(_overlay_facts(path), path=path, name=re.sub(r'^net_\d+_', '', name)), None
 
 
+# A sound effect or a transition overlay chosen from the editor's own computer, like a caption file: staged here
+# under the same kind of name as one picked with Browse library, so everything after works the same.
+SHORTS_ASSET_MAX_MB = {'sfx': _env_num('SHORTS_SFX_MAX_MB', 50, int), 'overlay': _env_num('SHORTS_OVERLAY_MAX_MB', 500, int)}
+_asset_limiter = _RateLimiter(limit=30, window=300)
+
+
+def _asset_streams(path):
+    """The kinds of stream in a media file ('video', 'audio'), and its length; nothing when it is not media."""
+    try:
+        r = subprocess.run([pipeline.FFPROBE, '-v', 'error', '-show_entries', 'format=duration:stream=codec_type',
+                            '-of', 'json', path], capture_output=True, text=True, timeout=30)
+        d = json.loads(r.stdout or '{}')
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return set(), 0.0
+    try:
+        dur = float((d.get('format') or {}).get('duration') or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    return {x.get('codec_type') for x in d.get('streams') or []}, dur
+
+
+@app.route('/api/shorts/asset-upload', methods=['POST'])
+@require_permission('vertical_shorts')
+def api_shorts_asset_upload():
+    """An ending sound effect (kind=sfx) or transition overlay (kind=overlay) from the editor's computer. Only
+    those two, size-capped, and kept only if ffprobe finds real sound (or real picture) in it."""
+    kind = (request.form.get('kind') or '').strip()
+    if kind not in SHORTS_ASSET_MAX_MB:
+        return jsonify(ok=False, error='Unknown kind of file.'), 400
+    if not _asset_limiter.allow(_client_ip()):
+        return jsonify(ok=False, error='Too many uploads. Wait a few minutes and try again.'), 429
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return jsonify(ok=False, error='No file was sent.'), 400
+    exts = pipeline.AUDIO_EXTENSIONS if kind == 'sfx' else _OVERLAY_EXTS
+    base = secure_filename(f.filename) or 'file'
+    ext = os.path.splitext(base)[1].lower().lstrip('.')
+    if ext not in exts:
+        what = 'A sound effect' if kind == 'sfx' else 'A transition overlay'
+        return jsonify(ok=False, error=f"{what} has to be one of: {', '.join('.' + e for e in sorted(exts))}."), 400
+    cap = SHORTS_ASSET_MAX_MB[kind] * 1024 * 1024
+    name = f'net_{int(time.time() * 1000)}_{base}'
+    path = os.path.join(app.config['UPLOAD_FOLDER'], name)
+    part = path + '.part'
+    size = 0
+    try:
+        with open(part, 'wb') as out:
+            while True:
+                chunk = f.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > cap:
+                    raise ValueError(f'That file is larger than {SHORTS_ASSET_MAX_MB[kind]} MB.')
+                out.write(chunk)
+        kinds, dur = _asset_streams(part)
+        need = 'audio' if kind == 'sfx' else 'video'
+        if need not in kinds or dur <= 0:
+            raise ValueError('That file has no sound in it that can be read.' if kind == 'sfx'
+                             else 'That file has no picture in it that can be read.')
+        os.replace(part, path)
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+    audit_log('shorts_asset_upload', target=f'{kind}: {base} ({size} bytes)', user_id=session.get('user_id'),
+              username=session.get('username'), ip=_client_ip())
+    return jsonify(ok=True, filename=name, orig_name=base, size=size)
+
+
 def _render_options(data):
     """reframe / speaker / subtitles / subtitle_size / ending / format / loudness from a request body --
     JSON for /render, form fields for /analyze's one-button path -- with
